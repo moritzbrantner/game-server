@@ -51,6 +51,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let malformed_rejected = expect_stream_rejected(&connection, b"bad").await?;
     let oversized_rejected = expect_stream_rejected(&connection, &oversized_header()).await?;
+    let mut trailing_frame = encode_control_request(b"ping")?;
+    trailing_frame.push(0);
+    let trailing_rejected = expect_stream_rejected(&connection, &trailing_frame).await?;
 
     let post_rejection = control_exchange(&connection, b"ping").await?;
     let connection_remained_usable = post_rejection.accepted && post_rejection.payload == b"pong";
@@ -73,18 +76,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
         && service_rejection
         && malformed_rejected
         && oversized_rejected
+        && trailing_rejected
         && connection_remained_usable
         && datagram_progress_while_control_stalled
         && stalled_stream_timed_out
         && concurrency_bound_observed;
 
     println!(
-        "{{\"mode\":\"webtransport-control-client\",\"playerId\":{},\"acceptedRoundTrip\":{},\"serviceRejection\":{},\"malformedRejected\":{},\"oversizedRejected\":{},\"connectionRemainedUsable\":{},\"datagramProgressWhileControlStalled\":{},\"stalledStreamTimedOut\":{},\"concurrencyBoundObserved\":{},\"expectationsHold\":{}}}",
+        "{{\"mode\":\"webtransport-control-client\",\"playerId\":{},\"acceptedRoundTrip\":{},\"serviceRejection\":{},\"malformedRejected\":{},\"oversizedRejected\":{},\"trailingRejected\":{},\"connectionRemainedUsable\":{},\"datagramProgressWhileControlStalled\":{},\"stalledStreamTimedOut\":{},\"concurrencyBoundObserved\":{},\"expectationsHold\":{}}}",
         welcome.player_id,
         accepted_round_trip,
         service_rejection,
         malformed_rejected,
         oversized_rejected,
+        trailing_rejected,
         connection_remained_usable,
         datagram_progress_while_control_stalled,
         stalled_stream_timed_out,
