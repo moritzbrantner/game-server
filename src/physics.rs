@@ -1,6 +1,7 @@
-use physics_engine::{
-    BodyId, BodyKind, Material, PhysicsError, RigidBody, StepReport, Vec3i, World, WorldConfig,
+pub use physics_engine::{
+    BodyId, BodyKind, Material, PhysicsError, RigidBody, StepReport, Vec3i, WorldConfig,
 };
+use physics_engine::World;
 
 pub const PINNED_PHYSICS_ENGINE_REVISION: &str =
     "8ea513395ad6893e45da7d6fa983b6cd3949a4ac";
