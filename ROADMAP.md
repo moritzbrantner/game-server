@@ -30,14 +30,16 @@ The existing reliable welcome stream carries admission/reconnect metadata. Realt
 
 ## Milestone E — reliability
 
-### Slice E1 — packet-level WebTransport resilience
+### Slice E1 — packet-level WebTransport resilience — completed
 
-- [ ] Exercise the real WebTransport/HTTP/3 runtime through isolated Linux network namespaces and kernel `tc netem` qdiscs.
-- [ ] Verify the reliable welcome stream survives normal packet impairment.
-- [ ] Verify realtime datagram loss/reordering cannot roll accepted authoritative snapshots backward.
-- [ ] Verify idempotent retransmission of the newest command converges to the newest authoritative sequence.
-- [ ] Verify a short 100% packet-loss outage can recover on the same QUIC session before idle expiry.
-- [ ] Keep exact timing/loss values as measurement evidence rather than benchmark assertions.
+- [x] Exercise the real WebTransport/HTTP/3 runtime through isolated Linux network namespaces and kernel `tc netem` qdiscs.
+- [x] Verify the reliable welcome stream survives normal packet impairment.
+- [x] Verify realtime datagram loss/reordering cannot roll accepted authoritative snapshots backward.
+- [x] Verify idempotent retransmission of the newest command converges to the newest authoritative sequence.
+- [x] Verify a short 100% packet-loss outage can recover on the same QUIC session before idle expiry.
+- [x] Keep exact timing/loss values as measurement evidence rather than benchmark assertions.
+
+The acceptance harness exercises baseline traffic, sustained delay/jitter/loss/reordering/rate impairment, and a 450 ms total-loss window with real kernel qdiscs. The transient-outage run retained connection epoch 1 and converged final sent command sequence 200 to authoritative applied sequence 200 after the link recovered. `tc -s qdisc` drop/requeue counters are retained as evidence; exact latency and packet-loss counts are not benchmark claims.
 
 ### Slice E2 — replay and restore
 
