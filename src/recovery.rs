@@ -486,7 +486,6 @@ fn io_error(error: std::io::Error) -> RecoveryError {
 mod tests {
     use super::*;
     use crate::replay::ReplayRecord;
-    use crate::simulation::SimulationSnapshot;
     use crate::world::{DemoSimulation, encode_demo_command};
     use std::time::{SystemTime, UNIX_EPOCH};
 
