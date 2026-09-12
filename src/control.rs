@@ -40,10 +40,15 @@ impl fmt::Display for ControlWireError {
             Self::UnsupportedVersion(version) => {
                 write!(formatter, "unsupported reliable-control version {version}")
             }
-            Self::UnexpectedKind(kind) => write!(formatter, "unexpected reliable-control kind {kind}"),
+            Self::UnexpectedKind(kind) => {
+                write!(formatter, "unexpected reliable-control kind {kind}")
+            }
             Self::Truncated => write!(formatter, "truncated reliable-control frame"),
             Self::TrailingBytes(count) => {
-                write!(formatter, "reliable-control frame has {count} trailing bytes")
+                write!(
+                    formatter,
+                    "reliable-control frame has {count} trailing bytes"
+                )
             }
             Self::PayloadTooLarge { maximum, actual } => write!(
                 formatter,
@@ -77,11 +82,7 @@ impl fmt::Display for ControlServiceError {
 impl Error for ControlServiceError {}
 
 pub trait ControlService: Send + Sync + 'static {
-    fn handle(
-        &self,
-        player_id: PlayerId,
-        payload: &[u8],
-    ) -> Result<Vec<u8>, ControlServiceError>;
+    fn handle(&self, player_id: PlayerId, payload: &[u8]) -> Result<Vec<u8>, ControlServiceError>;
 }
 
 #[derive(Clone, Copy, Debug, Default)]
