@@ -1,10 +1,9 @@
+use physics_engine::World;
 pub use physics_engine::{
     BodyId, BodyKind, Material, PhysicsError, RigidBody, StepReport, Vec3i, WorldConfig,
 };
-use physics_engine::World;
 
-pub const PINNED_PHYSICS_ENGINE_REVISION: &str =
-    "8ea513395ad6893e45da7d6fa983b6cd3949a4ac";
+pub const PINNED_PHYSICS_ENGINE_REVISION: &str = "8ea513395ad6893e45da7d6fa983b6cd3949a4ac";
 
 const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
