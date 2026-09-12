@@ -405,19 +405,13 @@ mod tests {
         host.insert(id("one"), runtime(10)).unwrap();
 
         let duplicate = host.insert(id("one"), runtime(10)).unwrap_err();
-        assert_eq!(
-            duplicate.error(),
-            &HostError::DuplicateMatch(id("one"))
-        );
+        assert_eq!(duplicate.error(), &HostError::DuplicateMatch(id("one")));
         assert_eq!(duplicate.id(), &id("one"));
 
         let mut retained = runtime(10);
         retained.admit(token(9)).unwrap();
         let capacity = host.insert(id("two"), retained).unwrap_err();
-        assert_eq!(
-            capacity.error(),
-            &HostError::AtCapacity { maximum: 1 }
-        );
+        assert_eq!(capacity.error(), &HostError::AtCapacity { maximum: 1 });
         let (error, returned_id, returned_runtime) = capacity.into_parts();
         assert_eq!(error, HostError::AtCapacity { maximum: 1 });
         assert_eq!(returned_id, id("two"));
