@@ -136,7 +136,8 @@ pub fn encode_snapshot(snapshot: &SnapshotFrame) -> Result<Vec<u8>, ProtocolErro
             actual: snapshot.state_hash,
         });
     }
-    let payload_len = u16::try_from(snapshot.payload.len()).expect("bounded snapshot payload length");
+    let payload_len =
+        u16::try_from(snapshot.payload.len()).expect("bounded snapshot payload length");
     let mut bytes = Vec::with_capacity(SNAPSHOT_HEADER_BYTES + snapshot.payload.len());
     bytes.push(PROTOCOL_VERSION);
     bytes.push(SNAPSHOT_KIND);
@@ -273,7 +274,10 @@ mod tests {
             state_hash: snapshot_hash(9, &payload),
             payload,
         };
-        assert_eq!(decode_snapshot(&encode_snapshot(&snapshot).unwrap()).unwrap(), snapshot);
+        assert_eq!(
+            decode_snapshot(&encode_snapshot(&snapshot).unwrap()).unwrap(),
+            snapshot
+        );
     }
 
     #[test]
