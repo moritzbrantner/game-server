@@ -72,6 +72,7 @@ assert receipt["acceptedRoundTrip"], receipt
 assert receipt["serviceRejection"], receipt
 assert receipt["malformedRejected"], receipt
 assert receipt["oversizedRejected"], receipt
+assert receipt["trailingRejected"], receipt
 assert receipt["connectionRemainedUsable"], receipt
 assert receipt["datagramProgressWhileControlStalled"], receipt
 assert receipt["stalledStreamTimedOut"], receipt
