@@ -54,4 +54,6 @@ pub trait GameSimulation: Send + 'static {
     ) -> Result<(), SimulationError>;
     fn advance_tick(&mut self) -> Result<(), SimulationError>;
     fn snapshot(&self) -> Result<SimulationSnapshot, SimulationError>;
+    fn checkpoint(&self) -> Result<Vec<u8>, SimulationError>;
+    fn restore_checkpoint(&mut self, checkpoint: &[u8]) -> Result<(), SimulationError>;
 }
