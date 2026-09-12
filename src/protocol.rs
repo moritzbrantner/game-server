@@ -1,10 +1,11 @@
 use std::fmt;
 
-pub const PROTOCOL_VERSION: u8 = 1;
+pub const PROTOCOL_VERSION: u8 = 2;
 pub const INPUT_BYTES: usize = 8;
 pub const SNAPSHOT_HEADER_BYTES: usize = 19;
 pub const SNAPSHOT_PLAYER_BYTES: usize = 12;
-pub const WELCOME_BYTES: usize = 18;
+pub const RECONNECT_TOKEN_BYTES: usize = 16;
+pub const WELCOME_BYTES: usize = 46;
 pub const MAX_PLAYERS: usize = 16;
 
 const INPUT_KIND: u8 = 1;
@@ -43,6 +44,9 @@ pub struct Welcome {
     pub tick_hz: u16,
     pub max_players: u8,
     pub current_tick: u64,
+    pub connection_epoch: u32,
+    pub reconnect_token: [u8; RECONNECT_TOKEN_BYTES],
+    pub reconnect_grace_ticks: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -216,6 +220,9 @@ pub fn encode_welcome(welcome: Welcome) -> [u8; WELCOME_BYTES] {
     bytes[6..8].copy_from_slice(&welcome.tick_hz.to_be_bytes());
     bytes[8] = welcome.max_players;
     bytes[10..18].copy_from_slice(&welcome.current_tick.to_be_bytes());
+    bytes[18..22].copy_from_slice(&welcome.connection_epoch.to_be_bytes());
+    bytes[22..38].copy_from_slice(&welcome.reconnect_token);
+    bytes[38..46].copy_from_slice(&welcome.reconnect_grace_ticks.to_be_bytes());
     bytes
 }
 
@@ -227,6 +234,13 @@ pub fn decode_welcome(bytes: &[u8]) -> Result<Welcome, ProtocolError> {
         tick_hz: u16::from_be_bytes(bytes[6..8].try_into().expect("checked welcome length")),
         max_players: bytes[8],
         current_tick: u64::from_be_bytes(bytes[10..18].try_into().expect("checked welcome length")),
+        connection_epoch: u32::from_be_bytes(
+            bytes[18..22].try_into().expect("checked welcome length"),
+        ),
+        reconnect_token: bytes[22..38].try_into().expect("checked welcome length"),
+        reconnect_grace_ticks: u64::from_be_bytes(
+            bytes[38..46].try_into().expect("checked welcome length"),
+        ),
     })
 }
 
@@ -315,5 +329,19 @@ mod tests {
             decode_snapshot(&encode_snapshot(&snapshot).unwrap()).unwrap(),
             snapshot
         );
+    }
+
+    #[test]
+    fn welcome_carries_reconnect_identity() {
+        let welcome = Welcome {
+            player_id: 7,
+            tick_hz: 20,
+            max_players: 16,
+            current_tick: 99,
+            connection_epoch: 3,
+            reconnect_token: [0xab; RECONNECT_TOKEN_BYTES],
+            reconnect_grace_ticks: 600,
+        };
+        assert_eq!(decode_welcome(&encode_welcome(welcome)).unwrap(), welcome);
     }
 }
