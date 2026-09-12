@@ -66,7 +66,8 @@ impl fmt::Display for MatchIdError {
             }
             Self::InvalidCharacter(character) => write!(
                 formatter,
-                "match id contains unsupported character {character:?}; use ASCII letters, digits, '-' or '_'"
+                "match id contains unsupported character {character:?}; use ASCII letters, digits, '-' or '_'
+"
             ),
         }
     }
@@ -121,12 +122,16 @@ impl Error for HostError {}
 pub struct PlacementFailure<S: GameSimulation> {
     error: HostError,
     id: MatchId,
-    runtime: MatchRuntime<S>,
+    runtime: Box<MatchRuntime<S>>,
 }
 
 impl<S: GameSimulation> PlacementFailure<S> {
     fn new(error: HostError, id: MatchId, runtime: MatchRuntime<S>) -> Self {
-        Self { error, id, runtime }
+        Self {
+            error,
+            id,
+            runtime: Box::new(runtime),
+        }
     }
 
     pub fn error(&self) -> &HostError {
@@ -138,7 +143,7 @@ impl<S: GameSimulation> PlacementFailure<S> {
     }
 
     pub fn into_parts(self) -> (HostError, MatchId, MatchRuntime<S>) {
-        (self.error, self.id, self.runtime)
+        (self.error, self.id, *self.runtime)
     }
 }
 
