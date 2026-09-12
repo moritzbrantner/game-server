@@ -1,3 +1,5 @@
+#[cfg(feature = "physics")]
+pub mod physics;
 pub mod protocol;
 pub mod runtime;
 pub mod session;
@@ -5,6 +7,8 @@ pub mod simulation;
 pub mod transport;
 pub mod world;
 
+#[cfg(feature = "physics")]
+pub use physics::{PINNED_PHYSICS_ENGINE_REVISION, PhysicsWorldAdapter};
 pub use protocol::{
     CommandFrame, MAX_COMMAND_PAYLOAD_BYTES, MAX_SNAPSHOT_PAYLOAD_BYTES, PlayerId, ProtocolError,
     RECONNECT_TOKEN_BYTES, SnapshotFrame, Welcome, decode_command, decode_snapshot, decode_welcome,
