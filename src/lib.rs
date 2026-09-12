@@ -22,15 +22,13 @@ pub use recovery::{
 pub use replay::{
     REPLAY_FORMAT_VERSION, ReplayError, ReplayLog, ReplayRecord, ReplayVerification, verify_replay,
 };
-pub use runtime::{
-    CommandOutcome, MatchRuntime, RuntimeError, RuntimeRecoveryError,
-};
+pub use runtime::{CommandOutcome, MatchRuntime, RuntimeError, RuntimeRecoveryError};
 pub use session::{
     DEFAULT_MAX_PLAYERS, DEFAULT_RECONNECT_GRACE_TICKS, RecoverableSession, ReconnectToken,
     SessionError, SessionLease, SessionRecoveryError, SessionRecoverySnapshot, SessionRegistry,
 };
 pub use simulation::{GameSimulation, SimulationError, SimulationSnapshot};
-pub use transport::{TransportError, WebTransportConfig, serve};
+pub use transport::{TransportError, WebTransportConfig, serve, serve_with_shutdown};
 pub use world::{
     DEMO_MAX_PLAYERS, DEMO_TICK_HZ, DemoSimulation, DemoSnapshotPlayer, WorldError,
     decode_demo_snapshot, encode_demo_command,
