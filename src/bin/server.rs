@@ -121,7 +121,11 @@ async fn handle_connection(connection: Connection, state: ServerState) -> Result
             return Ok(());
         }
         None => {
-            close(&connection, CLOSE_DATAGRAM, "WebTransport datagrams are required");
+            close(
+                &connection,
+                CLOSE_DATAGRAM,
+                "WebTransport datagrams are required",
+            );
             return Ok(());
         }
     };
@@ -168,7 +172,10 @@ async fn run_admitted_connection(
         max_players: MAX_PLAYERS as u8,
         current_tick,
     });
-    let opening = connection.open_uni().await.map_err(|error| error.to_string())?;
+    let opening = connection
+        .open_uni()
+        .await
+        .map_err(|error| error.to_string())?;
     let mut welcome_stream = opening.await.map_err(|error| error.to_string())?;
     welcome_stream
         .write_all(&welcome)
