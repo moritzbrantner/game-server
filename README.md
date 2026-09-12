@@ -21,7 +21,9 @@ Realtime game commands and latest authoritative snapshots use WebTransport datag
 
 Applications opt in with `serve_with_control` or `serve_with_control_and_shutdown` and provide a `ControlService`. The service receives the authenticated player identity and request bytes but has no access to `GameSimulation`; authoritative game mutation therefore remains on the deterministic command/tick path. The default `serve` and `serve_with_shutdown` entry points reject control requests.
 
-The real-network acceptance probe covers successful and rejected control exchanges, malformed and oversized fail-closed handling, stalled-stream timeout, the concurrency cap, and continued realtime command/snapshot progress while a control stream is stalled.
+Control handlers run off the async runtime. A server instance admits at most 64 handler executions at once, and that permit remains occupied until the synchronous handler actually exits even if its WebTransport exchange has already timed out. This prevents repeated transport timeouts from creating an unbounded tail of detached blocking work.
+
+The real-network acceptance probe covers successful and rejected control exchanges, malformed and oversized fail-closed handling, stalled-stream timeout, the per-connection concurrency cap, and continued realtime command/snapshot progress while a control stream is stalled.
 
 ## Graceful recovery
 
