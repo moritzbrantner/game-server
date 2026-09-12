@@ -434,20 +434,25 @@ fn rollback_failed_welcome<S: GameSimulation>(
     if runtime.is_frozen() {
         return Err("runtime froze before welcome rollback".to_owned());
     }
-    if !runtime.disconnect(lease.player_id, lease.connection_epoch) {
-        return Err("welcome rollback no longer owns the connection epoch".to_owned());
-    }
-    let AdmissionRequest::Reconnect(previous_token) = admission else {
-        return Ok(());
-    };
 
-    let restored = runtime
-        .reconnect(lease.reconnect_token, previous_token)
-        .map_err(|error| format!("failed to restore previous reconnect token: {error}"))?;
-    if !runtime.disconnect(restored.player_id, restored.connection_epoch) {
-        return Err("failed to return restored reconnect token to grace state".to_owned());
+    match admission {
+        AdmissionRequest::New => runtime
+            .abort_admission(lease.player_id, lease.connection_epoch)
+            .then_some(())
+            .ok_or_else(|| "failed to release incomplete new admission".to_owned()),
+        AdmissionRequest::Reconnect(previous_token) => {
+            if !runtime.disconnect(lease.player_id, lease.connection_epoch) {
+                return Err("welcome rollback no longer owns the connection epoch".to_owned());
+            }
+            let restored = runtime
+                .reconnect(lease.reconnect_token, previous_token)
+                .map_err(|error| format!("failed to restore previous reconnect token: {error}"))?;
+            if !runtime.disconnect(restored.player_id, restored.connection_epoch) {
+                return Err("failed to return restored reconnect token to grace state".to_owned());
+            }
+            Ok(())
+        }
     }
-    Ok(())
 }
 
 async fn run_established_connection<S: GameSimulation>(
@@ -555,6 +560,19 @@ mod tests {
             parse_admission_request("/match/one/reconnect/not-valid", "/match/one"),
             None
         );
+    }
+
+    #[test]
+    fn failed_new_welcome_releases_unusable_slot() {
+        let mut runtime = MatchRuntime::new_with_replay_capture(DemoSimulation::new(), 10);
+        let lease = runtime
+            .admit(ReconnectToken([1; RECONNECT_TOKEN_BYTES]))
+            .unwrap();
+
+        rollback_failed_welcome(&mut runtime, AdmissionRequest::New, lease).unwrap();
+
+        assert_eq!(runtime.slot_count(), 0);
+        assert_eq!(runtime.active_count(), 0);
     }
 
     #[test]
