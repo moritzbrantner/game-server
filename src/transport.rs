@@ -23,6 +23,7 @@ const CLOSE_DATAGRAM: u32 = 2;
 const CLOSE_RUNTIME: u32 = 3;
 const CLOSE_SERVER: u32 = 4;
 const SNAPSHOT_CHANNEL_DEPTH: usize = 1;
+const WELCOME_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug)]
 pub struct WebTransportConfig {
@@ -353,7 +354,19 @@ async fn handle_connection<S: GameSimulation>(
         }
     };
 
-    let result = run_admitted_connection(&connection, lease, max_datagram_size, &state).await;
+    if let Err(error) = send_welcome(&connection, lease, &state).await {
+        let cleanup = {
+            let mut runtime = state.runtime.lock().await;
+            rollback_failed_welcome(&mut runtime, admission, lease)
+        };
+        if let Err(cleanup_error) = cleanup {
+            eprintln!("failed to roll back incomplete welcome: {cleanup_error}");
+        }
+        close(&connection, CLOSE_RUNTIME, &error);
+        return Ok(());
+    }
+
+    let result = run_established_connection(&connection, lease, max_datagram_size, &state).await;
     state
         .runtime
         .lock()
@@ -362,10 +375,9 @@ async fn handle_connection<S: GameSimulation>(
     result
 }
 
-async fn run_admitted_connection<S: GameSimulation>(
+async fn send_welcome<S: GameSimulation>(
     connection: &Connection,
     lease: SessionLease,
-    max_datagram_size: usize,
     state: &ServerState<S>,
 ) -> Result<(), String> {
     let (tick_hz, max_players, current_tick) = {
@@ -386,20 +398,64 @@ async fn run_admitted_connection<S: GameSimulation>(
         reconnect_token: lease.reconnect_token.0,
         reconnect_grace_ticks: lease.reconnect_grace_ticks,
     });
-    let opening = connection
-        .open_uni()
-        .await
-        .map_err(|error| error.to_string())?;
-    let mut welcome_stream = opening.await.map_err(|error| error.to_string())?;
-    welcome_stream
-        .write_all(&welcome)
-        .await
-        .map_err(|error| error.to_string())?;
-    welcome_stream
-        .finish()
-        .await
-        .map_err(|error| error.to_string())?;
+    let handshake = async {
+        let opening = connection
+            .open_uni()
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut welcome_stream = opening.await.map_err(|error| error.to_string())?;
+        welcome_stream
+            .write_all(&welcome)
+            .await
+            .map_err(|error| error.to_string())?;
+        welcome_stream
+            .finish()
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    };
 
+    tokio::select! {
+        result = tokio::time::timeout(WELCOME_HANDSHAKE_TIMEOUT, handshake) => {
+            match result {
+                Ok(result) => result,
+                Err(_) => Err("welcome handshake timed out".to_owned()),
+            }
+        }
+        _ = connection.closed() => Err("connection closed before welcome completed".to_owned()),
+    }
+}
+
+fn rollback_failed_welcome<S: GameSimulation>(
+    runtime: &mut MatchRuntime<S>,
+    admission: AdmissionRequest,
+    lease: SessionLease,
+) -> Result<(), String> {
+    if runtime.is_frozen() {
+        return Err("runtime froze before welcome rollback".to_owned());
+    }
+    if !runtime.disconnect(lease.player_id, lease.connection_epoch) {
+        return Err("welcome rollback no longer owns the connection epoch".to_owned());
+    }
+    let AdmissionRequest::Reconnect(previous_token) = admission else {
+        return Ok(());
+    };
+
+    let restored = runtime
+        .reconnect(lease.reconnect_token, previous_token)
+        .map_err(|error| format!("failed to restore previous reconnect token: {error}"))?;
+    if !runtime.disconnect(restored.player_id, restored.connection_epoch) {
+        return Err("failed to return restored reconnect token to grace state".to_owned());
+    }
+    Ok(())
+}
+
+async fn run_established_connection<S: GameSimulation>(
+    connection: &Connection,
+    lease: SessionLease,
+    max_datagram_size: usize,
+    state: &ServerState<S>,
+) -> Result<(), String> {
     let mut snapshots = state.snapshots.subscribe();
     let mut shutdown = state.shutdown.subscribe();
     loop {
@@ -499,6 +555,30 @@ mod tests {
             parse_admission_request("/match/one/reconnect/not-valid", "/match/one"),
             None
         );
+    }
+
+    #[test]
+    fn failed_reconnect_welcome_restores_the_client_known_token() {
+        let previous_token = ReconnectToken([1; RECONNECT_TOKEN_BYTES]);
+        let replacement_token = ReconnectToken([2; RECONNECT_TOKEN_BYTES]);
+        let next_token = ReconnectToken([3; RECONNECT_TOKEN_BYTES]);
+        let mut runtime = MatchRuntime::new_with_replay_capture(DemoSimulation::new(), 10);
+        let original = runtime.admit(previous_token).unwrap();
+        assert!(runtime.disconnect(original.player_id, original.connection_epoch));
+        let failed = runtime
+            .reconnect(previous_token, replacement_token)
+            .unwrap();
+
+        rollback_failed_welcome(
+            &mut runtime,
+            AdmissionRequest::Reconnect(previous_token),
+            failed,
+        )
+        .unwrap();
+
+        let recovered = runtime.reconnect(previous_token, next_token).unwrap();
+        assert_eq!(recovered.player_id, original.player_id);
+        assert!(runtime.reconnect(replacement_token, previous_token).is_err());
     }
 
     #[test]
