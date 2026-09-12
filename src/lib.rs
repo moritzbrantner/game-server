@@ -24,7 +24,7 @@ pub use replay::{
 };
 pub use runtime::{CommandOutcome, MatchRuntime, RuntimeError, RuntimeRecoveryError};
 pub use session::{
-    DEFAULT_MAX_PLAYERS, DEFAULT_RECONNECT_GRACE_TICKS, RecoverableSession, ReconnectToken,
+    DEFAULT_MAX_PLAYERS, DEFAULT_RECONNECT_GRACE_TICKS, ReconnectToken, RecoverableSession,
     SessionError, SessionLease, SessionRecoveryError, SessionRecoverySnapshot, SessionRegistry,
 };
 pub use simulation::{GameSimulation, SimulationError, SimulationSnapshot};
