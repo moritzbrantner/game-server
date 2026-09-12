@@ -118,6 +118,49 @@ impl fmt::Display for HostError {
 
 impl Error for HostError {}
 
+pub struct PlacementFailure<S: GameSimulation> {
+    error: HostError,
+    id: MatchId,
+    runtime: MatchRuntime<S>,
+}
+
+impl<S: GameSimulation> PlacementFailure<S> {
+    fn new(error: HostError, id: MatchId, runtime: MatchRuntime<S>) -> Self {
+        Self { error, id, runtime }
+    }
+
+    pub fn error(&self) -> &HostError {
+        &self.error
+    }
+
+    pub fn id(&self) -> &MatchId {
+        &self.id
+    }
+
+    pub fn into_parts(self) -> (HostError, MatchId, MatchRuntime<S>) {
+        (self.error, self.id, self.runtime)
+    }
+}
+
+impl<S: GameSimulation> fmt::Debug for PlacementFailure<S> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PlacementFailure")
+            .field("error", &self.error)
+            .field("id", &self.id)
+            .field("runtime", &"<retained>")
+            .finish()
+    }
+}
+
+impl<S: GameSimulation> fmt::Display for PlacementFailure<S> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+
+impl<S: GameSimulation> Error for PlacementFailure<S> {}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HostStatus {
     pub draining: bool,
@@ -233,17 +276,29 @@ impl<S: GameSimulation> MatchHost<S> {
         })
     }
 
-    pub fn insert(&mut self, id: MatchId, runtime: MatchRuntime<S>) -> Result<(), HostError> {
+    pub fn insert(
+        &mut self,
+        id: MatchId,
+        runtime: MatchRuntime<S>,
+    ) -> Result<(), PlacementFailure<S>> {
         if self.draining {
-            return Err(HostError::Draining);
+            return Err(PlacementFailure::new(HostError::Draining, id, runtime));
         }
         if self.matches.contains_key(&id) {
-            return Err(HostError::DuplicateMatch(id));
+            return Err(PlacementFailure::new(
+                HostError::DuplicateMatch(id.clone()),
+                id,
+                runtime,
+            ));
         }
         if self.matches.len() >= self.max_matches {
-            return Err(HostError::AtCapacity {
-                maximum: self.max_matches,
-            });
+            return Err(PlacementFailure::new(
+                HostError::AtCapacity {
+                    maximum: self.max_matches,
+                },
+                id,
+                runtime,
+            ));
         }
         self.matches.insert(id, runtime);
         Ok(())
@@ -341,21 +396,33 @@ mod tests {
     }
 
     #[test]
-    fn host_enforces_nonzero_bounded_unique_placement() {
+    fn host_enforces_nonzero_bounded_unique_lossless_placement() {
         assert!(matches!(
             MatchHost::<DemoSimulation>::new(0),
             Err(HostError::ZeroCapacity)
         ));
         let mut host = MatchHost::new(1).unwrap();
         host.insert(id("one"), runtime(10)).unwrap();
+
+        let duplicate = host.insert(id("one"), runtime(10)).unwrap_err();
         assert_eq!(
-            host.insert(id("one"), runtime(10)),
-            Err(HostError::DuplicateMatch(id("one")))
+            duplicate.error(),
+            &HostError::DuplicateMatch(id("one"))
         );
+        assert_eq!(duplicate.id(), &id("one"));
+
+        let mut retained = runtime(10);
+        retained.admit(token(9)).unwrap();
+        let capacity = host.insert(id("two"), retained).unwrap_err();
         assert_eq!(
-            host.insert(id("two"), runtime(10)),
-            Err(HostError::AtCapacity { maximum: 1 })
+            capacity.error(),
+            &HostError::AtCapacity { maximum: 1 }
         );
+        let (error, returned_id, returned_runtime) = capacity.into_parts();
+        assert_eq!(error, HostError::AtCapacity { maximum: 1 });
+        assert_eq!(returned_id, id("two"));
+        assert_eq!(returned_runtime.active_count(), 1);
+        assert_eq!(returned_runtime.slot_count(), 1);
     }
 
     #[test]
@@ -384,10 +451,11 @@ mod tests {
         })
         .unwrap();
         assert!(host.runtime(&id("two")).unwrap().is_draining());
-        assert_eq!(
-            host.insert(id("three"), runtime(10)),
-            Err(HostError::Draining)
-        );
+        let rejected = host.insert(id("three"), runtime(10)).unwrap_err();
+        assert_eq!(rejected.error(), &HostError::Draining);
+        assert_eq!(rejected.id(), &id("three"));
+        let (_, _, returned_runtime) = rejected.into_parts();
+        assert_eq!(returned_runtime.slot_count(), 0);
     }
 
     #[test]
