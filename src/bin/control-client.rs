@@ -59,15 +59,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     stalled_send.write_all(&[0]).await?;
     let datagram_progress_while_control_stalled =
         observe_datagram_progress(&connection, welcome.player_id).await?;
-    let stalled_stream_timed_out = match timeout(
+    let stalled_stream_timed_out = timeout(
         STALLED_STREAM_TIMEOUT,
         read_one_byte_or_close(&mut stalled_recv),
     )
     .await
-    {
-        Ok(closed) => closed,
-        Err(_) => false,
-    };
+    .unwrap_or_default();
     drop(stalled_send);
 
     let concurrency_bound_observed = observe_concurrency_bound(&connection).await?;
@@ -142,15 +139,12 @@ async fn expect_stream_rejected(
     let (mut send_stream, mut recv_stream) = open_bi(connection).await?;
     timeout(IO_TIMEOUT, send_stream.write_all(frame)).await??;
     timeout(IO_TIMEOUT, send_stream.finish()).await??;
-    let rejected = match timeout(
+    let rejected = timeout(
         STREAM_REJECTION_TIMEOUT,
         read_one_byte_or_close(&mut recv_stream),
     )
     .await
-    {
-        Ok(closed) => closed,
-        Err(_) => false,
-    };
+    .unwrap_or_default();
     Ok(rejected)
 }
 
@@ -205,15 +199,12 @@ async fn observe_concurrency_bound(connection: &Connection) -> Result<bool, Box<
 
     let (mut overflow_send, mut overflow_recv) = open_bi(connection).await?;
     overflow_send.write_all(&[0]).await?;
-    let rejected = match timeout(
+    let rejected = timeout(
         STREAM_REJECTION_TIMEOUT,
         read_one_byte_or_close(&mut overflow_recv),
     )
     .await
-    {
-        Ok(closed) => closed,
-        Err(_) => false,
-    };
+    .unwrap_or_default();
     drop(overflow_send);
     drop(held);
     Ok(rejected)
