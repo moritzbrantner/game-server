@@ -49,7 +49,9 @@ impl fmt::Display for WorldError {
                 formatter,
                 "demo axes must each be between -1 and 1, got ({horizontal}, {vertical})"
             ),
-            Self::InvalidSnapshotLength => write!(formatter, "invalid demo snapshot payload length"),
+            Self::InvalidSnapshotLength => {
+                write!(formatter, "invalid demo snapshot payload length")
+            }
             Self::TickExhausted => write!(formatter, "tick counter is exhausted"),
         }
     }
