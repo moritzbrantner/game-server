@@ -95,16 +95,16 @@ impl<S: GameSimulation> MatchRuntime<S> {
         previous_token: ReconnectToken,
         replacement_token: ReconnectToken,
     ) -> Result<SessionLease, RuntimeError> {
-        Ok(self.sessions.reconnect(
-            previous_token,
-            replacement_token,
-            self.current_tick(),
-        )?)
+        let current_tick = self.current_tick();
+        Ok(self
+            .sessions
+            .reconnect(previous_token, replacement_token, current_tick)?)
     }
 
     pub fn disconnect(&mut self, player_id: PlayerId, connection_epoch: u32) -> bool {
+        let current_tick = self.current_tick();
         self.sessions
-            .disconnect(player_id, connection_epoch, self.current_tick())
+            .disconnect(player_id, connection_epoch, current_tick)
     }
 
     pub fn submit_command(
@@ -137,7 +137,8 @@ impl<S: GameSimulation> MatchRuntime<S> {
     }
 
     pub fn advance_tick(&mut self) -> Result<SimulationSnapshot, RuntimeError> {
-        let expired = self.sessions.expire(self.current_tick());
+        let current_tick = self.current_tick();
+        let expired = self.sessions.expire(current_tick);
         for player_id in expired {
             self.simulation.remove_player(player_id);
             self.last_sequences.remove(&player_id);
