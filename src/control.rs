@@ -15,7 +15,7 @@ const CONTROL_REJECTED_KIND: u8 = 3;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ControlContext {
     pub player_id: PlayerId,
-    pub connection_epoch: u64,
+    pub connection_epoch: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
