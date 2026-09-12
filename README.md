@@ -23,7 +23,13 @@ Applications opt in with `serve_with_control` or `serve_with_control_and_shutdow
 
 Control handlers run off the async runtime. A server instance admits at most 64 handler executions at once, and that permit remains occupied until the synchronous handler actually exits even if its WebTransport exchange has already timed out. This prevents repeated transport timeouts from creating an unbounded tail of detached blocking work.
 
-The real-network acceptance probe covers successful and rejected control exchanges, malformed and oversized fail-closed handling, stalled-stream timeout, the per-connection concurrency cap, and continued realtime command/snapshot progress while a control stream is stalled.
+The real-network acceptance probe covers successful and rejected control exchanges, malformed, oversized, and trailing-byte fail-closed handling, stalled-stream timeout, the per-connection concurrency cap, and continued realtime command/snapshot progress while a control stream is stalled.
+
+## Multi-match host
+
+`MatchHost` owns a bounded set of homogeneous `MatchRuntime` instances inside one process. Match IDs are URL-safe ASCII identifiers capped at 64 bytes, iteration is deterministic, and placement fails closed on duplicate IDs, process drain, or configured match capacity. Failed placement returns a `PlacementFailure` containing the original ID and runtime intact, so authoritative state is never discarded merely because placement must be retried elsewhere. Existing per-match player capacity remains owned by each simulation/runtime rather than being duplicated in the host.
+
+Draining is explicit at both match and process level. Removing a match requires it to be draining and to have no active or reconnectable player slots; the removed runtime is returned to the caller rather than silently discarded. Mutable runtime operations also reassert any pre-existing match/process drain before returning. `HostStatus` and per-match status expose capacity and lifecycle facts and derive readiness from those facts instead of storing a second mutable ready flag. Network routing and externally served health/readiness endpoints are the next process-hosting slice.
 
 ## Graceful recovery
 

@@ -1,4 +1,5 @@
 pub mod control;
+pub mod host;
 #[cfg(feature = "physics")]
 pub mod physics;
 pub mod protocol;
@@ -15,6 +16,10 @@ pub use control::{
     ControlService, ControlServiceError, ControlWireError, MAX_CONTROL_FRAME_BYTES,
     MAX_CONTROL_PAYLOAD_BYTES, RejectControlService, decode_control_request,
     decode_control_response, encode_control_request, encode_control_response,
+};
+pub use host::{
+    HostError, HostStatus, MAX_MATCH_ID_BYTES, MatchHost, MatchId, MatchIdError, MatchStatus,
+    PlacementFailure,
 };
 #[cfg(feature = "physics")]
 pub use physics::{PINNED_PHYSICS_ENGINE_REVISION, PhysicsWorldAdapter};
