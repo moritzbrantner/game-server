@@ -111,10 +111,7 @@ impl SessionRegistry {
             .count()
     }
 
-    pub fn admit(
-        &mut self,
-        reconnect_token: ReconnectToken,
-    ) -> Result<SessionLease, SessionError> {
+    pub fn admit(&mut self, reconnect_token: ReconnectToken) -> Result<SessionLease, SessionError> {
         if self.players.len() >= MAX_PLAYERS {
             return Err(SessionError::PlayerCapacity);
         }
