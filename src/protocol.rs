@@ -62,10 +62,15 @@ impl fmt::Display for ProtocolError {
             Self::IncorrectLength { expected, actual } => {
                 write!(formatter, "expected {expected} bytes, received {actual}")
             }
-            Self::UnsupportedVersion(version) => write!(formatter, "unsupported protocol version {version}"),
+            Self::UnsupportedVersion(version) => {
+                write!(formatter, "unsupported protocol version {version}")
+            }
             Self::UnexpectedKind(kind) => write!(formatter, "unexpected frame kind {kind}"),
             Self::InvalidSequence => write!(formatter, "input sequence must be non-zero"),
-            Self::InvalidAxis { horizontal, vertical } => write!(
+            Self::InvalidAxis {
+                horizontal,
+                vertical,
+            } => write!(
                 formatter,
                 "input axes must each be between -1 and 1, got ({horizontal}, {vertical})"
             ),
@@ -128,9 +133,8 @@ pub fn encode_snapshot(snapshot: &Snapshot) -> Result<Vec<u8>, ProtocolError> {
         });
     }
 
-    let mut bytes = Vec::with_capacity(
-        SNAPSHOT_HEADER_BYTES + snapshot.players.len() * SNAPSHOT_PLAYER_BYTES,
-    );
+    let mut bytes =
+        Vec::with_capacity(SNAPSHOT_HEADER_BYTES + snapshot.players.len() * SNAPSHOT_PLAYER_BYTES);
     bytes.push(PROTOCOL_VERSION);
     bytes.push(SNAPSHOT_KIND);
     bytes.extend_from_slice(&snapshot.tick.to_be_bytes());
@@ -284,7 +288,14 @@ mod tests {
     #[test]
     fn malformed_input_is_rejected() {
         assert!(decode_input(&[PROTOCOL_VERSION, INPUT_KIND]).is_err());
-        assert!(encode_input(InputCommand { sequence: 1, horizontal: 2, vertical: 0 }).is_err());
+        assert!(
+            encode_input(InputCommand {
+                sequence: 1,
+                horizontal: 2,
+                vertical: 0
+            })
+            .is_err()
+        );
     }
 
     #[test]
@@ -300,6 +311,9 @@ mod tests {
             state_hash: snapshot_hash(9, &players),
             players,
         };
-        assert_eq!(decode_snapshot(&encode_snapshot(&snapshot).unwrap()).unwrap(), snapshot);
+        assert_eq!(
+            decode_snapshot(&encode_snapshot(&snapshot).unwrap()).unwrap(),
+            snapshot
+        );
     }
 }
