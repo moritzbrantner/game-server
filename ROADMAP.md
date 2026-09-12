@@ -14,7 +14,7 @@
 - [x] Add a general reliable control-message channel distinct from realtime game-command and latest-state datagrams.
 - [x] Make disconnect and reconnect lifecycle deterministic and testable.
 
-The reliable welcome stream carries admission/reconnect metadata. Realtime game commands and authoritative snapshots deliberately remain datagrams. General transactional/session control uses separate versioned bidirectional WebTransport streams with a 4 KiB payload ceiling, a five-second stream timeout, and at most four concurrent control exchanges per connection. Control handlers receive the authenticated player ID plus the current connection epoch as a fencing token, but not `GameSimulation`, so delayed external side effects can reject stale reconnect epochs without turning this path into a second game-authority channel. Synchronous handler executions are additionally capped at 64 per server instance; their permits remain held until the handler actually exits even after a transport timeout, preventing detached blocking work from growing without bound. Real-network acceptance verifies successful and rejected exchanges, malformed/oversized fail-closed behavior, timeout/concurrency bounds, and continued command/snapshot progress while a control stream is stalled.
+The reliable welcome stream carries admission/reconnect metadata. Realtime game commands and authoritative snapshots deliberately remain datagrams. General transactional/session control uses separate versioned bidirectional WebTransport streams with a 4 KiB payload ceiling, a five-second stream timeout, and at most four concurrent control exchanges per connection. Control handlers receive the authenticated player ID plus the current connection epoch as a fencing token, but not `GameSimulation`, so delayed external side effects can reject stale reconnect epochs without turning this path into a second game-authority channel. Synchronous handler executions are additionally capped at 64 per server instance; their permits remain held until the handler actually exits even after a transport timeout, preventing detached blocking work from growing without bound. Real-network acceptance verifies successful and rejected exchanges, malformed/oversized/trailing fail-closed behavior, timeout/concurrency bounds, and continued command/snapshot progress while a control stream is stalled.
 
 ## Milestone C — pluggable simulation — completed
 
@@ -53,9 +53,11 @@ Graceful recovery freezes authoritative mutation before producing a bounded reco
 
 ## Milestone F — process hosting
 
-- [ ] Host multiple matches per process with bounded per-match resources.
-- [ ] Add placement, draining, and health/ready state.
+- [x] Host multiple matches per process with bounded match count and existing per-match player capacity.
+- [ ] Add transport routing plus externally served draining and health/ready state.
 - [ ] Keep cross-process orchestration out of the core until a real deployment needs it.
+
+The in-process `MatchHost` uses deterministic URL-safe match IDs, bounded placement, explicit per-match/process draining, and safe removal only after active and reconnectable slots are gone. Host and match status expose lifecycle/capacity facts and derive readiness rather than storing mutable readiness state. The next slice should route WebTransport sessions to a match ID and expose truthful process health/readiness without adding a fleet scheduler.
 
 The region/process-placement experiments in `server-lab` are evidence for this milestone, not code to copy wholesale. `game-server` should first expose truthful per-process capacity, health, and drain state; a separate fleet scheduler can consume those facts later.
 
