@@ -15,6 +15,14 @@ Reusable server-authoritative multiplayer runtime extracted from the proven `ser
 
 It does **not** own game-specific rules, matchmaking/accounts/rankings, or physics algorithms. Games supply deterministic simulation logic. Physics is delegated to `physics-engine` through an adapter boundary.
 
+## Reliable control
+
+Realtime game commands and latest authoritative snapshots use WebTransport datagrams. Transactional/session control uses an independent versioned request/response frame over bidirectional WebTransport streams. Each payload is bounded to 4 KiB, each exchange is time-bounded to five seconds, and each connection can have at most four control exchanges in flight.
+
+Applications opt in with `serve_with_control` or `serve_with_control_and_shutdown` and provide a `ControlService`. The service receives the authenticated player identity and request bytes but has no access to `GameSimulation`; authoritative game mutation therefore remains on the deterministic command/tick path. The default `serve` and `serve_with_shutdown` entry points reject control requests.
+
+The real-network acceptance probe covers successful and rejected control exchanges, malformed and oversized fail-closed handling, stalled-stream timeout, the concurrency cap, and continued realtime command/snapshot progress while a control stream is stalled.
+
 ## Graceful recovery
 
 Set `GAME_SERVER_RECOVERY_PATH` to enable replay-backed graceful restart recovery. On SIGTERM or Ctrl-C the demo host drains, freezes authoritative mutation, writes a bounded recovery image atomically, and then closes established sessions. On the next successful endpoint startup the image is verified, authoritative state and command watermarks are reconstructed, and saved sessions become disconnected/reconnectable before the consumed image is removed.
