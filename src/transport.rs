@@ -1,5 +1,10 @@
+use crate::control::{
+    CONTROL_HEADER_BYTES, ControlService, MAX_CONTROL_PAYLOAD_BYTES, RejectControlService,
+    decode_control_request, encode_control_response,
+};
 use crate::protocol::{
-    RECONNECT_TOKEN_BYTES, SnapshotFrame, Welcome, decode_command, encode_snapshot, encode_welcome,
+    PlayerId, RECONNECT_TOKEN_BYTES, SnapshotFrame, Welcome, decode_command, encode_snapshot,
+    encode_welcome,
 };
 use crate::recovery::RecoveryImage;
 use crate::runtime::{MatchRuntime, RuntimeError};
@@ -13,10 +18,10 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Mutex, broadcast, mpsc};
+use tokio::sync::{Mutex, Semaphore, broadcast, mpsc};
 use tokio::task::{JoinHandle, spawn_blocking};
 use tokio::time::MissedTickBehavior;
-use wtransport::{Connection, Endpoint, Identity, ServerConfig, VarInt};
+use wtransport::{Connection, Endpoint, Identity, RecvStream, SendStream, ServerConfig, VarInt};
 
 const CLOSE_PROTOCOL: u32 = 1;
 const CLOSE_DATAGRAM: u32 = 2;
@@ -24,6 +29,8 @@ const CLOSE_RUNTIME: u32 = 3;
 const CLOSE_SERVER: u32 = 4;
 const SNAPSHOT_CHANNEL_DEPTH: usize = 1;
 const WELCOME_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+const CONTROL_STREAM_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_CONCURRENT_CONTROL_STREAMS: usize = 4;
 
 #[derive(Clone, Debug)]
 pub struct WebTransportConfig {
@@ -74,6 +81,7 @@ enum AdmissionRequest {
 
 struct ServerState<S> {
     runtime: Arc<Mutex<MatchRuntime<S>>>,
+    control: Arc<dyn ControlService>,
     snapshots: broadcast::Sender<Vec<u8>>,
     shutdown: broadcast::Sender<()>,
 }
@@ -82,6 +90,7 @@ impl<S> Clone for ServerState<S> {
     fn clone(&self) -> Self {
         Self {
             runtime: Arc::clone(&self.runtime),
+            control: Arc::clone(&self.control),
             snapshots: self.snapshots.clone(),
             shutdown: self.shutdown.clone(),
         }
@@ -96,9 +105,34 @@ pub async fn serve<S>(
 where
     S: GameSimulation,
 {
+    serve_with_control(
+        simulation,
+        RejectControlService,
+        reconnect_grace_ticks,
+        config,
+    )
+    .await
+}
+
+pub async fn serve_with_control<S, C>(
+    simulation: S,
+    control: C,
+    reconnect_grace_ticks: u64,
+    config: WebTransportConfig,
+) -> Result<(), TransportError>
+where
+    S: GameSimulation,
+    C: ControlService,
+{
     let (shutdown_sender, shutdown_receiver) = mpsc::channel(1);
-    let result =
-        serve_with_shutdown(simulation, reconnect_grace_ticks, config, shutdown_receiver).await;
+    let result = serve_with_control_and_shutdown(
+        simulation,
+        control,
+        reconnect_grace_ticks,
+        config,
+        shutdown_receiver,
+    )
+    .await;
     drop(shutdown_sender);
     result
 }
@@ -107,10 +141,31 @@ pub async fn serve_with_shutdown<S>(
     simulation: S,
     reconnect_grace_ticks: u64,
     config: WebTransportConfig,
+    shutdown_requests: mpsc::Receiver<()>,
+) -> Result<(), TransportError>
+where
+    S: GameSimulation,
+{
+    serve_with_control_and_shutdown(
+        simulation,
+        RejectControlService,
+        reconnect_grace_ticks,
+        config,
+        shutdown_requests,
+    )
+    .await
+}
+
+pub async fn serve_with_control_and_shutdown<S, C>(
+    simulation: S,
+    control: C,
+    reconnect_grace_ticks: u64,
+    config: WebTransportConfig,
     mut shutdown_requests: mpsc::Receiver<()>,
 ) -> Result<(), TransportError>
 where
     S: GameSimulation,
+    C: ControlService,
 {
     if simulation.tick_hz() == 0 {
         return Err(TransportError::InvalidTickRate);
@@ -142,6 +197,7 @@ where
     let (shutdown, _) = broadcast::channel::<()>(1);
     let state = ServerState {
         runtime: Arc::new(Mutex::new(runtime)),
+        control: Arc::new(control),
         snapshots,
         shutdown,
     };
@@ -463,6 +519,7 @@ async fn run_established_connection<S: GameSimulation>(
 ) -> Result<(), String> {
     let mut snapshots = state.snapshots.subscribe();
     let mut shutdown = state.shutdown.subscribe();
+    let control_permits = Arc::new(Semaphore::new(MAX_CONCURRENT_CONTROL_STREAMS));
     loop {
         tokio::select! {
             datagram = connection.receive_datagram() => {
@@ -490,6 +547,29 @@ async fn run_established_connection<S: GameSimulation>(
                     Err(_) => return Ok(()),
                 }
             }
+            control_stream = connection.accept_bi() => {
+                let (send_stream, recv_stream) = match control_stream {
+                    Ok(streams) => streams,
+                    Err(_) => return Ok(()),
+                };
+                let permit = match Arc::clone(&control_permits).try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        eprintln!("reliable control stream rejected: concurrency limit reached");
+                        continue;
+                    }
+                };
+                let control = Arc::clone(&state.control);
+                let player_id = lease.player_id;
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    if let Err(error) =
+                        run_control_stream(send_stream, recv_stream, player_id, control).await
+                    {
+                        eprintln!("reliable control stream failed: {error}");
+                    }
+                });
+            }
             snapshot = snapshots.recv() => {
                 match snapshot {
                     Ok(snapshot) => {
@@ -513,6 +593,73 @@ async fn run_established_connection<S: GameSimulation>(
             _ = connection.closed() => return Ok(()),
         }
     }
+}
+
+async fn run_control_stream(
+    mut send_stream: SendStream,
+    mut recv_stream: RecvStream,
+    player_id: PlayerId,
+    control: Arc<dyn ControlService>,
+) -> Result<(), String> {
+    let exchange = async {
+        let mut header = [0_u8; CONTROL_HEADER_BYTES];
+        recv_stream
+            .read_exact(&mut header)
+            .await
+            .map_err(|error| error.to_string())?;
+        let payload_len = usize::from(u16::from_be_bytes([header[6], header[7]]));
+        if payload_len > MAX_CONTROL_PAYLOAD_BYTES {
+            return Err(format!(
+                "declared reliable-control payload {payload_len} exceeds maximum {MAX_CONTROL_PAYLOAD_BYTES}"
+            ));
+        }
+
+        let mut frame = Vec::with_capacity(CONTROL_HEADER_BYTES + payload_len);
+        frame.extend_from_slice(&header);
+        frame.resize(CONTROL_HEADER_BYTES + payload_len, 0);
+        if payload_len > 0 {
+            recv_stream
+                .read_exact(&mut frame[CONTROL_HEADER_BYTES..])
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        let request = decode_control_request(&frame).map_err(|error| error.to_string())?;
+
+        let service = Arc::clone(&control);
+        let payload = request.payload;
+        let handled = spawn_blocking(move || service.handle(player_id, &payload))
+            .await
+            .map_err(|error| format!("reliable-control handler task failed: {error}"))?;
+        let response = match handled {
+            Ok(payload) => match encode_control_response(true, &payload) {
+                Ok(response) => response,
+                Err(error) => {
+                    eprintln!("reliable-control response rejected: {error}");
+                    encode_control_response(false, b"")
+                        .expect("empty reliable-control rejection is always encodable")
+                }
+            },
+            Err(error) => {
+                eprintln!("reliable-control request rejected: {error}");
+                encode_control_response(false, b"")
+                    .expect("empty reliable-control rejection is always encodable")
+            }
+        };
+
+        send_stream
+            .write_all(&response)
+            .await
+            .map_err(|error| error.to_string())?;
+        send_stream
+            .finish()
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    };
+
+    tokio::time::timeout(CONTROL_STREAM_TIMEOUT, exchange)
+        .await
+        .map_err(|_| "reliable control stream timed out".to_owned())?
 }
 
 fn parse_admission_request(path: &str, session_path: &str) -> Option<AdmissionRequest> {
