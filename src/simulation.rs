@@ -1,5 +1,5 @@
-use crate::protocol::snapshot_hash;
 use crate::PlayerId;
+use crate::protocol::snapshot_hash;
 use std::fmt;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
