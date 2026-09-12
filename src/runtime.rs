@@ -181,6 +181,11 @@ impl<S: GameSimulation> MatchRuntime<S> {
         self.frozen = true;
     }
 
+    pub fn resume_after_failed_recovery(&mut self) {
+        self.frozen = false;
+        self.draining = false;
+    }
+
     pub fn recovery_image(&self) -> Result<RecoveryImage, RuntimeRecoveryError> {
         if !self.frozen {
             return Err(RuntimeRecoveryError::RuntimeNotFrozen);
@@ -532,6 +537,22 @@ mod tests {
         assert_eq!(
             runtime.reconnect(token(1), token(3)).unwrap().player_id,
             first.player_id
+        );
+    }
+
+    #[test]
+    fn failed_recovery_can_resume_runtime_without_state_loss() {
+        let mut runtime = MatchRuntime::new_with_replay_capture(FakeSimulation::default(), 10);
+        let lease = runtime.admit(token(1)).unwrap();
+        runtime.freeze_for_recovery();
+        runtime.resume_after_failed_recovery();
+        assert!(!runtime.is_draining());
+        assert!(!runtime.is_frozen());
+        assert_eq!(
+            runtime
+                .submit_command(lease.player_id, lease.connection_epoch, 1, b"resume")
+                .unwrap(),
+            CommandOutcome::Applied
         );
     }
 
