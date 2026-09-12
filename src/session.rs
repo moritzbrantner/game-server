@@ -1,7 +1,8 @@
-use crate::protocol::{MAX_PLAYERS, PlayerId, RECONNECT_TOKEN_BYTES};
+use crate::protocol::{PlayerId, RECONNECT_TOKEN_BYTES};
 use std::collections::BTreeMap;
 use std::fmt;
 
+pub const DEFAULT_MAX_PLAYERS: usize = 16;
 pub const DEFAULT_RECONNECT_GRACE_TICKS: u64 = 20 * 30;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -78,6 +79,7 @@ struct PlayerSession {
 
 #[derive(Clone, Debug)]
 pub struct SessionRegistry {
+    max_players: usize,
     reconnect_grace_ticks: u64,
     next_player_id: PlayerId,
     players: BTreeMap<PlayerId, PlayerSession>,
@@ -86,13 +88,14 @@ pub struct SessionRegistry {
 
 impl Default for SessionRegistry {
     fn default() -> Self {
-        Self::new(DEFAULT_RECONNECT_GRACE_TICKS)
+        Self::new(DEFAULT_MAX_PLAYERS, DEFAULT_RECONNECT_GRACE_TICKS)
     }
 }
 
 impl SessionRegistry {
-    pub fn new(reconnect_grace_ticks: u64) -> Self {
+    pub fn new(max_players: usize, reconnect_grace_ticks: u64) -> Self {
         Self {
+            max_players,
             reconnect_grace_ticks,
             next_player_id: 1,
             players: BTreeMap::new(),
@@ -111,8 +114,14 @@ impl SessionRegistry {
             .count()
     }
 
+    pub fn owns_connection(&self, player_id: PlayerId, connection_epoch: u32) -> bool {
+        self.players.get(&player_id).is_some_and(|session| {
+            session.connected && session.connection_epoch == connection_epoch
+        })
+    }
+
     pub fn admit(&mut self, reconnect_token: ReconnectToken) -> Result<SessionLease, SessionError> {
-        if self.players.len() >= MAX_PLAYERS {
+        if self.players.len() >= self.max_players {
             return Err(SessionError::PlayerCapacity);
         }
         if self.tokens.contains_key(&reconnect_token) {
@@ -240,7 +249,7 @@ mod tests {
 
     #[test]
     fn reconnect_rotates_token_and_epoch() {
-        let mut sessions = SessionRegistry::new(10);
+        let mut sessions = SessionRegistry::new(16, 10);
         let admitted = sessions.admit(token(1)).unwrap();
         assert!(sessions.disconnect(admitted.player_id, admitted.connection_epoch, 5));
         let reconnected = sessions.reconnect(token(1), token(2), 12).unwrap();
@@ -255,7 +264,7 @@ mod tests {
 
     #[test]
     fn stale_disconnect_cannot_evict_newer_connection() {
-        let mut sessions = SessionRegistry::new(10);
+        let mut sessions = SessionRegistry::new(16, 10);
         let first = sessions.admit(token(1)).unwrap();
         assert!(sessions.disconnect(first.player_id, first.connection_epoch, 1));
         let second = sessions.reconnect(token(1), token(2), 2).unwrap();
@@ -266,7 +275,7 @@ mod tests {
 
     #[test]
     fn expired_disconnected_slots_are_removed() {
-        let mut sessions = SessionRegistry::new(5);
+        let mut sessions = SessionRegistry::new(16, 5);
         let lease = sessions.admit(token(1)).unwrap();
         assert!(sessions.disconnect(lease.player_id, lease.connection_epoch, 10));
         assert!(sessions.expire(15).is_empty());
@@ -276,12 +285,19 @@ mod tests {
 
     #[test]
     fn active_token_cannot_be_replayed() {
-        let mut sessions = SessionRegistry::new(10);
+        let mut sessions = SessionRegistry::new(16, 10);
         sessions.admit(token(1)).unwrap();
         assert_eq!(
             sessions.reconnect(token(1), token(2), 1),
             Err(SessionError::AlreadyConnected)
         );
+    }
+
+    #[test]
+    fn configured_capacity_is_enforced() {
+        let mut sessions = SessionRegistry::new(1, 10);
+        sessions.admit(token(1)).unwrap();
+        assert_eq!(sessions.admit(token(2)), Err(SessionError::PlayerCapacity));
     }
 
     #[test]
