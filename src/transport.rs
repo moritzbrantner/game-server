@@ -147,7 +147,7 @@ where
     };
     let tick_task = spawn_tick_loop(state.clone(), tick_hz);
 
-    let spawn_incoming = |incoming| {
+    let spawn_incoming = |incoming: wtransport::endpoint::IncomingSession| {
         let state = state.clone();
         let session_path = config.session_path.clone();
         tokio::spawn(async move {
