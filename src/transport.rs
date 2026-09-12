@@ -578,7 +578,11 @@ mod tests {
 
         let recovered = runtime.reconnect(previous_token, next_token).unwrap();
         assert_eq!(recovered.player_id, original.player_id);
-        assert!(runtime.reconnect(replacement_token, previous_token).is_err());
+        assert!(
+            runtime
+                .reconnect(replacement_token, previous_token)
+                .is_err()
+        );
     }
 
     #[test]
