@@ -1,4 +1,5 @@
 use crate::PlayerId;
+use crate::protocol::MAX_COMMAND_PAYLOAD_BYTES;
 use crate::replay::{ReplayLog, ReplayRecord};
 use crate::session::{ReconnectToken, SessionError, SessionLease, SessionRegistry};
 use crate::simulation::{GameSimulation, SimulationError, SimulationSnapshot};
@@ -17,6 +18,10 @@ pub enum RuntimeError {
     Simulation(SimulationError),
     StaleConnection,
     InvalidSequence,
+    CommandPayloadTooLarge {
+        maximum: usize,
+        actual: usize,
+    },
 }
 
 impl fmt::Display for RuntimeError {
@@ -26,6 +31,10 @@ impl fmt::Display for RuntimeError {
             Self::Simulation(error) => write!(formatter, "simulation error: {error}"),
             Self::StaleConnection => write!(formatter, "connection no longer owns the player slot"),
             Self::InvalidSequence => write!(formatter, "command sequence must be non-zero"),
+            Self::CommandPayloadTooLarge { maximum, actual } => write!(
+                formatter,
+                "command payload size {actual} exceeds maximum {maximum}"
+            ),
         }
     }
 }
@@ -147,6 +156,12 @@ impl<S: GameSimulation> MatchRuntime<S> {
         if sequence <= last_sequence {
             return Ok(CommandOutcome::IgnoredStale);
         }
+        if payload.len() > MAX_COMMAND_PAYLOAD_BYTES {
+            return Err(RuntimeError::CommandPayloadTooLarge {
+                maximum: MAX_COMMAND_PAYLOAD_BYTES,
+                actual: payload.len(),
+            });
+        }
         self.simulation
             .apply_command(player_id, sequence, payload)?;
         self.last_sequences.insert(player_id, sequence);
@@ -266,12 +281,42 @@ mod tests {
                 .unwrap(),
             CommandOutcome::Applied
         );
+        let oversized_stale = vec![0_u8; MAX_COMMAND_PAYLOAD_BYTES + 1];
         assert_eq!(
             runtime
-                .submit_command(lease.player_id, lease.connection_epoch, 1, b"duplicate")
+                .submit_command(
+                    lease.player_id,
+                    lease.connection_epoch,
+                    1,
+                    &oversized_stale,
+                )
                 .unwrap(),
             CommandOutcome::IgnoredStale
         );
+    }
+
+    #[test]
+    fn oversized_new_command_is_rejected_before_simulation_or_replay_mutation() {
+        let mut runtime = MatchRuntime::new_with_replay_capture(FakeSimulation::default(), 10);
+        let lease = runtime.admit(token(1)).unwrap();
+        let oversized = vec![0_u8; MAX_COMMAND_PAYLOAD_BYTES + 1];
+
+        assert_eq!(
+            runtime.submit_command(
+                lease.player_id,
+                lease.connection_epoch,
+                1,
+                &oversized,
+            ),
+            Err(RuntimeError::CommandPayloadTooLarge {
+                maximum: MAX_COMMAND_PAYLOAD_BYTES,
+                actual: MAX_COMMAND_PAYLOAD_BYTES + 1,
+            })
+        );
+        assert!(runtime.simulation.commands.is_empty());
+        let replay = runtime.replay_log().unwrap();
+        assert_eq!(replay.records().len(), 1);
+        assert!(replay.encode().is_ok());
     }
 
     #[test]
