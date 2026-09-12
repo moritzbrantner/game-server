@@ -1,4 +1,6 @@
-use crate::protocol::{InputCommand, MAX_PLAYERS, PlayerId, Snapshot, SnapshotPlayer, snapshot_hash, validate_input};
+use crate::protocol::{
+    InputCommand, MAX_PLAYERS, PlayerId, Snapshot, SnapshotPlayer, snapshot_hash, validate_input,
+};
 use std::collections::BTreeMap;
 use std::fmt;
 
@@ -26,7 +28,9 @@ impl fmt::Display for WorldError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidPlayerId => write!(formatter, "player id zero is reserved"),
-            Self::DuplicatePlayer(player_id) => write!(formatter, "player {player_id} already exists"),
+            Self::DuplicatePlayer(player_id) => {
+                write!(formatter, "player {player_id} already exists")
+            }
             Self::PlayerCapacity => write!(formatter, "world has reached player capacity"),
             Self::UnknownPlayer(player_id) => write!(formatter, "unknown player {player_id}"),
             Self::InvalidInput(error) => write!(formatter, "invalid input: {error}"),
@@ -176,7 +180,10 @@ mod tests {
             horizontal: 1,
             vertical: 0,
         };
-        assert_eq!(world.submit_input(1, input).unwrap(), SubmitOutcome::Accepted);
+        assert_eq!(
+            world.submit_input(1, input).unwrap(),
+            SubmitOutcome::Accepted
+        );
         assert_eq!(
             world.submit_input(1, input).unwrap(),
             SubmitOutcome::IgnoredStale
