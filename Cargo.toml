@@ -1,0 +1,24 @@
+[package]
+name = "game-server"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.98"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "game-server"
+path = "src/bin/server.rs"
+
+[dependencies]
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+wtransport = { version = "0.7.2", default-features = false, features = ["ring"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
