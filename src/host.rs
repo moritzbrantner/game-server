@@ -20,10 +20,9 @@ impl MatchId {
                 actual: value.len(),
             });
         }
-        if let Some(character) = value
-            .chars()
-            .find(|character| !(character.is_ascii_alphanumeric() || matches!(character, '-' | '_')))
-        {
+        if let Some(character) = value.chars().find(|character| {
+            !(character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+        }) {
             return Err(MatchIdError::InvalidCharacter(character));
         }
         Ok(Self(value))
@@ -60,7 +59,10 @@ impl fmt::Display for MatchIdError {
         match self {
             Self::Empty => write!(formatter, "match id must not be empty"),
             Self::TooLong { maximum, actual } => {
-                write!(formatter, "match id length {actual} exceeds maximum {maximum}")
+                write!(
+                    formatter,
+                    "match id length {actual} exceeds maximum {maximum}"
+                )
             }
             Self::InvalidCharacter(character) => write!(
                 formatter,
@@ -77,7 +79,9 @@ pub enum HostError {
     ZeroCapacity,
     Draining,
     DuplicateMatch(MatchId),
-    AtCapacity { maximum: usize },
+    AtCapacity {
+        maximum: usize,
+    },
     UnknownMatch(MatchId),
     MatchNotDraining(MatchId),
     MatchNotIdle {
@@ -249,8 +253,19 @@ impl<S: GameSimulation> MatchHost<S> {
         self.matches.get(id)
     }
 
-    pub fn runtime_mut(&mut self, id: &MatchId) -> Option<&mut MatchRuntime<S>> {
-        self.matches.get_mut(id)
+    pub fn with_runtime_mut<R>(
+        &mut self,
+        id: &MatchId,
+        operation: impl FnOnce(&mut MatchRuntime<S>) -> R,
+    ) -> Option<R> {
+        let host_draining = self.draining;
+        let runtime = self.matches.get_mut(id)?;
+        let preserve_drain = host_draining || runtime.is_draining();
+        let result = operation(runtime);
+        if preserve_drain {
+            runtime.begin_drain();
+        }
+        Some(result)
     }
 
     pub fn begin_match_drain(&mut self, id: &MatchId) -> Result<(), HostError> {
@@ -354,11 +369,25 @@ mod tests {
         assert!(!host.runtime(&id("two")).unwrap().is_draining());
         assert!(host.status().ready_for_new_match());
 
+        host.with_runtime_mut(&id("one"), |runtime| {
+            runtime.resume_after_failed_recovery();
+        })
+        .unwrap();
+        assert!(host.runtime(&id("one")).unwrap().is_draining());
+
         host.begin_drain();
         assert!(host.is_draining());
         assert!(host.runtime(&id("two")).unwrap().is_draining());
         assert!(!host.status().ready_for_new_match());
-        assert_eq!(host.insert(id("three"), runtime(10)), Err(HostError::Draining));
+        host.with_runtime_mut(&id("two"), |runtime| {
+            runtime.resume_after_failed_recovery();
+        })
+        .unwrap();
+        assert!(host.runtime(&id("two")).unwrap().is_draining());
+        assert_eq!(
+            host.insert(id("three"), runtime(10)),
+            Err(HostError::Draining)
+        );
     }
 
     #[test]
@@ -374,7 +403,10 @@ mod tests {
         assert_eq!(status.max_matches, 2);
         assert_eq!(status.active_players, 1);
         assert_eq!(status.occupied_player_slots, 1);
-        assert_eq!(status.player_capacity, DemoSimulation::new().max_players() * 2);
+        assert_eq!(
+            status.player_capacity,
+            DemoSimulation::new().max_players() * 2
+        );
         assert_eq!(status.remaining_match_capacity(), 0);
         assert!(!status.ready_for_new_match());
 
@@ -404,16 +436,18 @@ mod tests {
             })
         ));
 
-        let runtime = host.runtime_mut(&id("one")).unwrap();
-        assert!(runtime.disconnect(lease.player_id, lease.connection_epoch));
-        assert!(matches!(
-            runtime.admit(token(2)),
-            Err(RuntimeError::Draining)
-        ));
-        runtime.advance_tick().unwrap();
-        assert_eq!(runtime.slot_count(), 1);
-        runtime.advance_tick().unwrap();
-        assert_eq!(runtime.slot_count(), 0);
+        host.with_runtime_mut(&id("one"), |runtime| {
+            assert!(runtime.disconnect(lease.player_id, lease.connection_epoch));
+            assert!(matches!(
+                runtime.admit(token(2)),
+                Err(RuntimeError::Draining)
+            ));
+            runtime.advance_tick().unwrap();
+            assert_eq!(runtime.slot_count(), 1);
+            runtime.advance_tick().unwrap();
+            assert_eq!(runtime.slot_count(), 0);
+        })
+        .unwrap();
 
         let removed = host.remove_drained(&id("one")).unwrap();
         assert_eq!(removed.slot_count(), 0);
