@@ -43,9 +43,13 @@ The acceptance harness exercises baseline traffic, sustained delay/jitter/loss/r
 
 ### Slice E2 — replay and restore
 
-- [ ] Add append-only replay logs for admitted commands and authoritative snapshot checkpoints.
-- [ ] Add deterministic restore/replay verification.
+- [x] Add append-only replay logs for successful player admission/removal, applied commands, and authoritative snapshot checkpoints.
+- [x] Add deterministic replay verification against a fresh game simulation.
 - [ ] Add graceful draining/shutdown and restart-safe match recovery semantics.
+
+Replay capture is opt-in so ordinary matches do not accumulate unbounded evidence in memory. Captured records have a versioned deterministic binary format, rejected/stale commands are deliberately omitted, and every captured authoritative tick includes a snapshot checkpoint. The verifier replays lifecycle changes and accepted commands in authoritative tick order and fails on the first snapshot hash or payload divergence.
+
+Durable file/object storage is intentionally not hidden inside `MatchRuntime` yet. Making journal persistence part of restart safety requires an explicit policy for I/O failure versus authoritative mutation; that belongs with the remaining recovery slice rather than making game simulation depend on an arbitrary storage backend.
 
 ## Milestone F — process hosting
 

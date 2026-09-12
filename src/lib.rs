@@ -1,6 +1,7 @@
 #[cfg(feature = "physics")]
 pub mod physics;
 pub mod protocol;
+pub mod replay;
 pub mod runtime;
 pub mod session;
 pub mod simulation;
@@ -13,6 +14,9 @@ pub use protocol::{
     CommandFrame, MAX_COMMAND_PAYLOAD_BYTES, MAX_SNAPSHOT_PAYLOAD_BYTES, PlayerId, ProtocolError,
     RECONNECT_TOKEN_BYTES, SnapshotFrame, Welcome, decode_command, decode_snapshot, decode_welcome,
     encode_command, encode_snapshot, encode_welcome, snapshot_hash,
+};
+pub use replay::{
+    REPLAY_FORMAT_VERSION, ReplayError, ReplayLog, ReplayRecord, ReplayVerification, verify_replay,
 };
 pub use runtime::{CommandOutcome, MatchRuntime, RuntimeError};
 pub use session::{
