@@ -21,7 +21,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let private_key_pem =
         PathBuf::from(env::var("GAME_SERVER_KEY_PEM").unwrap_or_else(|_| "key.pem".to_owned()));
     let session_path = env::var("GAME_SERVER_SESSION_PATH").unwrap_or_else(|_| "/game".to_owned());
-    let recovery_path = env::var("GAME_SERVER_RECOVERY_PATH").ok().map(PathBuf::from);
+    let recovery_path = env::var("GAME_SERVER_RECOVERY_PATH")
+        .ok()
+        .map(PathBuf::from);
     let drain_grace_ms = env::var("GAME_SERVER_DRAIN_GRACE_MS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
