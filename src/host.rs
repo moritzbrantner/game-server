@@ -66,8 +66,7 @@ impl fmt::Display for MatchIdError {
             }
             Self::InvalidCharacter(character) => write!(
                 formatter,
-                "match id contains unsupported character {character:?}; use ASCII letters, digits, '-' or '_'
-"
+                "match id contains unsupported character {character:?}; use ASCII letters, digits, '-' or '_'"
             ),
         }
     }
