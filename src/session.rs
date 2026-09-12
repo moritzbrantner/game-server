@@ -1,8 +1,7 @@
-use crate::protocol::{MAX_PLAYERS, PlayerId};
+use crate::protocol::{MAX_PLAYERS, PlayerId, RECONNECT_TOKEN_BYTES};
 use std::collections::BTreeMap;
 use std::fmt;
 
-pub const RECONNECT_TOKEN_BYTES: usize = 16;
 pub const DEFAULT_RECONNECT_GRACE_TICKS: u64 = 20 * 30;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -58,7 +57,9 @@ impl fmt::Display for SessionError {
             Self::PlayerCapacity => write!(formatter, "match has reached player capacity"),
             Self::TokenCollision => write!(formatter, "reconnect token collision"),
             Self::UnknownToken => write!(formatter, "unknown reconnect token"),
-            Self::AlreadyConnected => write!(formatter, "player slot already has an active connection"),
+            Self::AlreadyConnected => {
+                write!(formatter, "player slot already has an active connection")
+            }
             Self::ReconnectExpired => write!(formatter, "reconnect grace period has expired"),
             Self::ConnectionEpochExhausted => write!(formatter, "connection epoch exhausted"),
         }
@@ -104,7 +105,10 @@ impl SessionRegistry {
     }
 
     pub fn active_count(&self) -> usize {
-        self.players.values().filter(|session| session.connected).count()
+        self.players
+            .values()
+            .filter(|session| session.connected)
+            .count()
     }
 
     pub fn admit(
@@ -131,7 +135,12 @@ impl SessionRegistry {
         };
         self.players.insert(player_id, session);
         self.tokens.insert(reconnect_token, player_id);
-        Ok(self.lease(player_id, session))
+        Ok(SessionLease {
+            player_id,
+            connection_epoch: session.connection_epoch,
+            reconnect_token: session.token,
+            reconnect_grace_ticks: self.reconnect_grace_ticks,
+        })
     }
 
     pub fn reconnect(
@@ -164,13 +173,23 @@ impl SessionRegistry {
         session.connected = true;
         session.expires_at_tick = u64::MAX;
         session.token = replacement_token;
-        let lease = self.lease(player_id, *session);
+        let lease = SessionLease {
+            player_id,
+            connection_epoch: session.connection_epoch,
+            reconnect_token: session.token,
+            reconnect_grace_ticks: self.reconnect_grace_ticks,
+        };
         self.tokens.remove(&previous_token);
         self.tokens.insert(replacement_token, player_id);
         Ok(lease)
     }
 
-    pub fn disconnect(&mut self, player_id: PlayerId, connection_epoch: u32, current_tick: u64) -> bool {
+    pub fn disconnect(
+        &mut self,
+        player_id: PlayerId,
+        connection_epoch: u32,
+        current_tick: u64,
+    ) -> bool {
         let Some(session) = self.players.get_mut(&player_id) else {
             return false;
         };
@@ -196,15 +215,6 @@ impl SessionRegistry {
             }
         }
         expired
-    }
-
-    fn lease(&self, player_id: PlayerId, session: PlayerSession) -> SessionLease {
-        SessionLease {
-            player_id,
-            connection_epoch: session.connection_epoch,
-            reconnect_token: session.token,
-            reconnect_grace_ticks: self.reconnect_grace_ticks,
-        }
     }
 }
 
@@ -234,7 +244,10 @@ mod tests {
         assert_eq!(reconnected.player_id, admitted.player_id);
         assert_eq!(reconnected.connection_epoch, 2);
         assert_eq!(reconnected.reconnect_token, token(2));
-        assert_eq!(sessions.reconnect(token(1), token(3), 12), Err(SessionError::UnknownToken));
+        assert_eq!(
+            sessions.reconnect(token(1), token(3), 12),
+            Err(SessionError::UnknownToken)
+        );
     }
 
     #[test]
