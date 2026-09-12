@@ -201,6 +201,14 @@ impl SessionRegistry {
         true
     }
 
+    pub fn remove_slot(&mut self, player_id: PlayerId) -> bool {
+        let Some(session) = self.players.remove(&player_id) else {
+            return false;
+        };
+        self.tokens.remove(&session.token);
+        true
+    }
+
     pub fn expire(&mut self, current_tick: u64) -> Vec<PlayerId> {
         let expired = self
             .players
@@ -210,9 +218,7 @@ impl SessionRegistry {
             })
             .collect::<Vec<_>>();
         for player_id in &expired {
-            if let Some(session) = self.players.remove(player_id) {
-                self.tokens.remove(&session.token);
-            }
+            self.remove_slot(*player_id);
         }
         expired
     }
