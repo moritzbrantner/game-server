@@ -1,5 +1,6 @@
 use crate::PlayerId;
 use crate::protocol::MAX_COMMAND_PAYLOAD_BYTES;
+use crate::recovery::{RecoveryError, RecoveryImage};
 use crate::replay::{ReplayLog, ReplayRecord};
 use crate::session::{ReconnectToken, SessionError, SessionLease, SessionRegistry};
 use crate::simulation::{GameSimulation, SimulationError, SimulationSnapshot};
@@ -19,6 +20,8 @@ pub enum RuntimeError {
     StaleConnection,
     InvalidSequence,
     CommandPayloadTooLarge { maximum: usize, actual: usize },
+    Draining,
+    Frozen,
 }
 
 impl fmt::Display for RuntimeError {
@@ -32,6 +35,8 @@ impl fmt::Display for RuntimeError {
                 formatter,
                 "command payload size {actual} exceeds maximum {maximum}"
             ),
+            Self::Draining => write!(formatter, "match is draining and rejects new admissions"),
+            Self::Frozen => write!(formatter, "match is frozen for recovery"),
         }
     }
 }
@@ -50,12 +55,42 @@ impl From<SimulationError> for RuntimeError {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RuntimeRecoveryError {
+    ReplayCaptureDisabled,
+    RuntimeNotFrozen,
+    Recovery(RecoveryError),
+}
+
+impl fmt::Display for RuntimeRecoveryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ReplayCaptureDisabled => {
+                write!(formatter, "runtime recovery requires replay capture")
+            }
+            Self::RuntimeNotFrozen => write!(formatter, "runtime must be frozen before recovery"),
+            Self::Recovery(error) => write!(formatter, "recovery error: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for RuntimeRecoveryError {}
+
+impl From<RecoveryError> for RuntimeRecoveryError {
+    fn from(error: RecoveryError) -> Self {
+        Self::Recovery(error)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct MatchRuntime<S> {
     simulation: S,
     sessions: SessionRegistry,
     last_sequences: BTreeMap<PlayerId, u32>,
     replay: Option<ReplayLog>,
+    reconnect_grace_ticks: u64,
+    draining: bool,
+    frozen: bool,
 }
 
 impl<S: GameSimulation> MatchRuntime<S> {
@@ -67,6 +102,32 @@ impl<S: GameSimulation> MatchRuntime<S> {
         Self::build(simulation, reconnect_grace_ticks, true)
     }
 
+    pub fn restore_from_recovery(
+        simulation: S,
+        image: RecoveryImage,
+    ) -> Result<Self, RuntimeRecoveryError> {
+        let _ = image.encode()?;
+        let max_players = simulation.max_players();
+        let simulation = image.restore_simulation(simulation)?;
+        let sessions = SessionRegistry::restore(
+            max_players,
+            image.reconnect_grace_ticks,
+            image.current_tick,
+            &image.sessions,
+        )
+        .map_err(RecoveryError::from)?;
+        let last_sequences = image.last_sequences();
+        Ok(Self {
+            simulation,
+            sessions,
+            last_sequences,
+            replay: Some(image.replay),
+            reconnect_grace_ticks: image.reconnect_grace_ticks,
+            draining: false,
+            frozen: false,
+        })
+    }
+
     fn build(simulation: S, reconnect_grace_ticks: u64, capture_replay: bool) -> Self {
         let max_players = simulation.max_players();
         Self {
@@ -74,6 +135,9 @@ impl<S: GameSimulation> MatchRuntime<S> {
             sessions: SessionRegistry::new(max_players, reconnect_grace_ticks),
             last_sequences: BTreeMap::new(),
             replay: capture_replay.then(ReplayLog::default),
+            reconnect_grace_ticks,
+            draining: false,
+            frozen: false,
         }
     }
 
@@ -97,11 +161,67 @@ impl<S: GameSimulation> MatchRuntime<S> {
         self.sessions.active_count()
     }
 
+    pub fn is_draining(&self) -> bool {
+        self.draining
+    }
+
+    pub fn is_frozen(&self) -> bool {
+        self.frozen
+    }
+
     pub fn replay_log(&self) -> Option<&ReplayLog> {
         self.replay.as_ref()
     }
 
+    pub fn begin_drain(&mut self) {
+        self.draining = true;
+    }
+
+    pub fn freeze_for_recovery(&mut self) {
+        self.draining = true;
+        self.frozen = true;
+    }
+
+    pub fn resume_after_failed_recovery(&mut self) {
+        self.frozen = false;
+        self.draining = false;
+    }
+
+    pub fn recovery_image(&self) -> Result<RecoveryImage, RuntimeRecoveryError> {
+        if !self.frozen {
+            return Err(RuntimeRecoveryError::RuntimeNotFrozen);
+        }
+        let mut replay = self
+            .replay
+            .clone()
+            .ok_or(RuntimeRecoveryError::ReplayCaptureDisabled)?;
+        let snapshot = self.simulation.snapshot().map_err(RecoveryError::from)?;
+        let checkpoint_matches = matches!(
+            replay.records().last(),
+            Some(ReplayRecord::Checkpoint { snapshot: previous }) if previous == &snapshot
+        );
+        if !checkpoint_matches {
+            replay.append(ReplayRecord::Checkpoint {
+                snapshot: snapshot.clone(),
+            });
+        }
+        let image = RecoveryImage {
+            current_tick: snapshot.tick,
+            reconnect_grace_ticks: self.reconnect_grace_ticks,
+            replay,
+            sessions: self.sessions.recovery_snapshot(snapshot.tick),
+        };
+        let _ = image.encode()?;
+        Ok(image)
+    }
+
     pub fn admit(&mut self, token: ReconnectToken) -> Result<SessionLease, RuntimeError> {
+        if self.frozen {
+            return Err(RuntimeError::Frozen);
+        }
+        if self.draining {
+            return Err(RuntimeError::Draining);
+        }
         let lease = self.sessions.admit(token)?;
         if let Err(error) = self.simulation.add_player(lease.player_id) {
             self.sessions.remove_slot(lease.player_id);
@@ -120,6 +240,9 @@ impl<S: GameSimulation> MatchRuntime<S> {
         previous_token: ReconnectToken,
         replacement_token: ReconnectToken,
     ) -> Result<SessionLease, RuntimeError> {
+        if self.frozen {
+            return Err(RuntimeError::Frozen);
+        }
         let current_tick = self.current_tick();
         Ok(self
             .sessions
@@ -127,9 +250,30 @@ impl<S: GameSimulation> MatchRuntime<S> {
     }
 
     pub fn disconnect(&mut self, player_id: PlayerId, connection_epoch: u32) -> bool {
+        if self.frozen {
+            return false;
+        }
         let current_tick = self.current_tick();
         self.sessions
             .disconnect(player_id, connection_epoch, current_tick)
+    }
+
+    pub(crate) fn abort_admission(&mut self, player_id: PlayerId, connection_epoch: u32) -> bool {
+        if self.frozen || !self.sessions.owns_connection(player_id, connection_epoch) {
+            return false;
+        }
+        if !self.simulation.remove_player(player_id) {
+            return false;
+        }
+        if !self.sessions.remove_slot(player_id) {
+            return false;
+        }
+        self.last_sequences.remove(&player_id);
+        self.record(ReplayRecord::PlayerRemoved {
+            tick: self.current_tick(),
+            player_id,
+        });
+        true
     }
 
     pub fn submit_command(
@@ -139,6 +283,9 @@ impl<S: GameSimulation> MatchRuntime<S> {
         sequence: u32,
         payload: &[u8],
     ) -> Result<CommandOutcome, RuntimeError> {
+        if self.frozen {
+            return Err(RuntimeError::Frozen);
+        }
         if sequence == 0 {
             return Err(RuntimeError::InvalidSequence);
         }
@@ -172,6 +319,9 @@ impl<S: GameSimulation> MatchRuntime<S> {
     }
 
     pub fn advance_tick(&mut self) -> Result<SimulationSnapshot, RuntimeError> {
+        if self.frozen {
+            return Err(RuntimeError::Frozen);
+        }
         let current_tick = self.current_tick();
         let expired = self.sessions.expire(current_tick);
         for player_id in expired {
@@ -394,5 +544,95 @@ mod tests {
                 })
         );
         verify_replay(FakeSimulation::default(), runtime.replay_log().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn draining_blocks_new_admission_but_still_allows_reconnect() {
+        let mut runtime = MatchRuntime::new_with_replay_capture(FakeSimulation::default(), 10);
+        let first = runtime.admit(token(1)).unwrap();
+        assert!(runtime.disconnect(first.player_id, first.connection_epoch));
+        runtime.begin_drain();
+        assert_eq!(runtime.admit(token(2)), Err(RuntimeError::Draining));
+        assert_eq!(
+            runtime.reconnect(token(1), token(3)).unwrap().player_id,
+            first.player_id
+        );
+    }
+
+    #[test]
+    fn aborted_admission_releases_capacity_and_keeps_replay_valid() {
+        let mut runtime = MatchRuntime::new_with_replay_capture(FakeSimulation::default(), 10);
+        let lease = runtime.admit(token(1)).unwrap();
+
+        assert!(runtime.abort_admission(lease.player_id, lease.connection_epoch));
+        assert_eq!(runtime.slot_count(), 0);
+        assert_eq!(runtime.active_count(), 0);
+        assert!(runtime.simulation.players.is_empty());
+
+        runtime.advance_tick().unwrap();
+        verify_replay(FakeSimulation::default(), runtime.replay_log().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn failed_recovery_can_resume_runtime_without_state_loss() {
+        let mut runtime = MatchRuntime::new_with_replay_capture(FakeSimulation::default(), 10);
+        let lease = runtime.admit(token(1)).unwrap();
+        runtime.freeze_for_recovery();
+        runtime.resume_after_failed_recovery();
+        assert!(!runtime.is_draining());
+        assert!(!runtime.is_frozen());
+        assert_eq!(
+            runtime
+                .submit_command(lease.player_id, lease.connection_epoch, 1, b"resume")
+                .unwrap(),
+            CommandOutcome::Applied
+        );
+    }
+
+    #[test]
+    fn frozen_runtime_round_trips_through_recovery() {
+        let mut runtime = MatchRuntime::new_with_replay_capture(FakeSimulation::default(), 10);
+        let lease = runtime.admit(token(1)).unwrap();
+        runtime
+            .submit_command(lease.player_id, lease.connection_epoch, 1, b"move")
+            .unwrap();
+        let expected = runtime.advance_tick().unwrap();
+        runtime.freeze_for_recovery();
+        assert_eq!(
+            runtime.submit_command(lease.player_id, lease.connection_epoch, 2, b"late"),
+            Err(RuntimeError::Frozen)
+        );
+        assert_eq!(runtime.advance_tick(), Err(RuntimeError::Frozen));
+
+        let image = runtime.recovery_image().unwrap();
+        let mut restored =
+            MatchRuntime::restore_from_recovery(FakeSimulation::default(), image).unwrap();
+        assert_eq!(restored.snapshot().unwrap(), expected);
+        assert_eq!(restored.active_count(), 0);
+        let reconnected = restored.reconnect(token(1), token(2)).unwrap();
+        assert_eq!(reconnected.player_id, lease.player_id);
+        assert_eq!(reconnected.connection_epoch, lease.connection_epoch + 1);
+        assert_eq!(
+            restored
+                .submit_command(
+                    reconnected.player_id,
+                    reconnected.connection_epoch,
+                    1,
+                    b"stale"
+                )
+                .unwrap(),
+            CommandOutcome::IgnoredStale
+        );
+        assert_eq!(
+            restored
+                .submit_command(
+                    reconnected.player_id,
+                    reconnected.connection_epoch,
+                    2,
+                    b"new"
+                )
+                .unwrap(),
+            CommandOutcome::Applied
+        );
     }
 }

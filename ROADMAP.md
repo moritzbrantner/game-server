@@ -41,15 +41,15 @@ The existing reliable welcome stream carries admission/reconnect metadata. Realt
 
 The acceptance harness exercises baseline traffic, sustained delay/jitter/loss/reordering/rate impairment, and a 450 ms total-loss window with real kernel qdiscs. The transient-outage run retained connection epoch 1 and converged final sent command sequence 200 to authoritative applied sequence 200 after the link recovered. `tc -s qdisc` drop/requeue counters are retained as evidence; exact latency and packet-loss counts are not benchmark claims.
 
-### Slice E2 — replay and restore
+### Slice E2 — replay and restore — completed
 
 - [x] Add append-only replay logs for successful player admission/removal, applied commands, and authoritative snapshot checkpoints.
 - [x] Add deterministic replay verification against a fresh game simulation.
-- [ ] Add graceful draining/shutdown and restart-safe match recovery semantics.
+- [x] Add graceful draining/shutdown and restart-safe match recovery semantics.
 
 Replay capture is opt-in so ordinary matches do not accumulate unbounded evidence in memory. Captured records have a versioned deterministic binary format, rejected/stale commands are deliberately omitted, and every captured authoritative tick includes a snapshot checkpoint. The verifier replays lifecycle changes and accepted commands in authoritative tick order and fails on the first snapshot hash or payload divergence.
 
-Durable file/object storage is intentionally not hidden inside `MatchRuntime` yet. Making journal persistence part of restart safety requires an explicit policy for I/O failure versus authoritative mutation; that belongs with the remaining recovery slice rather than making game simulation depend on an arbitrary storage backend.
+Graceful recovery freezes authoritative mutation before producing a bounded recovery image, atomically persists verified replay plus reconnect-session state, and restores live slots as disconnected/reconnectable after restart. Recovery-file reads and writes are bounded, startup fails closed on malformed evidence, successfully restored images are consumed only after the WebTransport endpoint is ready, and failed persistence resumes the live runtime rather than exiting with undurable state. This remains graceful restart recovery, not arbitrary crash journaling; durable per-command persistence still requires an explicit storage-failure transaction policy.
 
 ## Milestone F — process hosting
 

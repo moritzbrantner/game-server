@@ -1,16 +1,20 @@
 use crate::protocol::{
     RECONNECT_TOKEN_BYTES, SnapshotFrame, Welcome, decode_command, encode_snapshot, encode_welcome,
 };
-use crate::runtime::MatchRuntime;
+use crate::recovery::RecoveryImage;
+use crate::runtime::{MatchRuntime, RuntimeError};
 use crate::session::{ReconnectToken, SessionLease};
 use crate::simulation::GameSimulation;
 use ring::rand::{SecureRandom, SystemRandom};
 use std::error::Error;
 use std::fmt;
-use std::path::PathBuf;
+use std::fs::{self, File};
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::{Mutex, broadcast, mpsc};
+use tokio::task::{JoinHandle, spawn_blocking};
 use tokio::time::MissedTickBehavior;
 use wtransport::{Connection, Endpoint, Identity, ServerConfig, VarInt};
 
@@ -19,6 +23,7 @@ const CLOSE_DATAGRAM: u32 = 2;
 const CLOSE_RUNTIME: u32 = 3;
 const CLOSE_SERVER: u32 = 4;
 const SNAPSHOT_CHANNEL_DEPTH: usize = 1;
+const WELCOME_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug)]
 pub struct WebTransportConfig {
@@ -26,6 +31,8 @@ pub struct WebTransportConfig {
     pub certificate_pem: PathBuf,
     pub private_key_pem: PathBuf,
     pub session_path: String,
+    pub recovery_path: Option<PathBuf>,
+    pub drain_grace: Duration,
 }
 
 impl WebTransportConfig {
@@ -38,6 +45,7 @@ impl WebTransportConfig {
 pub enum TransportError {
     Identity(String),
     Endpoint(String),
+    Recovery(String),
     InvalidTickRate,
     PlayerCapacityTooLarge(usize),
 }
@@ -47,6 +55,7 @@ impl fmt::Display for TransportError {
         match self {
             Self::Identity(error) => write!(formatter, "TLS identity error: {error}"),
             Self::Endpoint(error) => write!(formatter, "WebTransport endpoint error: {error}"),
+            Self::Recovery(error) => write!(formatter, "recovery error: {error}"),
             Self::InvalidTickRate => write!(formatter, "simulation tick rate must be non-zero"),
             Self::PlayerCapacityTooLarge(capacity) => {
                 write!(formatter, "player capacity {capacity} exceeds wire limit")
@@ -66,6 +75,7 @@ enum AdmissionRequest {
 struct ServerState<S> {
     runtime: Arc<Mutex<MatchRuntime<S>>>,
     snapshots: broadcast::Sender<Vec<u8>>,
+    shutdown: broadcast::Sender<()>,
 }
 
 impl<S> Clone for ServerState<S> {
@@ -73,6 +83,7 @@ impl<S> Clone for ServerState<S> {
         Self {
             runtime: Arc::clone(&self.runtime),
             snapshots: self.snapshots.clone(),
+            shutdown: self.shutdown.clone(),
         }
     }
 }
@@ -85,6 +96,22 @@ pub async fn serve<S>(
 where
     S: GameSimulation,
 {
+    let (shutdown_sender, shutdown_receiver) = mpsc::channel(1);
+    let result =
+        serve_with_shutdown(simulation, reconnect_grace_ticks, config, shutdown_receiver).await;
+    drop(shutdown_sender);
+    result
+}
+
+pub async fn serve_with_shutdown<S>(
+    simulation: S,
+    reconnect_grace_ticks: u64,
+    config: WebTransportConfig,
+    mut shutdown_requests: mpsc::Receiver<()>,
+) -> Result<(), TransportError>
+where
+    S: GameSimulation,
+{
     if simulation.tick_hz() == 0 {
         return Err(TransportError::InvalidTickRate);
     }
@@ -93,6 +120,7 @@ where
             simulation.max_players(),
         ));
     }
+
     let identity = Identity::load_pemfiles(&config.certificate_pem, &config.private_key_pem)
         .await
         .map_err(|error| TransportError::Identity(error.to_string()))?;
@@ -104,19 +132,22 @@ where
     let endpoint = Endpoint::server(server_config)
         .map_err(|error| TransportError::Endpoint(error.to_string()))?;
 
-    let tick_hz = simulation.tick_hz();
+    let runtime = build_runtime(
+        simulation,
+        reconnect_grace_ticks,
+        config.recovery_path.as_deref(),
+    )?;
+    let tick_hz = runtime.tick_hz();
     let (snapshots, _) = broadcast::channel::<Vec<u8>>(SNAPSHOT_CHANNEL_DEPTH);
+    let (shutdown, _) = broadcast::channel::<()>(1);
     let state = ServerState {
-        runtime: Arc::new(Mutex::new(MatchRuntime::new(
-            simulation,
-            reconnect_grace_ticks,
-        ))),
+        runtime: Arc::new(Mutex::new(runtime)),
         snapshots,
+        shutdown,
     };
-    spawn_tick_loop(state.clone(), tick_hz);
+    let tick_task = spawn_tick_loop(state.clone(), tick_hz);
 
-    loop {
-        let incoming = endpoint.accept().await;
+    let spawn_incoming = |incoming: wtransport::endpoint::IncomingSession| {
         let state = state.clone();
         let session_path = config.session_path.clone();
         tokio::spawn(async move {
@@ -142,10 +173,118 @@ where
                 eprintln!("game session failed: {error}");
             }
         });
+    };
+
+    let mut shutdown_channel_open = true;
+    loop {
+        tokio::select! {
+            incoming = endpoint.accept() => spawn_incoming(incoming),
+            shutdown = shutdown_requests.recv(), if shutdown_channel_open => {
+                let Some(()) = shutdown else {
+                    shutdown_channel_open = false;
+                    continue;
+                };
+
+                state.runtime.lock().await.begin_drain();
+                let drain_deadline = tokio::time::sleep(config.drain_grace);
+                tokio::pin!(drain_deadline);
+                loop {
+                    tokio::select! {
+                        _ = &mut drain_deadline => break,
+                        incoming = endpoint.accept() => spawn_incoming(incoming),
+                    }
+                }
+
+                match persist_graceful_recovery(&state, config.recovery_path.as_deref()).await {
+                    Ok(()) => {
+                        let _ = state.shutdown.send(());
+                        stop_tick_loop(tick_task).await;
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        eprintln!("graceful shutdown aborted because recovery persistence failed: {error}");
+                    }
+                }
+            }
+        }
     }
 }
 
-fn spawn_tick_loop<S: GameSimulation>(state: ServerState<S>, tick_hz: u16) {
+fn build_runtime<S: GameSimulation>(
+    simulation: S,
+    reconnect_grace_ticks: u64,
+    recovery_path: Option<&Path>,
+) -> Result<MatchRuntime<S>, TransportError> {
+    let Some(path) = recovery_path else {
+        return Ok(MatchRuntime::new(simulation, reconnect_grace_ticks));
+    };
+
+    match fs::metadata(path) {
+        Ok(_) => {
+            let image = RecoveryImage::read_file(path)
+                .map_err(|error| TransportError::Recovery(error.to_string()))?;
+            let runtime = MatchRuntime::restore_from_recovery(simulation, image)
+                .map_err(|error| TransportError::Recovery(error.to_string()))?;
+            consume_recovery_file(path)?;
+            Ok(runtime)
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(
+            MatchRuntime::new_with_replay_capture(simulation, reconnect_grace_ticks),
+        ),
+        Err(error) => Err(TransportError::Recovery(error.to_string())),
+    }
+}
+
+async fn persist_graceful_recovery<S: GameSimulation>(
+    state: &ServerState<S>,
+    recovery_path: Option<&Path>,
+) -> Result<(), String> {
+    let image = {
+        let mut runtime = state.runtime.lock().await;
+        runtime.freeze_for_recovery();
+        match recovery_path {
+            Some(_) => match runtime.recovery_image() {
+                Ok(image) => Some(image),
+                Err(error) => {
+                    runtime.resume_after_failed_recovery();
+                    return Err(error.to_string());
+                }
+            },
+            None => None,
+        }
+    };
+
+    let result = match (recovery_path, image) {
+        (Some(path), Some(image)) => {
+            let path = path.to_path_buf();
+            match spawn_blocking(move || image.write_atomic(&path)).await {
+                Ok(result) => result.map_err(|error| error.to_string()),
+                Err(error) => Err(format!("recovery persistence task failed: {error}")),
+            }
+        }
+        (None, None) => Ok(()),
+        _ => Err("recovery persistence state mismatch".to_owned()),
+    };
+
+    if result.is_err() {
+        state.runtime.lock().await.resume_after_failed_recovery();
+    }
+    result
+}
+
+fn consume_recovery_file(path: &Path) -> Result<(), TransportError> {
+    fs::remove_file(path).map_err(|error| TransportError::Recovery(error.to_string()))?;
+    #[cfg(unix)]
+    {
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| TransportError::Recovery(error.to_string()))?;
+    }
+    Ok(())
+}
+
+fn spawn_tick_loop<S: GameSimulation>(state: ServerState<S>, tick_hz: u16) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker =
             tokio::time::interval(Duration::from_micros(1_000_000_u64 / u64::from(tick_hz)));
@@ -154,6 +293,7 @@ fn spawn_tick_loop<S: GameSimulation>(state: ServerState<S>, tick_hz: u16) {
             ticker.tick().await;
             let snapshot = match state.runtime.lock().await.advance_tick() {
                 Ok(snapshot) => snapshot,
+                Err(RuntimeError::Frozen) => continue,
                 Err(error) => {
                     eprintln!("authoritative tick failed: {error}");
                     continue;
@@ -171,7 +311,12 @@ fn spawn_tick_loop<S: GameSimulation>(state: ServerState<S>, tick_hz: u16) {
                 Err(error) => eprintln!("snapshot encoding failed: {error}"),
             }
         }
-    });
+    })
+}
+
+async fn stop_tick_loop(tick_task: JoinHandle<()>) {
+    tick_task.abort();
+    let _ = tick_task.await;
 }
 
 async fn handle_connection<S: GameSimulation>(
@@ -209,7 +354,19 @@ async fn handle_connection<S: GameSimulation>(
         }
     };
 
-    let result = run_admitted_connection(&connection, lease, max_datagram_size, &state).await;
+    if let Err(error) = send_welcome(&connection, lease, &state).await {
+        let cleanup = {
+            let mut runtime = state.runtime.lock().await;
+            rollback_failed_welcome(&mut runtime, admission, lease)
+        };
+        if let Err(cleanup_error) = cleanup {
+            eprintln!("failed to roll back incomplete welcome: {cleanup_error}");
+        }
+        close(&connection, CLOSE_RUNTIME, &error);
+        return Ok(());
+    }
+
+    let result = run_established_connection(&connection, lease, max_datagram_size, &state).await;
     state
         .runtime
         .lock()
@@ -218,10 +375,9 @@ async fn handle_connection<S: GameSimulation>(
     result
 }
 
-async fn run_admitted_connection<S: GameSimulation>(
+async fn send_welcome<S: GameSimulation>(
     connection: &Connection,
     lease: SessionLease,
-    max_datagram_size: usize,
     state: &ServerState<S>,
 ) -> Result<(), String> {
     let (tick_hz, max_players, current_tick) = {
@@ -242,35 +398,88 @@ async fn run_admitted_connection<S: GameSimulation>(
         reconnect_token: lease.reconnect_token.0,
         reconnect_grace_ticks: lease.reconnect_grace_ticks,
     });
-    let opening = connection
-        .open_uni()
-        .await
-        .map_err(|error| error.to_string())?;
-    let mut welcome_stream = opening.await.map_err(|error| error.to_string())?;
-    welcome_stream
-        .write_all(&welcome)
-        .await
-        .map_err(|error| error.to_string())?;
-    welcome_stream
-        .finish()
-        .await
-        .map_err(|error| error.to_string())?;
+    let handshake = async {
+        let opening = connection
+            .open_uni()
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut welcome_stream = opening.await.map_err(|error| error.to_string())?;
+        welcome_stream
+            .write_all(&welcome)
+            .await
+            .map_err(|error| error.to_string())?;
+        welcome_stream
+            .finish()
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    };
 
+    tokio::select! {
+        result = tokio::time::timeout(WELCOME_HANDSHAKE_TIMEOUT, handshake) => {
+            match result {
+                Ok(result) => result,
+                Err(_) => Err("welcome handshake timed out".to_owned()),
+            }
+        }
+        _ = connection.closed() => Err("connection closed before welcome completed".to_owned()),
+    }
+}
+
+fn rollback_failed_welcome<S: GameSimulation>(
+    runtime: &mut MatchRuntime<S>,
+    admission: AdmissionRequest,
+    lease: SessionLease,
+) -> Result<(), String> {
+    if runtime.is_frozen() {
+        return Err("runtime froze before welcome rollback".to_owned());
+    }
+
+    match admission {
+        AdmissionRequest::New => runtime
+            .abort_admission(lease.player_id, lease.connection_epoch)
+            .then_some(())
+            .ok_or_else(|| "failed to release incomplete new admission".to_owned()),
+        AdmissionRequest::Reconnect(previous_token) => {
+            if !runtime.disconnect(lease.player_id, lease.connection_epoch) {
+                return Err("welcome rollback no longer owns the connection epoch".to_owned());
+            }
+            let restored = runtime
+                .reconnect(lease.reconnect_token, previous_token)
+                .map_err(|error| format!("failed to restore previous reconnect token: {error}"))?;
+            if !runtime.disconnect(restored.player_id, restored.connection_epoch) {
+                return Err("failed to return restored reconnect token to grace state".to_owned());
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn run_established_connection<S: GameSimulation>(
+    connection: &Connection,
+    lease: SessionLease,
+    max_datagram_size: usize,
+    state: &ServerState<S>,
+) -> Result<(), String> {
     let mut snapshots = state.snapshots.subscribe();
+    let mut shutdown = state.shutdown.subscribe();
     loop {
         tokio::select! {
             datagram = connection.receive_datagram() => {
                 match datagram {
                     Ok(datagram) => match decode_command(datagram.as_ref()) {
                         Ok(command) => {
-                            if let Err(error) = state.runtime.lock().await.submit_command(
+                            match state.runtime.lock().await.submit_command(
                                 lease.player_id,
                                 lease.connection_epoch,
                                 command.sequence,
                                 &command.payload,
                             ) {
-                                close(connection, CLOSE_PROTOCOL, &error.to_string());
-                                return Ok(());
+                                Ok(_) | Err(RuntimeError::Frozen) => {}
+                                Err(error) => {
+                                    close(connection, CLOSE_PROTOCOL, &error.to_string());
+                                    return Ok(());
+                                }
                             }
                         }
                         Err(error) => {
@@ -296,6 +505,10 @@ async fn run_admitted_connection<S: GameSimulation>(
                         return Ok(());
                     }
                 }
+            }
+            _ = shutdown.recv() => {
+                close(connection, CLOSE_SERVER, "server shutting down");
+                return Ok(());
             }
             _ = connection.closed() => return Ok(()),
         }
@@ -326,6 +539,8 @@ fn close(connection: &Connection, code: u32, reason: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::world::DemoSimulation;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn parses_new_and_reconnect_paths() {
@@ -345,5 +560,88 @@ mod tests {
             parse_admission_request("/match/one/reconnect/not-valid", "/match/one"),
             None
         );
+    }
+
+    #[test]
+    fn failed_new_welcome_releases_unusable_slot() {
+        let mut runtime = MatchRuntime::new_with_replay_capture(DemoSimulation::new(), 10);
+        let lease = runtime
+            .admit(ReconnectToken([1; RECONNECT_TOKEN_BYTES]))
+            .unwrap();
+
+        rollback_failed_welcome(&mut runtime, AdmissionRequest::New, lease).unwrap();
+
+        assert_eq!(runtime.slot_count(), 0);
+        assert_eq!(runtime.active_count(), 0);
+    }
+
+    #[test]
+    fn failed_reconnect_welcome_restores_the_client_known_token() {
+        let previous_token = ReconnectToken([1; RECONNECT_TOKEN_BYTES]);
+        let replacement_token = ReconnectToken([2; RECONNECT_TOKEN_BYTES]);
+        let next_token = ReconnectToken([3; RECONNECT_TOKEN_BYTES]);
+        let mut runtime = MatchRuntime::new_with_replay_capture(DemoSimulation::new(), 10);
+        let original = runtime.admit(previous_token).unwrap();
+        assert!(runtime.disconnect(original.player_id, original.connection_epoch));
+        let failed = runtime
+            .reconnect(previous_token, replacement_token)
+            .unwrap();
+
+        rollback_failed_welcome(
+            &mut runtime,
+            AdmissionRequest::Reconnect(previous_token),
+            failed,
+        )
+        .unwrap();
+
+        let recovered = runtime.reconnect(previous_token, next_token).unwrap();
+        assert_eq!(recovered.player_id, original.player_id);
+        assert!(
+            runtime
+                .reconnect(replacement_token, previous_token)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn recovery_startup_consumes_valid_image_and_rejects_corruption() {
+        let path = unique_test_path();
+        let mut runtime = MatchRuntime::new_with_replay_capture(DemoSimulation::new(), 10);
+        let lease = runtime
+            .admit(ReconnectToken([1; RECONNECT_TOKEN_BYTES]))
+            .unwrap();
+        runtime.advance_tick().unwrap();
+        runtime.freeze_for_recovery();
+        runtime
+            .recovery_image()
+            .unwrap()
+            .write_atomic(&path)
+            .unwrap();
+
+        let restored = build_runtime(DemoSimulation::new(), 10, Some(&path)).unwrap();
+        assert_eq!(restored.slot_count(), 1);
+        assert!(!path.exists());
+        assert_eq!(restored.current_tick(), 1);
+        assert_eq!(restored.active_count(), 0);
+        assert_eq!(lease.player_id, 1);
+
+        fs::write(&path, b"not a recovery image").unwrap();
+        assert!(matches!(
+            build_runtime(DemoSimulation::new(), 10, Some(&path)),
+            Err(TransportError::Recovery(_))
+        ));
+        assert!(path.exists());
+        let _ = fs::remove_file(path);
+    }
+
+    fn unique_test_path() -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "game-server-transport-recovery-{}-{nonce}.bin",
+            std::process::id()
+        ))
     }
 }
