@@ -16,6 +16,7 @@ const PLAYER_BODY_BYTES: usize = 4;
 const COMMAND_FIXED_BODY_BYTES: usize = 4 + 4 + 4;
 const CHECKPOINT_FIXED_BODY_BYTES: usize = 8 + 4;
 const MAX_REPLAY_BODY_BYTES: usize = CHECKPOINT_FIXED_BODY_BYTES + MAX_SNAPSHOT_PAYLOAD_BYTES;
+const MAX_VERIFIER_TICK_GAP: u64 = 1;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReplayRecord {
@@ -167,6 +168,11 @@ pub enum ReplayError {
         previous: u64,
         actual: u64,
     },
+    TickGapTooLarge {
+        from_tick: u64,
+        to_tick: u64,
+        maximum: u64,
+    },
     ReplayStartsBeforeSimulation {
         simulation_tick: u64,
         record_tick: u64,
@@ -217,6 +223,14 @@ impl fmt::Display for ReplayError {
             Self::NonMonotonicTick { previous, actual } => write!(
                 formatter,
                 "replay tick moved backward from {previous} to {actual}"
+            ),
+            Self::TickGapTooLarge {
+                from_tick,
+                to_tick,
+                maximum,
+            } => write!(
+                formatter,
+                "replay tick gap from {from_tick} to {to_tick} exceeds maximum {maximum}"
             ),
             Self::ReplayStartsBeforeSimulation {
                 simulation_tick,
@@ -277,7 +291,15 @@ pub fn verify_replay<S: GameSimulation>(
                 record_tick,
             });
         }
-        while simulation.current_tick() < record_tick {
+        let tick_gap = record_tick - simulation_tick;
+        if tick_gap > MAX_VERIFIER_TICK_GAP {
+            return Err(ReplayError::TickGapTooLarge {
+                from_tick: simulation_tick,
+                to_tick: record_tick,
+                maximum: MAX_VERIFIER_TICK_GAP,
+            });
+        }
+        if tick_gap == 1 {
             simulation.advance_tick()?;
         }
 
@@ -574,5 +596,23 @@ mod tests {
         assert_eq!(verification.records_verified, 5);
         assert_eq!(verification.checkpoints_verified, 2);
         assert_eq!(verification.final_snapshot, second);
+    }
+
+    #[test]
+    fn verifier_rejects_implausible_tick_gap_before_advancing() {
+        let mut log = ReplayLog::default();
+        log.append(ReplayRecord::PlayerAdmitted {
+            tick: u64::MAX,
+            player_id: 1,
+        });
+
+        assert_eq!(
+            verify_replay(DemoSimulation::new(), &log),
+            Err(ReplayError::TickGapTooLarge {
+                from_tick: 0,
+                to_tick: u64::MAX,
+                maximum: MAX_VERIFIER_TICK_GAP,
+            })
+        );
     }
 }
