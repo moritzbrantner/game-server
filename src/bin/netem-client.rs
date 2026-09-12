@@ -9,6 +9,8 @@ use tokio::time::{sleep, timeout};
 use wtransport::tls::{Sha256Digest, Sha256DigestFmt};
 use wtransport::{ClientConfig, Endpoint};
 
+const MIN_ACCEPTED_SNAPSHOTS: u64 = 3;
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -99,17 +101,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
         {
             final_applied_sequence = final_applied_sequence.max(player.last_applied_sequence);
         }
-        if final_applied_sequence == command_count && accepted_snapshots >= 3 {
+        if final_applied_sequence == command_count && accepted_snapshots >= MIN_ACCEPTED_SNAPSHOTS {
             break;
         }
     }
 
     let progressed = match (first_tick, last_tick) {
-        (Some(first), Some(last)) => last >= first,
+        (Some(first), Some(last)) => last > first,
         _ => false,
     };
-    let expectations_hold = received_snapshots > 0
-        && accepted_snapshots > 0
+    let expectations_hold = received_snapshots >= MIN_ACCEPTED_SNAPSHOTS
+        && accepted_snapshots >= MIN_ACCEPTED_SNAPSHOTS
         && invalid_snapshots == 0
         && progressed
         && final_applied_sequence == command_count;
