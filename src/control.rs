@@ -12,6 +12,12 @@ const CONTROL_REQUEST_KIND: u8 = 1;
 const CONTROL_RESPONSE_KIND: u8 = 2;
 const CONTROL_REJECTED_KIND: u8 = 3;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ControlContext {
+    pub player_id: PlayerId,
+    pub connection_epoch: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ControlRequest {
     pub payload: Vec<u8>,
@@ -82,7 +88,11 @@ impl fmt::Display for ControlServiceError {
 impl Error for ControlServiceError {}
 
 pub trait ControlService: Send + Sync + 'static {
-    fn handle(&self, player_id: PlayerId, payload: &[u8]) -> Result<Vec<u8>, ControlServiceError>;
+    fn handle(
+        &self,
+        context: ControlContext,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, ControlServiceError>;
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -91,7 +101,7 @@ pub struct RejectControlService;
 impl ControlService for RejectControlService {
     fn handle(
         &self,
-        _player_id: PlayerId,
+        _context: ControlContext,
         _payload: &[u8],
     ) -> Result<Vec<u8>, ControlServiceError> {
         Err(ControlServiceError::new("reliable control is disabled"))
