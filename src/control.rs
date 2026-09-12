@@ -193,6 +193,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn control_context_preserves_connection_fencing_identity() {
+        let context = ControlContext {
+            player_id: 7,
+            connection_epoch: 11,
+        };
+        assert_eq!(context.player_id, 7);
+        assert_eq!(context.connection_epoch, 11);
+    }
+
+    #[test]
     fn request_and_response_round_trip_exactly() {
         let request = encode_control_request(b"ready").unwrap();
         assert_eq!(
