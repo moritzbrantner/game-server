@@ -1,5 +1,5 @@
 use crate::protocol::{PlayerId, RECONNECT_TOKEN_BYTES};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 pub const DEFAULT_MAX_PLAYERS: usize = 16;
@@ -42,6 +42,20 @@ pub struct SessionLease {
     pub reconnect_grace_ticks: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RecoverableSession {
+    pub player_id: PlayerId,
+    pub reconnect_token: ReconnectToken,
+    pub connection_epoch: u32,
+    pub remaining_grace_ticks: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionRecoverySnapshot {
+    pub next_player_id: PlayerId,
+    pub sessions: Vec<RecoverableSession>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SessionError {
     PlayerCapacity,
@@ -68,6 +82,51 @@ impl fmt::Display for SessionError {
 }
 
 impl std::error::Error for SessionError {}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SessionRecoveryError {
+    PlayerCapacity,
+    InvalidNextPlayerId,
+    InvalidPlayerId(PlayerId),
+    InvalidConnectionEpoch(PlayerId),
+    DuplicatePlayerId(PlayerId),
+    DuplicateToken,
+    GraceExceedsConfigured {
+        player_id: PlayerId,
+        remaining: u64,
+        configured: u64,
+    },
+}
+
+impl fmt::Display for SessionRecoveryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PlayerCapacity => write!(formatter, "recovery session count exceeds capacity"),
+            Self::InvalidNextPlayerId => write!(formatter, "recovery next player id is invalid"),
+            Self::InvalidPlayerId(player_id) => {
+                write!(formatter, "recovery contains invalid player id {player_id}")
+            }
+            Self::InvalidConnectionEpoch(player_id) => write!(
+                formatter,
+                "recovery contains invalid connection epoch for player {player_id}"
+            ),
+            Self::DuplicatePlayerId(player_id) => {
+                write!(formatter, "recovery contains duplicate player id {player_id}")
+            }
+            Self::DuplicateToken => write!(formatter, "recovery contains duplicate reconnect token"),
+            Self::GraceExceedsConfigured {
+                player_id,
+                remaining,
+                configured,
+            } => write!(
+                formatter,
+                "recovery grace {remaining} for player {player_id} exceeds configured grace {configured}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SessionRecoveryError {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PlayerSession {
@@ -101,6 +160,98 @@ impl SessionRegistry {
             players: BTreeMap::new(),
             tokens: BTreeMap::new(),
         }
+    }
+
+    pub fn restore(
+        max_players: usize,
+        reconnect_grace_ticks: u64,
+        current_tick: u64,
+        snapshot: &SessionRecoverySnapshot,
+    ) -> Result<Self, SessionRecoveryError> {
+        if snapshot.sessions.len() > max_players {
+            return Err(SessionRecoveryError::PlayerCapacity);
+        }
+        if snapshot.next_player_id == 0 {
+            return Err(SessionRecoveryError::InvalidNextPlayerId);
+        }
+
+        let mut players = BTreeMap::new();
+        let mut tokens = BTreeMap::new();
+        let mut player_ids = BTreeSet::new();
+        let mut reconnect_tokens = BTreeSet::new();
+        let mut maximum_player_id = 0;
+
+        for recovered in &snapshot.sessions {
+            if recovered.player_id == 0 {
+                return Err(SessionRecoveryError::InvalidPlayerId(recovered.player_id));
+            }
+            if recovered.connection_epoch == 0 {
+                return Err(SessionRecoveryError::InvalidConnectionEpoch(
+                    recovered.player_id,
+                ));
+            }
+            if recovered.remaining_grace_ticks > reconnect_grace_ticks {
+                return Err(SessionRecoveryError::GraceExceedsConfigured {
+                    player_id: recovered.player_id,
+                    remaining: recovered.remaining_grace_ticks,
+                    configured: reconnect_grace_ticks,
+                });
+            }
+            if !player_ids.insert(recovered.player_id) {
+                return Err(SessionRecoveryError::DuplicatePlayerId(
+                    recovered.player_id,
+                ));
+            }
+            if !reconnect_tokens.insert(recovered.reconnect_token) {
+                return Err(SessionRecoveryError::DuplicateToken);
+            }
+            maximum_player_id = maximum_player_id.max(recovered.player_id);
+            let session = PlayerSession {
+                token: recovered.reconnect_token,
+                connection_epoch: recovered.connection_epoch,
+                connected: false,
+                expires_at_tick: current_tick.saturating_add(recovered.remaining_grace_ticks),
+            };
+            players.insert(recovered.player_id, session);
+            tokens.insert(recovered.reconnect_token, recovered.player_id);
+        }
+
+        if snapshot.next_player_id <= maximum_player_id {
+            return Err(SessionRecoveryError::InvalidNextPlayerId);
+        }
+
+        Ok(Self {
+            max_players,
+            reconnect_grace_ticks,
+            next_player_id: snapshot.next_player_id,
+            players,
+            tokens,
+        })
+    }
+
+    pub fn recovery_snapshot(&self, current_tick: u64) -> SessionRecoverySnapshot {
+        let sessions = self
+            .players
+            .iter()
+            .map(|(&player_id, session)| RecoverableSession {
+                player_id,
+                reconnect_token: session.token,
+                connection_epoch: session.connection_epoch,
+                remaining_grace_ticks: if session.connected {
+                    self.reconnect_grace_ticks
+                } else {
+                    session.expires_at_tick.saturating_sub(current_tick)
+                },
+            })
+            .collect();
+        SessionRecoverySnapshot {
+            next_player_id: self.next_player_id,
+            sessions,
+        }
+    }
+
+    pub fn player_ids(&self) -> impl Iterator<Item = PlayerId> + '_ {
+        self.players.keys().copied()
     }
 
     pub fn slot_count(&self) -> usize {
@@ -305,5 +456,65 @@ mod tests {
         let value = ReconnectToken([0xab; RECONNECT_TOKEN_BYTES]);
         assert_eq!(ReconnectToken::decode_hex(&value.encode_hex()), Some(value));
         assert_eq!(ReconnectToken::decode_hex("not-a-token"), None);
+    }
+
+    #[test]
+    fn recovery_turns_live_connections_into_reconnectable_slots() {
+        let mut sessions = SessionRegistry::new(16, 10);
+        let first = sessions.admit(token(1)).unwrap();
+        let second = sessions.admit(token(2)).unwrap();
+        assert!(sessions.disconnect(second.player_id, second.connection_epoch, 5));
+
+        let snapshot = sessions.recovery_snapshot(8);
+        let mut restored = SessionRegistry::restore(16, 10, 20, &snapshot).unwrap();
+        assert_eq!(restored.active_count(), 0);
+        assert_eq!(restored.slot_count(), 2);
+        assert_eq!(
+            restored.reconnect(token(1), token(3), 25).unwrap().player_id,
+            first.player_id
+        );
+        assert_eq!(
+            restored.reconnect(token(2), token(4), 27).unwrap().player_id,
+            second.player_id
+        );
+    }
+
+    #[test]
+    fn recovery_rejects_duplicate_tokens_and_invalid_next_id() {
+        let duplicate = SessionRecoverySnapshot {
+            next_player_id: 3,
+            sessions: vec![
+                RecoverableSession {
+                    player_id: 1,
+                    reconnect_token: token(1),
+                    connection_epoch: 1,
+                    remaining_grace_ticks: 10,
+                },
+                RecoverableSession {
+                    player_id: 2,
+                    reconnect_token: token(1),
+                    connection_epoch: 1,
+                    remaining_grace_ticks: 10,
+                },
+            ],
+        };
+        assert_eq!(
+            SessionRegistry::restore(16, 10, 0, &duplicate),
+            Err(SessionRecoveryError::DuplicateToken)
+        );
+
+        let invalid_next = SessionRecoverySnapshot {
+            next_player_id: 2,
+            sessions: vec![RecoverableSession {
+                player_id: 2,
+                reconnect_token: token(2),
+                connection_epoch: 1,
+                remaining_grace_ticks: 10,
+            }],
+        };
+        assert_eq!(
+            SessionRegistry::restore(16, 10, 0, &invalid_next),
+            Err(SessionRecoveryError::InvalidNextPlayerId)
+        );
     }
 }
