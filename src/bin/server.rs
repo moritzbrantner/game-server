@@ -176,14 +176,8 @@ async fn handle_connection(
         }
     }
 
-    let result = run_admitted_connection(
-        &connection,
-        lease,
-        current_tick,
-        max_datagram_size,
-        &state,
-    )
-    .await;
+    let result =
+        run_admitted_connection(&connection, lease, current_tick, max_datagram_size, &state).await;
     let disconnect_tick = state.world.lock().await.tick();
     state.sessions.lock().await.disconnect(
         lease.player_id,
@@ -290,7 +284,10 @@ mod tests {
 
     #[test]
     fn parses_new_and_reconnect_paths() {
-        assert_eq!(parse_admission_request("/game"), Some(AdmissionRequest::New));
+        assert_eq!(
+            parse_admission_request("/game"),
+            Some(AdmissionRequest::New)
+        );
         let token = ReconnectToken([0xab; RECONNECT_TOKEN_BYTES]);
         assert_eq!(
             parse_admission_request(&format!("/game/reconnect/{}", token.encode_hex())),
