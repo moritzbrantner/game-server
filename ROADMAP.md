@@ -1,32 +1,45 @@
 # Roadmap
 
-## Milestone A — foundation
+## Milestone A — foundation — completed
 
-- [ ] Extract the deterministic authoritative kernel proven in `server-lab`.
-- [ ] Keep protocol encoding/versioning independent from transport.
-- [ ] Add a WebTransport/HTTP/3 adapter without moving game authority into transport code.
-- [ ] Add fail-closed CI for formatting, linting, tests, and release build.
+- [x] Extract the deterministic authoritative kernel proven in `server-lab`.
+- [x] Keep protocol encoding/versioning independent from transport.
+- [x] Add a WebTransport/HTTP/3 adapter without moving game authority into transport code.
+- [x] Add fail-closed CI for formatting, linting, tests, and release build.
 
-## Milestone B — session runtime
+## Milestone B — session runtime — mostly integrated
 
-- [ ] Add match/session admission and connection ownership.
-- [ ] Add reconnect tokens with bounded expiry and one active connection per player slot.
-- [ ] Separate reliable command/control messages from latest-state datagrams.
-- [ ] Make disconnect and reconnect lifecycle deterministic and testable.
+- [x] Add match/session admission and connection ownership.
+- [x] Add reconnect tokens with bounded expiry and one active connection per player slot.
+- [ ] Add a general reliable control-message channel distinct from realtime game-command and latest-state datagrams.
+- [x] Make disconnect and reconnect lifecycle deterministic and testable.
 
-## Milestone C — pluggable simulation
+The existing reliable welcome stream carries admission/reconnect metadata. Realtime game commands and authoritative snapshots deliberately use datagrams. The remaining item is a reusable reliable control path for future transactional/session messages; it must not turn realtime game commands into a reliable queue.
 
-- [ ] Replace the demo movement world with a `GameSimulation` contract supplied by games.
-- [ ] Keep the runtime authoritative over scheduling, identity, sequencing, and snapshot publication.
-- [ ] Provide a reference deterministic simulation for tests/examples only.
+## Milestone C — pluggable simulation — completed
 
-## Milestone D — physics integration
+- [x] Replace the demo movement world with a `GameSimulation` contract supplied by games.
+- [x] Keep the runtime authoritative over scheduling, identity, sequencing, and snapshot publication.
+- [x] Provide a reference deterministic simulation for tests/examples only.
 
-- [ ] Add an adapter boundary for `physics-engine` rather than duplicating collision/physics logic.
-- [ ] Pin integration to an explicit `physics-engine` revision and keep it optional for games without physics.
-- [ ] Add deterministic integration evidence around tick ownership and replay.
+## Milestone D — physics integration — completed first adapter
+
+- [x] Add an adapter boundary for `physics-engine` rather than duplicating collision/physics logic.
+- [x] Pin integration to an explicit `physics-engine` revision and keep it optional for games without physics.
+- [x] Add deterministic integration evidence around one authoritative tick -> one physics step and replay fingerprints.
 
 ## Milestone E — reliability
+
+### Slice E1 — packet-level WebTransport resilience
+
+- [ ] Exercise the real WebTransport/HTTP/3 runtime through isolated Linux network namespaces and kernel `tc netem` qdiscs.
+- [ ] Verify the reliable welcome stream survives normal packet impairment.
+- [ ] Verify realtime datagram loss/reordering cannot roll accepted authoritative snapshots backward.
+- [ ] Verify idempotent retransmission of the newest command converges to the newest authoritative sequence.
+- [ ] Verify a short 100% packet-loss outage can recover on the same QUIC session before idle expiry.
+- [ ] Keep exact timing/loss values as measurement evidence rather than benchmark assertions.
+
+### Slice E2 — replay and restore
 
 - [ ] Add append-only replay logs for admitted commands and authoritative snapshot checkpoints.
 - [ ] Add deterministic restore/replay verification.
@@ -38,6 +51,8 @@
 - [ ] Add placement, draining, and health/ready state.
 - [ ] Keep cross-process orchestration out of the core until a real deployment needs it.
 
+The region/process-placement experiments in `server-lab` are evidence for this milestone, not code to copy wholesale. `game-server` should first expose truthful per-process capacity, health, and drain state; a separate fleet scheduler can consume those facts later.
+
 ## Deliberately out of scope
 
-Accounts, matchmaking/rankings, game-specific inventory/combat rules, persistent-world databases, and a custom physics engine are not owned here.
+Accounts, matchmaking/rankings, game-specific inventory/combat rules, persistent-world databases, provider provisioning, and a custom physics engine are not owned here.
