@@ -27,9 +27,9 @@ The real-network acceptance probe covers successful and rejected control exchang
 
 ## Multi-match host
 
-`MatchHost` owns a bounded set of homogeneous `MatchRuntime` instances inside one process. Match IDs are URL-safe ASCII identifiers capped at 64 bytes, iteration is deterministic, and placement fails closed on duplicate IDs, process drain, or configured match capacity. Existing per-match player capacity remains owned by each simulation/runtime rather than being duplicated in the host.
+`MatchHost` owns a bounded set of homogeneous `MatchRuntime` instances inside one process. Match IDs are URL-safe ASCII identifiers capped at 64 bytes, iteration is deterministic, and placement fails closed on duplicate IDs, process drain, or configured match capacity. Failed placement returns a `PlacementFailure` containing the original ID and runtime intact, so authoritative state is never discarded merely because placement must be retried elsewhere. Existing per-match player capacity remains owned by each simulation/runtime rather than being duplicated in the host.
 
-Draining is explicit at both match and process level. Removing a match requires it to be draining and to have no active or reconnectable player slots; the removed runtime is returned to the caller rather than silently discarded. `HostStatus` and per-match status expose capacity and lifecycle facts and derive readiness from those facts instead of storing a second mutable ready flag. Network routing and externally served health/readiness endpoints are the next process-hosting slice.
+Draining is explicit at both match and process level. Removing a match requires it to be draining and to have no active or reconnectable player slots; the removed runtime is returned to the caller rather than silently discarded. Mutable runtime operations also reassert any pre-existing match/process drain before returning. `HostStatus` and per-match status expose capacity and lifecycle facts and derive readiness from those facts instead of storing a second mutable ready flag. Network routing and externally served health/readiness endpoints are the next process-hosting slice.
 
 ## Graceful recovery
 
