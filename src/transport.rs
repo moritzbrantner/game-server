@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, broadcast, mpsc};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, spawn_blocking};
 use tokio::time::MissedTickBehavior;
 use wtransport::{Connection, Endpoint, Identity, ServerConfig, VarInt};
 
@@ -96,13 +96,8 @@ where
     S: GameSimulation,
 {
     let (shutdown_sender, shutdown_receiver) = mpsc::channel(1);
-    let result = serve_with_shutdown(
-        simulation,
-        reconnect_grace_ticks,
-        config,
-        shutdown_receiver,
-    )
-    .await;
+    let result =
+        serve_with_shutdown(simulation, reconnect_grace_ticks, config, shutdown_receiver).await;
     drop(shutdown_sender);
     result
 }
@@ -125,9 +120,6 @@ where
         ));
     }
 
-    let runtime = build_runtime(simulation, reconnect_grace_ticks, config.recovery_path.as_deref())?;
-    let tick_hz = runtime.tick_hz();
-
     let identity = Identity::load_pemfiles(&config.certificate_pem, &config.private_key_pem)
         .await
         .map_err(|error| TransportError::Identity(error.to_string()))?;
@@ -139,6 +131,12 @@ where
     let endpoint = Endpoint::server(server_config)
         .map_err(|error| TransportError::Endpoint(error.to_string()))?;
 
+    let runtime = build_runtime(
+        simulation,
+        reconnect_grace_ticks,
+        config.recovery_path.as_deref(),
+    )?;
+    let tick_hz = runtime.tick_hz();
     let (snapshots, _) = broadcast::channel::<Vec<u8>>(SNAPSHOT_CHANNEL_DEPTH);
     let (shutdown, _) = broadcast::channel::<()>(1);
     let state = ServerState {
@@ -240,19 +238,35 @@ async fn persist_graceful_recovery<S: GameSimulation>(
     state: &ServerState<S>,
     recovery_path: Option<&Path>,
 ) -> Result<(), String> {
-    let mut runtime = state.runtime.lock().await;
-    runtime.freeze_for_recovery();
+    let image = {
+        let mut runtime = state.runtime.lock().await;
+        runtime.freeze_for_recovery();
+        match recovery_path {
+            Some(_) => match runtime.recovery_image() {
+                Ok(image) => Some(image),
+                Err(error) => {
+                    runtime.resume_after_failed_recovery();
+                    return Err(error.to_string());
+                }
+            },
+            None => None,
+        }
+    };
 
-    let result = match recovery_path {
-        Some(path) => runtime
-            .recovery_image()
-            .map_err(|error| error.to_string())
-            .and_then(|image| image.write_atomic(path).map_err(|error| error.to_string())),
-        None => Ok(()),
+    let result = match (recovery_path, image) {
+        (Some(path), Some(image)) => {
+            let path = path.to_path_buf();
+            match spawn_blocking(move || image.write_atomic(&path)).await {
+                Ok(result) => result.map_err(|error| error.to_string()),
+                Err(error) => Err(format!("recovery persistence task failed: {error}")),
+            }
+        }
+        (None, None) => Ok(()),
+        _ => Err("recovery persistence state mismatch".to_owned()),
     };
 
     if result.is_err() {
-        runtime.resume_after_failed_recovery();
+        state.runtime.lock().await.resume_after_failed_recovery();
     }
     result
 }
@@ -400,8 +414,7 @@ async fn run_admitted_connection<S: GameSimulation>(
                                 command.sequence,
                                 &command.payload,
                             ) {
-                                Ok(_) => {}
-                                Err(RuntimeError::Frozen) => return Ok(()),
+                                Ok(_) | Err(RuntimeError::Frozen) => {}
                                 Err(error) => {
                                     close(connection, CLOSE_PROTOCOL, &error.to_string());
                                     return Ok(());
@@ -497,7 +510,11 @@ mod tests {
             .unwrap();
         runtime.advance_tick().unwrap();
         runtime.freeze_for_recovery();
-        runtime.recovery_image().unwrap().write_atomic(&path).unwrap();
+        runtime
+            .recovery_image()
+            .unwrap()
+            .write_atomic(&path)
+            .unwrap();
 
         let restored = build_runtime(DemoSimulation::new(), 10, Some(&path)).unwrap();
         assert_eq!(restored.slot_count(), 1);
