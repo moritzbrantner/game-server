@@ -1,4 +1,5 @@
 use crate::PlayerId;
+use crate::replay::{ReplayLog, ReplayRecord};
 use crate::session::{ReconnectToken, SessionError, SessionLease, SessionRegistry};
 use crate::simulation::{GameSimulation, SimulationError, SimulationSnapshot};
 use std::collections::BTreeMap;
@@ -48,15 +49,25 @@ pub struct MatchRuntime<S> {
     simulation: S,
     sessions: SessionRegistry,
     last_sequences: BTreeMap<PlayerId, u32>,
+    replay: Option<ReplayLog>,
 }
 
 impl<S: GameSimulation> MatchRuntime<S> {
     pub fn new(simulation: S, reconnect_grace_ticks: u64) -> Self {
+        Self::build(simulation, reconnect_grace_ticks, false)
+    }
+
+    pub fn new_with_replay_capture(simulation: S, reconnect_grace_ticks: u64) -> Self {
+        Self::build(simulation, reconnect_grace_ticks, true)
+    }
+
+    fn build(simulation: S, reconnect_grace_ticks: u64, capture_replay: bool) -> Self {
         let max_players = simulation.max_players();
         Self {
             simulation,
             sessions: SessionRegistry::new(max_players, reconnect_grace_ticks),
             last_sequences: BTreeMap::new(),
+            replay: capture_replay.then(ReplayLog::default),
         }
     }
 
@@ -80,6 +91,10 @@ impl<S: GameSimulation> MatchRuntime<S> {
         self.sessions.active_count()
     }
 
+    pub fn replay_log(&self) -> Option<&ReplayLog> {
+        self.replay.as_ref()
+    }
+
     pub fn admit(&mut self, token: ReconnectToken) -> Result<SessionLease, RuntimeError> {
         let lease = self.sessions.admit(token)?;
         if let Err(error) = self.simulation.add_player(lease.player_id) {
@@ -87,6 +102,10 @@ impl<S: GameSimulation> MatchRuntime<S> {
             return Err(error.into());
         }
         self.last_sequences.insert(lease.player_id, 0);
+        self.record(ReplayRecord::PlayerAdmitted {
+            tick: self.current_tick(),
+            player_id: lease.player_id,
+        });
         Ok(lease)
     }
 
@@ -122,14 +141,21 @@ impl<S: GameSimulation> MatchRuntime<S> {
         }
         let last_sequence = self
             .last_sequences
-            .get_mut(&player_id)
+            .get(&player_id)
+            .copied()
             .ok_or(RuntimeError::StaleConnection)?;
-        if sequence <= *last_sequence {
+        if sequence <= last_sequence {
             return Ok(CommandOutcome::IgnoredStale);
         }
         self.simulation
             .apply_command(player_id, sequence, payload)?;
-        *last_sequence = sequence;
+        self.last_sequences.insert(player_id, sequence);
+        self.record(ReplayRecord::CommandApplied {
+            tick: self.current_tick(),
+            player_id,
+            sequence,
+            payload: payload.to_vec(),
+        });
         Ok(CommandOutcome::Applied)
     }
 
@@ -139,19 +165,34 @@ impl<S: GameSimulation> MatchRuntime<S> {
         for player_id in expired {
             self.simulation.remove_player(player_id);
             self.last_sequences.remove(&player_id);
+            self.record(ReplayRecord::PlayerRemoved {
+                tick: current_tick,
+                player_id,
+            });
         }
         self.simulation.advance_tick()?;
-        Ok(self.simulation.snapshot()?)
+        let snapshot = self.simulation.snapshot()?;
+        self.record(ReplayRecord::Checkpoint {
+            snapshot: snapshot.clone(),
+        });
+        Ok(snapshot)
     }
 
     pub fn snapshot(&self) -> Result<SimulationSnapshot, RuntimeError> {
         Ok(self.simulation.snapshot()?)
+    }
+
+    fn record(&mut self, record: ReplayRecord) {
+        if let Some(replay) = &mut self.replay {
+            replay.append(record);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::replay::{ReplayRecord, verify_replay};
     use crate::simulation::SimulationSnapshot;
 
     #[derive(Clone, Debug, Default)]
@@ -201,10 +242,13 @@ mod tests {
         }
 
         fn snapshot(&self) -> Result<SimulationSnapshot, SimulationError> {
-            Ok(SimulationSnapshot::new(
-                self.tick,
-                vec![self.players.len() as u8],
-            ))
+            let mut payload = vec![self.players.len() as u8];
+            for (player_id, sequence, command) in &self.commands {
+                payload.extend_from_slice(&player_id.to_be_bytes());
+                payload.extend_from_slice(&sequence.to_be_bytes());
+                payload.extend_from_slice(command);
+            }
+            Ok(SimulationSnapshot::new(self.tick, payload))
         }
     }
 
@@ -246,5 +290,70 @@ mod tests {
                 .unwrap(),
             CommandOutcome::Applied
         );
+    }
+
+    #[test]
+    fn replay_capture_records_only_applied_commands_and_checkpoints() {
+        let mut runtime = MatchRuntime::new_with_replay_capture(FakeSimulation::default(), 10);
+        let lease = runtime.admit(token(1)).unwrap();
+        assert_eq!(
+            runtime
+                .submit_command(lease.player_id, lease.connection_epoch, 1, b"accepted")
+                .unwrap(),
+            CommandOutcome::Applied
+        );
+        assert_eq!(
+            runtime
+                .submit_command(lease.player_id, lease.connection_epoch, 1, b"stale")
+                .unwrap(),
+            CommandOutcome::IgnoredStale
+        );
+        let expected = runtime.advance_tick().unwrap();
+
+        let replay = runtime.replay_log().unwrap();
+        assert_eq!(replay.records().len(), 3);
+        assert!(matches!(
+            replay.records()[0],
+            ReplayRecord::PlayerAdmitted { player_id: 1, .. }
+        ));
+        assert!(matches!(
+            replay.records()[1],
+            ReplayRecord::CommandApplied {
+                player_id: 1,
+                sequence: 1,
+                ..
+            }
+        ));
+        assert_eq!(
+            replay.records()[2],
+            ReplayRecord::Checkpoint {
+                snapshot: expected.clone()
+            }
+        );
+
+        let verification = verify_replay(FakeSimulation::default(), replay).unwrap();
+        assert_eq!(verification.checkpoints_verified, 1);
+        assert_eq!(verification.final_snapshot, expected);
+    }
+
+    #[test]
+    fn replay_capture_records_expired_player_before_next_tick() {
+        let mut runtime = MatchRuntime::new_with_replay_capture(FakeSimulation::default(), 1);
+        let lease = runtime.admit(token(1)).unwrap();
+        assert!(runtime.disconnect(lease.player_id, lease.connection_epoch));
+        runtime.advance_tick().unwrap();
+        runtime.advance_tick().unwrap();
+        runtime.advance_tick().unwrap();
+
+        assert!(runtime.replay_log().unwrap().records().iter().any(|record| {
+            matches!(
+                record,
+                ReplayRecord::PlayerRemoved {
+                    tick: 2,
+                    player_id: 1
+                }
+            )
+        }));
+        verify_replay(FakeSimulation::default(), runtime.replay_log().unwrap()).unwrap();
     }
 }
