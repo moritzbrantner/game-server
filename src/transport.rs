@@ -638,6 +638,19 @@ async fn run_control_stream(
                 .map_err(|error| error.to_string())?;
         }
         let request = decode_control_request(&frame).map_err(|error| error.to_string())?;
+        let mut trailing = [0_u8; 1];
+        match recv_stream
+            .read(&mut trailing)
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            None => {}
+            Some(count) => {
+                return Err(format!(
+                    "reliable-control request has {count} trailing byte(s)"
+                ));
+            }
+        }
 
         let handler_permit = control_handlers
             .acquire_owned()
