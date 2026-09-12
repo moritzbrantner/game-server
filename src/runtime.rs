@@ -1,6 +1,6 @@
+use crate::PlayerId;
 use crate::session::{ReconnectToken, SessionError, SessionLease, SessionRegistry};
 use crate::simulation::{GameSimulation, SimulationError, SimulationSnapshot};
-use crate::PlayerId;
 use std::collections::BTreeMap;
 use std::fmt;
 
@@ -117,10 +117,7 @@ impl<S: GameSimulation> MatchRuntime<S> {
         if sequence == 0 {
             return Err(RuntimeError::InvalidSequence);
         }
-        if !self
-            .sessions
-            .owns_connection(player_id, connection_epoch)
-        {
+        if !self.sessions.owns_connection(player_id, connection_epoch) {
             return Err(RuntimeError::StaleConnection);
         }
         let last_sequence = self
@@ -204,7 +201,10 @@ mod tests {
         }
 
         fn snapshot(&self) -> Result<SimulationSnapshot, SimulationError> {
-            Ok(SimulationSnapshot::new(self.tick, vec![self.players.len() as u8]))
+            Ok(SimulationSnapshot::new(
+                self.tick,
+                vec![self.players.len() as u8],
+            ))
         }
     }
 
