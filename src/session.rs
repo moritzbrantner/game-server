@@ -507,10 +507,10 @@ mod tests {
                 },
             ],
         };
-        assert_eq!(
+        assert!(matches!(
             SessionRegistry::restore(16, 10, 0, &duplicate),
             Err(SessionRecoveryError::DuplicateToken)
-        );
+        ));
 
         let invalid_next = SessionRecoverySnapshot {
             next_player_id: 2,
@@ -521,9 +521,9 @@ mod tests {
                 remaining_grace_ticks: 10,
             }],
         };
-        assert_eq!(
+        assert!(matches!(
             SessionRegistry::restore(16, 10, 0, &invalid_next),
             Err(SessionRecoveryError::InvalidNextPlayerId)
-        );
+        ));
     }
 }
