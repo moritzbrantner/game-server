@@ -113,9 +113,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         {
             final_applied_sequence = final_applied_sequence.max(player.last_applied_sequence);
         }
-        if final_applied_sequence == final_sequence
-            && accepted_snapshots >= MIN_ACCEPTED_SNAPSHOTS
-        {
+        if final_applied_sequence == final_sequence && accepted_snapshots >= MIN_ACCEPTED_SNAPSHOTS {
             break;
         }
     }
