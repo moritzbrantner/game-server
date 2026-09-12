@@ -1,5 +1,6 @@
 use game_server::{
-    DEFAULT_RECONNECT_GRACE_TICKS, DemoSimulation, WebTransportConfig, serve_with_shutdown,
+    ControlContext, ControlService, ControlServiceError, DEFAULT_RECONNECT_GRACE_TICKS,
+    DemoSimulation, WebTransportConfig, serve_with_control_and_shutdown,
 };
 use std::env;
 use std::error::Error;
@@ -9,6 +10,23 @@ use tokio::sync::mpsc;
 
 const DEFAULT_PORT: u16 = 4433;
 const DEFAULT_DRAIN_GRACE_MS: u64 = 500;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct DemoControlService;
+
+impl ControlService for DemoControlService {
+    fn handle(
+        &self,
+        _context: ControlContext,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, ControlServiceError> {
+        match payload {
+            b"ping" => Ok(b"pong".to_vec()),
+            b"reject" => Err(ControlServiceError::new("demo control request rejected")),
+            _ => Err(ControlServiceError::new("unsupported demo control request")),
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -32,8 +50,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let (shutdown_sender, shutdown_receiver) = mpsc::channel(4);
     install_shutdown_forwarder(shutdown_sender)?;
 
-    serve_with_shutdown(
+    serve_with_control_and_shutdown(
         DemoSimulation::new(),
+        DemoControlService,
         DEFAULT_RECONNECT_GRACE_TICKS,
         WebTransportConfig {
             port,

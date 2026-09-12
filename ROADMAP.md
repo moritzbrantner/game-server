@@ -7,14 +7,14 @@
 - [x] Add a WebTransport/HTTP/3 adapter without moving game authority into transport code.
 - [x] Add fail-closed CI for formatting, linting, tests, and release build.
 
-## Milestone B — session runtime — mostly integrated
+## Milestone B — session runtime — completed
 
 - [x] Add match/session admission and connection ownership.
 - [x] Add reconnect tokens with bounded expiry and one active connection per player slot.
-- [ ] Add a general reliable control-message channel distinct from realtime game-command and latest-state datagrams.
+- [x] Add a general reliable control-message channel distinct from realtime game-command and latest-state datagrams.
 - [x] Make disconnect and reconnect lifecycle deterministic and testable.
 
-The existing reliable welcome stream carries admission/reconnect metadata. Realtime game commands and authoritative snapshots deliberately use datagrams. The remaining item is a reusable reliable control path for future transactional/session messages; it must not turn realtime game commands into a reliable queue.
+The reliable welcome stream carries admission/reconnect metadata. Realtime game commands and authoritative snapshots deliberately remain datagrams. General transactional/session control uses separate versioned bidirectional WebTransport streams with a 4 KiB payload ceiling, a five-second stream timeout, and at most four concurrent control exchanges per connection. Control handlers receive the authenticated player ID plus the current connection epoch as a fencing token, but not `GameSimulation`, so delayed external side effects can reject stale reconnect epochs without turning this path into a second game-authority channel. Synchronous handler executions are additionally capped at 64 per server instance; their permits remain held until the handler actually exits even after a transport timeout, preventing detached blocking work from growing without bound. Real-network acceptance verifies successful and rejected exchanges, malformed/oversized fail-closed behavior, timeout/concurrency bounds, and continued command/snapshot progress while a control stream is stalled.
 
 ## Milestone C — pluggable simulation — completed
 

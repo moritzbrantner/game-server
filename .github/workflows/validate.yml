@@ -24,8 +24,10 @@ jobs:
       - name: Release build
         run: cargo build --locked --release --all-features
       - name: Build WebTransport probes
-        run: cargo build --locked --bin game-server --bin netem-client
+        run: cargo build --locked --bin game-server --bin netem-client --bin control-client
       - name: Run WebTransport packet impairment experiment
         run: sudo bash netem/webtransport-experiment.sh
+      - name: Run reliable control experiment
+        run: bash control/reliable-control-experiment.sh
       - name: Run graceful restart recovery experiment
         run: bash recovery/restart-experiment.sh
