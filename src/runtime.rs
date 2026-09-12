@@ -18,10 +18,7 @@ pub enum RuntimeError {
     Simulation(SimulationError),
     StaleConnection,
     InvalidSequence,
-    CommandPayloadTooLarge {
-        maximum: usize,
-        actual: usize,
-    },
+    CommandPayloadTooLarge { maximum: usize, actual: usize },
 }
 
 impl fmt::Display for RuntimeError {
@@ -284,12 +281,7 @@ mod tests {
         let oversized_stale = vec![0_u8; MAX_COMMAND_PAYLOAD_BYTES + 1];
         assert_eq!(
             runtime
-                .submit_command(
-                    lease.player_id,
-                    lease.connection_epoch,
-                    1,
-                    &oversized_stale,
-                )
+                .submit_command(lease.player_id, lease.connection_epoch, 1, &oversized_stale,)
                 .unwrap(),
             CommandOutcome::IgnoredStale
         );
@@ -302,12 +294,7 @@ mod tests {
         let oversized = vec![0_u8; MAX_COMMAND_PAYLOAD_BYTES + 1];
 
         assert_eq!(
-            runtime.submit_command(
-                lease.player_id,
-                lease.connection_epoch,
-                1,
-                &oversized,
-            ),
+            runtime.submit_command(lease.player_id, lease.connection_epoch, 1, &oversized,),
             Err(RuntimeError::CommandPayloadTooLarge {
                 maximum: MAX_COMMAND_PAYLOAD_BYTES,
                 actual: MAX_COMMAND_PAYLOAD_BYTES + 1,
