@@ -23,3 +23,7 @@ jobs:
         run: cargo test --locked --all-targets --all-features
       - name: Release build
         run: cargo build --locked --release --all-features
+      - name: Build WebTransport netem probes
+        run: cargo build --locked --bin game-server --bin netem-client
+      - name: Run WebTransport packet impairment experiment
+        run: sudo bash netem/webtransport-experiment.sh
