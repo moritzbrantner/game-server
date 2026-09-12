@@ -1,6 +1,6 @@
 use game_server::{
-    ControlService, ControlServiceError, DEFAULT_RECONNECT_GRACE_TICKS, DemoSimulation, PlayerId,
-    WebTransportConfig, serve_with_control_and_shutdown,
+    ControlContext, ControlService, ControlServiceError, DEFAULT_RECONNECT_GRACE_TICKS,
+    DemoSimulation, WebTransportConfig, serve_with_control_and_shutdown,
 };
 use std::env;
 use std::error::Error;
@@ -15,7 +15,11 @@ const DEFAULT_DRAIN_GRACE_MS: u64 = 500;
 struct DemoControlService;
 
 impl ControlService for DemoControlService {
-    fn handle(&self, _player_id: PlayerId, payload: &[u8]) -> Result<Vec<u8>, ControlServiceError> {
+    fn handle(
+        &self,
+        _context: ControlContext,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, ControlServiceError> {
         match payload {
             b"ping" => Ok(b"pong".to_vec()),
             b"reject" => Err(ControlServiceError::new("demo control request rejected")),
