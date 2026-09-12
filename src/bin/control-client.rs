@@ -1,8 +1,8 @@
 use game_server::protocol::WELCOME_BYTES;
 use game_server::{
-    CONTROL_FORMAT_VERSION, CONTROL_HEADER_BYTES, MAX_CONTROL_PAYLOAD_BYTES, decode_control_response,
-    decode_demo_snapshot, decode_snapshot, decode_welcome, encode_command, encode_control_request,
-    encode_demo_command,
+    CONTROL_FORMAT_VERSION, CONTROL_HEADER_BYTES, MAX_CONTROL_PAYLOAD_BYTES,
+    decode_control_response, decode_demo_snapshot, decode_snapshot, decode_welcome, encode_command,
+    encode_control_request, encode_demo_command,
 };
 use std::env;
 use std::error::Error;
