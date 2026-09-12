@@ -156,7 +156,7 @@ async fn expect_stream_rejected(
 
 async fn observe_datagram_progress(
     connection: &Connection,
-    player_id: u16,
+    player_id: u32,
 ) -> Result<bool, Box<dyn Error>> {
     let payload = encode_demo_command(1, 0)?;
     connection.send_datagram(encode_command(1, &payload)?)?;
