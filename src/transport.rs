@@ -31,6 +31,7 @@ const SNAPSHOT_CHANNEL_DEPTH: usize = 1;
 const WELCOME_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const CONTROL_STREAM_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CONCURRENT_CONTROL_STREAMS: usize = 4;
+const MAX_CONCURRENT_CONTROL_HANDLERS: usize = 64;
 
 #[derive(Clone, Debug)]
 pub struct WebTransportConfig {
@@ -82,6 +83,7 @@ enum AdmissionRequest {
 struct ServerState<S> {
     runtime: Arc<Mutex<MatchRuntime<S>>>,
     control: Arc<dyn ControlService>,
+    control_handlers: Arc<Semaphore>,
     snapshots: broadcast::Sender<Vec<u8>>,
     shutdown: broadcast::Sender<()>,
 }
@@ -91,6 +93,7 @@ impl<S> Clone for ServerState<S> {
         Self {
             runtime: Arc::clone(&self.runtime),
             control: Arc::clone(&self.control),
+            control_handlers: Arc::clone(&self.control_handlers),
             snapshots: self.snapshots.clone(),
             shutdown: self.shutdown.clone(),
         }
@@ -198,6 +201,7 @@ where
     let state = ServerState {
         runtime: Arc::new(Mutex::new(runtime)),
         control: Arc::new(control),
+        control_handlers: Arc::new(Semaphore::new(MAX_CONCURRENT_CONTROL_HANDLERS)),
         snapshots,
         shutdown,
     };
@@ -560,11 +564,18 @@ async fn run_established_connection<S: GameSimulation>(
                     }
                 };
                 let control = Arc::clone(&state.control);
+                let control_handlers = Arc::clone(&state.control_handlers);
                 let player_id = lease.player_id;
                 tokio::spawn(async move {
                     let _permit = permit;
-                    if let Err(error) =
-                        run_control_stream(send_stream, recv_stream, player_id, control).await
+                    if let Err(error) = run_control_stream(
+                        send_stream,
+                        recv_stream,
+                        player_id,
+                        control,
+                        control_handlers,
+                    )
+                    .await
                     {
                         eprintln!("reliable control stream failed: {error}");
                     }
@@ -600,6 +611,7 @@ async fn run_control_stream(
     mut recv_stream: RecvStream,
     player_id: PlayerId,
     control: Arc<dyn ControlService>,
+    control_handlers: Arc<Semaphore>,
 ) -> Result<(), String> {
     let exchange = async {
         let mut header = [0_u8; CONTROL_HEADER_BYTES];
@@ -625,11 +637,18 @@ async fn run_control_stream(
         }
         let request = decode_control_request(&frame).map_err(|error| error.to_string())?;
 
+        let handler_permit = control_handlers
+            .acquire_owned()
+            .await
+            .map_err(|_| "reliable-control handler capacity closed".to_owned())?;
         let service = Arc::clone(&control);
         let payload = request.payload;
-        let handled = spawn_blocking(move || service.handle(player_id, &payload))
-            .await
-            .map_err(|error| format!("reliable-control handler task failed: {error}"))?;
+        let handled = spawn_blocking(move || {
+            let _handler_permit = handler_permit;
+            service.handle(player_id, &payload)
+        })
+        .await
+        .map_err(|error| format!("reliable-control handler task failed: {error}"))?;
         let response = match handled {
             Ok(payload) => match encode_control_response(true, &payload) {
                 Ok(response) => response,
