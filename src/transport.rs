@@ -1,10 +1,9 @@
 use crate::control::{
-    CONTROL_HEADER_BYTES, ControlService, MAX_CONTROL_PAYLOAD_BYTES, RejectControlService,
-    decode_control_request, encode_control_response,
+    CONTROL_HEADER_BYTES, ControlContext, ControlService, MAX_CONTROL_PAYLOAD_BYTES,
+    RejectControlService, decode_control_request, encode_control_response,
 };
 use crate::protocol::{
-    PlayerId, RECONNECT_TOKEN_BYTES, SnapshotFrame, Welcome, decode_command, encode_snapshot,
-    encode_welcome,
+    RECONNECT_TOKEN_BYTES, SnapshotFrame, Welcome, decode_command, encode_snapshot, encode_welcome,
 };
 use crate::recovery::RecoveryImage;
 use crate::runtime::{MatchRuntime, RuntimeError};
@@ -565,13 +564,16 @@ async fn run_established_connection<S: GameSimulation>(
                 };
                 let control = Arc::clone(&state.control);
                 let control_handlers = Arc::clone(&state.control_handlers);
-                let player_id = lease.player_id;
+                let context = ControlContext {
+                    player_id: lease.player_id,
+                    connection_epoch: lease.connection_epoch,
+                };
                 tokio::spawn(async move {
                     let _permit = permit;
                     if let Err(error) = run_control_stream(
                         send_stream,
                         recv_stream,
-                        player_id,
+                        context,
                         control,
                         control_handlers,
                     )
@@ -609,7 +611,7 @@ async fn run_established_connection<S: GameSimulation>(
 async fn run_control_stream(
     mut send_stream: SendStream,
     mut recv_stream: RecvStream,
-    player_id: PlayerId,
+    context: ControlContext,
     control: Arc<dyn ControlService>,
     control_handlers: Arc<Semaphore>,
 ) -> Result<(), String> {
@@ -645,7 +647,7 @@ async fn run_control_stream(
         let payload = request.payload;
         let handled = spawn_blocking(move || {
             let _handler_permit = handler_permit;
-            service.handle(player_id, &payload)
+            service.handle(context, &payload)
         })
         .await
         .map_err(|error| format!("reliable-control handler task failed: {error}"))?;
