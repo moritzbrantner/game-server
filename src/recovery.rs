@@ -1,7 +1,7 @@
 use crate::protocol::{PlayerId, RECONNECT_TOKEN_BYTES};
 use crate::replay::{ReplayError, ReplayLog, ReplayRecord};
 use crate::session::{
-    RecoverableSession, ReconnectToken, SessionRecoveryError, SessionRecoverySnapshot,
+    ReconnectToken, RecoverableSession, SessionRecoveryError, SessionRecoverySnapshot,
 };
 use crate::simulation::{GameSimulation, SimulationError};
 use std::collections::{BTreeMap, BTreeSet};
@@ -78,7 +78,10 @@ impl fmt::Display for RecoveryError {
                 actual
             ),
             Self::ReplayPlayerSetMismatch => {
-                write!(formatter, "recovery replay players do not match session snapshot")
+                write!(
+                    formatter,
+                    "recovery replay players do not match session snapshot"
+                )
             }
             Self::ReplayTickGapTooLarge { from_tick, to_tick } => write!(
                 formatter,
@@ -191,8 +194,8 @@ impl RecoveryImage {
         let reconnect_grace_ticks = read_u64(bytes, 13)?;
         let next_player_id = read_u32(bytes, 21)?;
         let session_count = usize::from(read_u16(bytes, 25)?);
-        let replay_len = usize::try_from(read_u32(bytes, 27)?)
-            .expect("u32 replay length fits supported usize");
+        let replay_len =
+            usize::try_from(read_u32(bytes, 27)?).expect("u32 replay length fits supported usize");
         let sessions_len = SESSION_BYTES
             .checked_mul(session_count)
             .ok_or(RecoveryError::ImageTooLarge(usize::MAX))?;
@@ -276,9 +279,14 @@ impl RecoveryImage {
         if size > MAX_RECOVERY_IMAGE_BYTES {
             return Err(RecoveryError::ImageTooLarge(size));
         }
-        let mut file = File::open(path).map_err(io_error)?;
+        let limit = u64::try_from(MAX_RECOVERY_IMAGE_BYTES + 1)
+            .expect("recovery image byte limit fits supported u64");
+        let mut file = File::open(path).map_err(io_error)?.take(limit);
         let mut bytes = Vec::with_capacity(size);
         file.read_to_end(&mut bytes).map_err(io_error)?;
+        if bytes.len() > MAX_RECOVERY_IMAGE_BYTES {
+            return Err(RecoveryError::ImageTooLarge(bytes.len()));
+        }
         Self::decode(&bytes)
     }
 
@@ -533,10 +541,18 @@ mod tests {
         let image = image();
         let simulation = image.restore_simulation(DemoSimulation::new()).unwrap();
         assert_eq!(simulation.current_tick(), 1);
-        assert_eq!(simulation.snapshot().unwrap().state_hash, image.replay.records().last().and_then(|record| match record {
-            ReplayRecord::Checkpoint { snapshot } => Some(snapshot.state_hash),
-            _ => None,
-        }).unwrap());
+        assert_eq!(
+            simulation.snapshot().unwrap().state_hash,
+            image
+                .replay
+                .records()
+                .last()
+                .and_then(|record| match record {
+                    ReplayRecord::Checkpoint { snapshot } => Some(snapshot.state_hash),
+                    _ => None,
+                })
+                .unwrap()
+        );
         assert_eq!(image.last_sequences().get(&1), Some(&1));
     }
 
@@ -552,6 +568,19 @@ mod tests {
         second.sessions.sessions[0].remaining_grace_ticks = 300;
         second.write_atomic(&path).unwrap();
         assert_eq!(RecoveryImage::read_file(&path).unwrap(), second);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn oversized_recovery_file_is_rejected_before_decode() {
+        let path = unique_test_path();
+        let file = File::create(&path).unwrap();
+        file.set_len(u64::try_from(MAX_RECOVERY_IMAGE_BYTES + 1).unwrap())
+            .unwrap();
+        assert_eq!(
+            RecoveryImage::read_file(&path),
+            Err(RecoveryError::ImageTooLarge(MAX_RECOVERY_IMAGE_BYTES + 1))
+        );
         let _ = fs::remove_file(path);
     }
 
