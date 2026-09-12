@@ -345,15 +345,22 @@ mod tests {
         runtime.advance_tick().unwrap();
         runtime.advance_tick().unwrap();
 
-        assert!(runtime.replay_log().unwrap().records().iter().any(|record| {
-            matches!(
-                record,
-                ReplayRecord::PlayerRemoved {
-                    tick: 2,
-                    player_id: 1
-                }
-            )
-        }));
+        assert!(
+            runtime
+                .replay_log()
+                .unwrap()
+                .records()
+                .iter()
+                .any(|record| {
+                    matches!(
+                        record,
+                        ReplayRecord::PlayerRemoved {
+                            tick: 2,
+                            player_id: 1
+                        }
+                    )
+                })
+        );
         verify_replay(FakeSimulation::default(), runtime.replay_log().unwrap()).unwrap();
     }
 }
