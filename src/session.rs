@@ -111,9 +111,14 @@ impl fmt::Display for SessionRecoveryError {
                 "recovery contains invalid connection epoch for player {player_id}"
             ),
             Self::DuplicatePlayerId(player_id) => {
-                write!(formatter, "recovery contains duplicate player id {player_id}")
+                write!(
+                    formatter,
+                    "recovery contains duplicate player id {player_id}"
+                )
             }
-            Self::DuplicateToken => write!(formatter, "recovery contains duplicate reconnect token"),
+            Self::DuplicateToken => {
+                write!(formatter, "recovery contains duplicate reconnect token")
+            }
             Self::GraceExceedsConfigured {
                 player_id,
                 remaining,
@@ -198,9 +203,7 @@ impl SessionRegistry {
                 });
             }
             if !player_ids.insert(recovered.player_id) {
-                return Err(SessionRecoveryError::DuplicatePlayerId(
-                    recovered.player_id,
-                ));
+                return Err(SessionRecoveryError::DuplicatePlayerId(recovered.player_id));
             }
             if !reconnect_tokens.insert(recovered.reconnect_token) {
                 return Err(SessionRecoveryError::DuplicateToken);
@@ -470,11 +473,17 @@ mod tests {
         assert_eq!(restored.active_count(), 0);
         assert_eq!(restored.slot_count(), 2);
         assert_eq!(
-            restored.reconnect(token(1), token(3), 25).unwrap().player_id,
+            restored
+                .reconnect(token(1), token(3), 25)
+                .unwrap()
+                .player_id,
             first.player_id
         );
         assert_eq!(
-            restored.reconnect(token(2), token(4), 27).unwrap().player_id,
+            restored
+                .reconnect(token(2), token(4), 27)
+                .unwrap()
+                .player_id,
             second.player_id
         );
     }
