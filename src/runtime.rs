@@ -114,7 +114,8 @@ impl<S: GameSimulation> MatchRuntime<S> {
             image.reconnect_grace_ticks,
             image.current_tick,
             &image.sessions,
-        )?;
+        )
+        .map_err(RecoveryError::from)?;
         let last_sequences = image.last_sequences();
         Ok(Self {
             simulation,
