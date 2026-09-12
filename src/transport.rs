@@ -147,9 +147,8 @@ where
 
 fn spawn_tick_loop<S: GameSimulation>(state: ServerState<S>, tick_hz: u16) {
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(Duration::from_micros(
-            1_000_000_u64 / u64::from(tick_hz),
-        ));
+        let mut ticker =
+            tokio::time::interval(Duration::from_micros(1_000_000_u64 / u64::from(tick_hz)));
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
@@ -229,7 +228,8 @@ async fn run_admitted_connection<S: GameSimulation>(
         let runtime = state.runtime.lock().await;
         (
             runtime.tick_hz(),
-            u16::try_from(runtime.max_players()).map_err(|_| "player capacity exceeds wire limit")?,
+            u16::try_from(runtime.max_players())
+                .map_err(|_| "player capacity exceeds wire limit")?,
             runtime.current_tick(),
         )
     };
