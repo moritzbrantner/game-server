@@ -572,8 +572,8 @@ mod tests {
         assert_eq!(runtime.advance_tick(), Err(RuntimeError::Frozen));
 
         let image = runtime.recovery_image().unwrap();
-        let mut restored = MatchRuntime::restore_from_recovery(FakeSimulation::default(), image)
-            .unwrap();
+        let mut restored =
+            MatchRuntime::restore_from_recovery(FakeSimulation::default(), image).unwrap();
         assert_eq!(restored.snapshot().unwrap(), expected);
         assert_eq!(restored.active_count(), 0);
         let reconnected = restored.reconnect(token(1), token(2)).unwrap();
@@ -581,13 +581,23 @@ mod tests {
         assert_eq!(reconnected.connection_epoch, lease.connection_epoch + 1);
         assert_eq!(
             restored
-                .submit_command(reconnected.player_id, reconnected.connection_epoch, 1, b"stale")
+                .submit_command(
+                    reconnected.player_id,
+                    reconnected.connection_epoch,
+                    1,
+                    b"stale"
+                )
                 .unwrap(),
             CommandOutcome::IgnoredStale
         );
         assert_eq!(
             restored
-                .submit_command(reconnected.player_id, reconnected.connection_epoch, 2, b"new")
+                .submit_command(
+                    reconnected.player_id,
+                    reconnected.connection_epoch,
+                    2,
+                    b"new"
+                )
                 .unwrap(),
             CommandOutcome::Applied
         );
