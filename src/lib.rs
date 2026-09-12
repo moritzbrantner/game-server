@@ -35,7 +35,10 @@ pub use session::{
     SessionError, SessionLease, SessionRecoveryError, SessionRecoverySnapshot, SessionRegistry,
 };
 pub use simulation::{GameSimulation, SimulationError, SimulationSnapshot};
-pub use transport::{TransportError, WebTransportConfig, serve, serve_with_shutdown};
+pub use transport::{
+    TransportError, WebTransportConfig, serve, serve_with_control, serve_with_control_and_shutdown,
+    serve_with_shutdown,
+};
 pub use world::{
     DEMO_MAX_PLAYERS, DEMO_TICK_HZ, DemoSimulation, DemoSnapshotPlayer, WorldError,
     decode_demo_snapshot, encode_demo_command,
