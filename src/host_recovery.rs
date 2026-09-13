@@ -6,6 +6,7 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use tokio::task::spawn_blocking;
 
 pub const HOST_RECOVERY_BUNDLE_VERSION: u8 = 1;
 
@@ -60,7 +61,27 @@ impl fmt::Display for MatchHostRecoveryError {
 
 impl Error for MatchHostRecoveryError {}
 
-pub fn prepare_match_host_for_recovery<S: GameSimulation>(
+pub async fn prepare_match_host_for_recovery<S: GameSimulation>(
+    matches: Vec<(MatchId, S)>,
+    max_matches: usize,
+    reconnect_grace_ticks: u64,
+    config: MatchHostRecoveryConfig,
+) -> Result<PreparedMatchHost<S>, MatchHostRecoveryError> {
+    spawn_blocking(move || {
+        prepare_match_host_for_recovery_sync(
+            matches,
+            max_matches,
+            reconnect_grace_ticks,
+            config,
+        )
+    })
+    .await
+    .map_err(|error| {
+        MatchHostRecoveryError::Io(format!("hosted recovery preparation task failed: {error}"))
+    })?
+}
+
+fn prepare_match_host_for_recovery_sync<S: GameSimulation>(
     matches: Vec<(MatchId, S)>,
     max_matches: usize,
     reconnect_grace_ticks: u64,
