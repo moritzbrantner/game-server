@@ -17,7 +17,7 @@ use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Mutex, RwLock, Semaphore, broadcast, mpsc};
+use tokio::sync::{Mutex, RwLock, Semaphore, broadcast, mpsc, oneshot};
 use tokio::task::{JoinHandle, spawn_blocking};
 use tokio::time::MissedTickBehavior;
 use wtransport::{Connection, Endpoint, Identity, RecvStream, SendStream, ServerConfig, VarInt};
@@ -187,7 +187,28 @@ pub async fn serve_match_host_with_control_and_shutdown<S, C>(
     host: MatchHost<S>,
     control: C,
     config: MatchHostWebTransportConfig,
+    shutdown_requests: mpsc::Receiver<()>,
+) -> Result<(), MatchHostTransportError>
+where
+    S: GameSimulation,
+    C: MatchControlService,
+{
+    serve_match_host_with_control_and_shutdown_notifying_ready(
+        host,
+        control,
+        config,
+        shutdown_requests,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn serve_match_host_with_control_and_shutdown_notifying_ready<S, C>(
+    host: MatchHost<S>,
+    control: C,
+    config: MatchHostWebTransportConfig,
     mut shutdown_requests: mpsc::Receiver<()>,
+    ready: Option<oneshot::Sender<()>>,
 ) -> Result<(), MatchHostTransportError>
 where
     S: GameSimulation,
@@ -215,6 +236,9 @@ where
     };
     let tick_tasks = spawn_tick_loops(state.clone(), &match_tick_rates);
     let route_prefix = config.route_prefix.clone();
+    if let Some(ready) = ready {
+        let _ = ready.send(());
+    }
 
     let spawn_incoming = |incoming: wtransport::endpoint::IncomingSession| {
         let state = state.clone();
