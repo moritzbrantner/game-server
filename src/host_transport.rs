@@ -48,10 +48,7 @@ pub enum MatchHostTransportError {
     EmptyHost,
     HostAlreadyDraining,
     InvalidTickRate(MatchId),
-    PlayerCapacityTooLarge {
-        match_id: MatchId,
-        capacity: usize,
-    },
+    PlayerCapacityTooLarge { match_id: MatchId, capacity: usize },
 }
 
 impl fmt::Display for MatchHostTransportError {
@@ -61,10 +58,16 @@ impl fmt::Display for MatchHostTransportError {
             Self::Endpoint(error) => write!(formatter, "WebTransport endpoint error: {error}"),
             Self::EmptyHost => write!(formatter, "match host must contain at least one match"),
             Self::HostAlreadyDraining => {
-                write!(formatter, "match host cannot start transport while already draining")
+                write!(
+                    formatter,
+                    "match host cannot start transport while already draining"
+                )
             }
             Self::InvalidTickRate(match_id) => {
-                write!(formatter, "match {match_id} has a zero simulation tick rate")
+                write!(
+                    formatter,
+                    "match {match_id} has a zero simulation tick rate"
+                )
             }
             Self::PlayerCapacityTooLarge { match_id, capacity } => write!(
                 formatter,
@@ -147,13 +150,8 @@ where
     C: MatchControlService,
 {
     let (shutdown_sender, shutdown_receiver) = mpsc::channel(1);
-    let result = serve_match_host_with_control_and_shutdown(
-        host,
-        control,
-        config,
-        shutdown_receiver,
-    )
-    .await;
+    let result =
+        serve_match_host_with_control_and_shutdown(host, control, config, shutdown_receiver).await;
     drop(shutdown_sender);
     result
 }
@@ -756,7 +754,10 @@ mod tests {
     #[test]
     fn empty_or_pre_draining_hosts_fail_closed() {
         let empty = MatchHost::<DemoSimulation>::new(1).unwrap();
-        assert_eq!(validate_host(&empty), Err(MatchHostTransportError::EmptyHost));
+        assert_eq!(
+            validate_host(&empty),
+            Err(MatchHostTransportError::EmptyHost)
+        );
 
         let mut draining = host_with(&["alpha"]);
         draining.begin_drain();
