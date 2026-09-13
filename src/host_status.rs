@@ -2,7 +2,7 @@ use crate::MatchControlService;
 use crate::host::{MatchHost, MatchId};
 use crate::host_transport::{
     MatchHostTransportError, MatchHostWebTransportConfig,
-    serve_match_host_with_control_and_shutdown,
+    serve_match_host_with_control_and_shutdown_notifying_ready,
 };
 use crate::simulation::GameSimulation;
 use std::error::Error;
@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 pub const HOST_STATUS_CONTRACT_VERSION: u16 = 1;
@@ -88,6 +88,7 @@ struct ProcessFacts {
 #[derive(Debug)]
 struct StatusState {
     process: ProcessFacts,
+    serving: AtomicBool,
     draining: AtomicBool,
 }
 
@@ -111,8 +112,17 @@ impl StatusState {
                 player_capacity: process.player_capacity,
                 matches,
             },
+            serving: AtomicBool::new(false),
             draining: AtomicBool::new(process.draining),
         }
+    }
+
+    fn mark_serving(&self) {
+        self.serving.store(true, Ordering::Release);
+    }
+
+    fn serving(&self) -> bool {
+        self.serving.load(Ordering::Acquire)
     }
 
     fn begin_process_drain(&self) {
@@ -135,7 +145,7 @@ impl StatusState {
     }
 
     fn match_ready(&self, facts: &MatchFacts) -> bool {
-        !self.match_draining(facts) && !facts.frozen
+        self.serving() && !self.match_draining(facts) && !facts.frozen
     }
 
     fn process_ready(&self) -> bool {
@@ -197,6 +207,7 @@ where
     let state = Arc::new(StatusState::from_host(&host));
     let (transport_shutdown_sender, transport_shutdown_receiver) = mpsc::channel(4);
     let (status_stop_sender, status_stop_receiver) = mpsc::channel(1);
+    let (transport_ready_sender, transport_ready_receiver) = oneshot::channel();
 
     let forward_state = Arc::clone(&state);
     let forward_transport_shutdown = transport_shutdown_sender.clone();
@@ -209,16 +220,23 @@ where
         }
     });
 
+    let ready_state = Arc::clone(&state);
+    let mut readiness_task = tokio::spawn(async move {
+        if transport_ready_receiver.await.is_ok() {
+            ready_state.mark_serving();
+        }
+    });
     let mut status_task = tokio::spawn(serve_status_listener(
         listener,
         Arc::clone(&state),
         status_stop_receiver,
     ));
-    let transport = serve_match_host_with_control_and_shutdown(
+    let transport = serve_match_host_with_control_and_shutdown_notifying_ready(
         host,
         control,
         transport_config,
         transport_shutdown_receiver,
+        Some(transport_ready_sender),
     );
     tokio::pin!(transport);
 
@@ -226,6 +244,7 @@ where
         transport_result = &mut transport => {
             let _ = status_stop_sender.send(()).await;
             let status_result = join_status_task(&mut status_task).await;
+            let _ = (&mut readiness_task).await;
             shutdown_forwarder.abort();
             let _ = shutdown_forwarder.await;
             transport_result?;
@@ -237,6 +256,7 @@ where
             state.begin_process_drain();
             let _ = transport_shutdown_sender.send(()).await;
             let transport_result = transport.await;
+            let _ = (&mut readiness_task).await;
             shutdown_forwarder.abort();
             let _ = shutdown_forwarder.await;
             transport_result?;
@@ -263,10 +283,7 @@ async fn serve_status_listener(
     let connections = Arc::new(Semaphore::new(MAX_CONCURRENT_STATUS_CONNECTIONS));
     loop {
         tokio::select! {
-            stop = stop.recv() => {
-                let _ = stop;
-                return Ok(());
-            }
+            _ = stop.recv() => return Ok(()),
             accepted = listener.accept() => {
                 let (stream, _) = accepted
                     .map_err(|error| HostStatusServerError::Serve(error.to_string()))?;
@@ -348,7 +365,7 @@ enum RequestReadError {
 }
 
 async fn read_request_header(stream: &mut TcpStream) -> Result<String, RequestReadError> {
-    let mut buffer = vec![0_u8; MAX_REQUEST_HEADER_BYTES];
+    let mut buffer = [0_u8; MAX_REQUEST_HEADER_BYTES];
     let mut used = 0_usize;
     loop {
         if used == buffer.len() {
@@ -535,8 +552,23 @@ mod tests {
                     },
                 ],
             },
+            serving: AtomicBool::new(true),
             draining: AtomicBool::new(false),
         }
+    }
+
+    #[test]
+    fn startup_is_unready_until_transport_signals_serving() {
+        let state = state();
+        state.serving.store(false, Ordering::Release);
+
+        let starting = route_request("GET /readyz HTTP/1.1\r\n\r\n", &state);
+        assert_eq!(starting.status, 503);
+        assert!(!state.process_ready());
+
+        state.mark_serving();
+        let ready = route_request("GET /readyz HTTP/1.1\r\n\r\n", &state);
+        assert_eq!(ready.status, 200);
     }
 
     #[test]
