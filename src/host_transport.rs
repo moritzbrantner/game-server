@@ -409,7 +409,11 @@ async fn handle_connection<S: GameSimulation>(
         BrowserAdmission::New => {
             let draining = state.admission_gate.read().await;
             if *draining {
-                close(&connection, CLOSE_RUNTIME, &RuntimeError::Draining.to_string());
+                close(
+                    &connection,
+                    CLOSE_RUNTIME,
+                    &RuntimeError::Draining.to_string(),
+                );
                 return Ok(());
             }
             state
