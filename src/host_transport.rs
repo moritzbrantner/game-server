@@ -238,14 +238,33 @@ where
             .expect("checked recovery plan")
             .directory
             .clone();
-        spawn_blocking(move || consume_recovery_bundle(&directory))
-            .await
-            .map_err(|error| {
-                MatchHostTransportError::Recovery(format!(
+        let consumption = spawn_blocking(move || {
+            let result = consume_recovery_bundle(&directory);
+            let active_exists = directory.exists();
+            let consumed_exists = directory.file_name().is_some_and(|file_name| {
+                let mut consumed_name = file_name.to_os_string();
+                consumed_name.push(".consumed");
+                directory.with_file_name(consumed_name).exists()
+            });
+            (result, active_exists, consumed_exists)
+        })
+        .await;
+        match consumption {
+            Ok((Ok(()), _, _)) => {}
+            Ok((Err(error), false, false)) => {
+                eprintln!(
+                    "hosted recovery bundle was fully consumed but the final durability step reported an error; continuing with the already-restored authoritative state: {error}"
+                );
+            }
+            Ok((Err(error), _, _)) => {
+                return Err(MatchHostTransportError::Recovery(error.to_string()));
+            }
+            Err(error) => {
+                return Err(MatchHostTransportError::Recovery(format!(
                     "recovery consumption task failed: {error}"
-                ))
-            })?
-            .map_err(|error| MatchHostTransportError::Recovery(error.to_string()))?;
+                )));
+            }
+        }
     }
 
     let (shutdown, _) = broadcast::channel::<()>(1);
