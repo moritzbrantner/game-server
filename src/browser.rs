@@ -137,9 +137,9 @@ fn validate_base_path(value: &str) -> Result<(), BrowserRouteError> {
 
     if value[1..].split('/').any(|segment| {
         segment.is_empty()
-            || segment
-                .chars()
-                .any(|character| !(character.is_ascii_alphanumeric() || matches!(character, '-' | '_')))
+            || segment.chars().any(|character| {
+                !(character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+            })
     }) {
         return Err(BrowserRouteError::InvalidBasePath);
     }
@@ -180,10 +180,7 @@ mod tests {
         let token = ReconnectToken([0xab; RECONNECT_TOKEN_BYTES]);
 
         assert_eq!(prefix.match_path(&id), "/game/matches/uno_01");
-        assert_eq!(
-            nested_prefix.match_path(&id),
-            "/api/game_v1/matches/uno_01"
-        );
+        assert_eq!(nested_prefix.match_path(&id), "/api/game_v1/matches/uno_01");
         assert_eq!(
             prefix.reconnect_path(&id, token),
             format!("/game/matches/uno_01/reconnect/{}", token.encode_hex())
