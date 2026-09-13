@@ -1,7 +1,8 @@
 use game_server::{
     BrowserRoutePrefix, ControlContext, ControlService, ControlServiceError,
-    DEFAULT_RECONNECT_GRACE_TICKS, DemoSimulation, MatchId, WebTransportConfig,
-    serve_with_control_and_shutdown,
+    DEFAULT_RECONNECT_GRACE_TICKS, DemoSimulation, MatchControlService, MatchHost,
+    MatchHostWebTransportConfig, MatchId, MatchRuntime, WebTransportConfig,
+    serve_match_host_with_control_and_shutdown, serve_with_control_and_shutdown,
 };
 use std::env;
 use std::error::Error;
@@ -21,11 +22,26 @@ impl ControlService for DemoControlService {
         _context: ControlContext,
         payload: &[u8],
     ) -> Result<Vec<u8>, ControlServiceError> {
-        match payload {
-            b"ping" => Ok(b"pong".to_vec()),
-            b"reject" => Err(ControlServiceError::new("demo control request rejected")),
-            _ => Err(ControlServiceError::new("unsupported demo control request")),
-        }
+        handle_demo_control(payload)
+    }
+}
+
+impl MatchControlService for DemoControlService {
+    fn handle(
+        &self,
+        _match_id: &MatchId,
+        _context: ControlContext,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, ControlServiceError> {
+        handle_demo_control(payload)
+    }
+}
+
+fn handle_demo_control(payload: &[u8]) -> Result<Vec<u8>, ControlServiceError> {
+    match payload {
+        b"ping" => Ok(b"pong".to_vec()),
+        b"reject" => Err(ControlServiceError::new("demo control request rejected")),
+        _ => Err(ControlServiceError::new("unsupported demo control request")),
     }
 }
 
@@ -40,14 +56,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let private_key_pem =
         PathBuf::from(env::var("GAME_SERVER_KEY_PEM").unwrap_or_else(|_| "key.pem".to_owned()));
     let session_path = env::var("GAME_SERVER_SESSION_PATH").unwrap_or_else(|_| "/game".to_owned());
-    let session_path = match env::var("GAME_SERVER_MATCH_ID") {
-        Ok(value) => {
-            let route_prefix = BrowserRoutePrefix::new(session_path)?;
-            route_prefix.match_path(&MatchId::new(value)?)
-        }
-        Err(env::VarError::NotPresent) => session_path,
-        Err(error) => return Err(error.into()),
-    };
+    let hosted_match_ids = read_hosted_match_ids()?;
+    let single_match_id = read_single_match_id()?;
+    if hosted_match_ids.is_some() && single_match_id.is_some() {
+        return Err("GAME_SERVER_MATCH_IDS and GAME_SERVER_MATCH_ID are mutually exclusive".into());
+    }
     let recovery_path = env::var("GAME_SERVER_RECOVERY_PATH")
         .ok()
         .map(PathBuf::from);
@@ -55,26 +68,90 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(DEFAULT_DRAIN_GRACE_MS);
+    let drain_grace = Duration::from_millis(drain_grace_ms);
 
     let (shutdown_sender, shutdown_receiver) = mpsc::channel(4);
     install_shutdown_forwarder(shutdown_sender)?;
 
-    serve_with_control_and_shutdown(
-        DemoSimulation::new(),
-        DemoControlService,
-        DEFAULT_RECONNECT_GRACE_TICKS,
-        WebTransportConfig {
-            port,
-            certificate_pem,
-            private_key_pem,
-            session_path,
-            recovery_path,
-            drain_grace: Duration::from_millis(drain_grace_ms),
-        },
-        shutdown_receiver,
-    )
-    .await?;
+    if let Some(match_ids) = hosted_match_ids {
+        if recovery_path.is_some() {
+            return Err(
+                "GAME_SERVER_RECOVERY_PATH is not yet supported with GAME_SERVER_MATCH_IDS".into(),
+            );
+        }
+        let route_prefix = BrowserRoutePrefix::new(session_path)?;
+        let mut host = MatchHost::new(match_ids.len())?;
+        for match_id in match_ids {
+            host.insert(
+                match_id,
+                MatchRuntime::new(DemoSimulation::new(), DEFAULT_RECONNECT_GRACE_TICKS),
+            )?;
+        }
+        serve_match_host_with_control_and_shutdown(
+            host,
+            DemoControlService,
+            MatchHostWebTransportConfig {
+                port,
+                certificate_pem,
+                private_key_pem,
+                route_prefix,
+                drain_grace,
+            },
+            shutdown_receiver,
+        )
+        .await?;
+    } else {
+        let session_path = match single_match_id {
+            Some(match_id) => {
+                let route_prefix = BrowserRoutePrefix::new(session_path)?;
+                route_prefix.match_path(&match_id)
+            }
+            None => session_path,
+        };
+        serve_with_control_and_shutdown(
+            DemoSimulation::new(),
+            DemoControlService,
+            DEFAULT_RECONNECT_GRACE_TICKS,
+            WebTransportConfig {
+                port,
+                certificate_pem,
+                private_key_pem,
+                session_path,
+                recovery_path,
+                drain_grace,
+            },
+            shutdown_receiver,
+        )
+        .await?;
+    }
     Ok(())
+}
+
+fn read_single_match_id() -> Result<Option<MatchId>, Box<dyn Error>> {
+    match env::var("GAME_SERVER_MATCH_ID") {
+        Ok(value) => Ok(Some(MatchId::new(value)?)),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn read_hosted_match_ids() -> Result<Option<Vec<MatchId>>, Box<dyn Error>> {
+    let value = match env::var("GAME_SERVER_MATCH_IDS") {
+        Ok(value) => value,
+        Err(env::VarError::NotPresent) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if value.is_empty() {
+        return Err("GAME_SERVER_MATCH_IDS must not be empty".into());
+    }
+    let match_ids = value
+        .split(',')
+        .map(MatchId::new)
+        .collect::<Result<Vec<_>, _>>()?;
+    if match_ids.is_empty() {
+        return Err("GAME_SERVER_MATCH_IDS must contain at least one match".into());
+    }
+    Ok(Some(match_ids))
 }
 
 #[cfg(unix)]
