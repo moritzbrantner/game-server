@@ -48,9 +48,7 @@ pub use session::{
 };
 pub use simulation::{GameSimulation, SimulationError, SimulationSnapshot};
 pub use transport::{
-    TransportError, WebTransportConfig, serve, serve_browser_match,
-    serve_browser_match_with_control, serve_browser_match_with_control_and_shutdown,
-    serve_browser_match_with_shutdown, serve_with_control, serve_with_control_and_shutdown,
+    TransportError, WebTransportConfig, serve, serve_with_control, serve_with_control_and_shutdown,
     serve_with_shutdown,
 };
 pub use world::{
