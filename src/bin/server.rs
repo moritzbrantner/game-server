@@ -1,8 +1,9 @@
 use game_server::{
     BrowserRoutePrefix, ControlContext, ControlService, ControlServiceError,
-    DEFAULT_RECONNECT_GRACE_TICKS, DemoSimulation, MatchControlService, MatchHost,
-    MatchHostWebTransportConfig, MatchId, MatchRuntime, WebTransportConfig,
-    serve_match_host_with_control_and_shutdown, serve_with_control_and_shutdown,
+    DEFAULT_HOST_STATUS_PORT, DEFAULT_RECONNECT_GRACE_TICKS, DemoSimulation, MatchControlService,
+    MatchHost, MatchHostStatusConfig, MatchHostWebTransportConfig, MatchId, MatchRuntime,
+    WebTransportConfig, serve_match_host_with_status_and_control_and_shutdown,
+    serve_with_control_and_shutdown,
 };
 use std::env;
 use std::error::Error;
@@ -54,6 +55,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .ok()
         .and_then(|value| value.parse::<u16>().ok())
         .unwrap_or(DEFAULT_PORT);
+    let status_port = env::var("GAME_SERVER_STATUS_PORT")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(DEFAULT_HOST_STATUS_PORT);
     let certificate_pem =
         PathBuf::from(env::var("GAME_SERVER_CERT_PEM").unwrap_or_else(|_| "cert.pem".to_owned()));
     let private_key_pem =
@@ -90,7 +95,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 MatchRuntime::new(DemoSimulation::new(), DEFAULT_RECONNECT_GRACE_TICKS),
             )?;
         }
-        serve_match_host_with_control_and_shutdown(
+        serve_match_host_with_status_and_control_and_shutdown(
             host,
             DemoControlService,
             MatchHostWebTransportConfig {
@@ -100,6 +105,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 route_prefix,
                 drain_grace,
             },
+            MatchHostStatusConfig { port: status_port },
             shutdown_receiver,
         )
         .await?;
