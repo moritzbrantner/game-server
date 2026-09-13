@@ -1,10 +1,10 @@
+use crate::MatchControlService;
 use crate::host::{MatchHost, MatchId};
 use crate::host_transport::{
     MatchHostTransportError, MatchHostWebTransportConfig,
     serve_match_host_with_control_and_shutdown,
 };
 use crate::simulation::GameSimulation;
-use crate::MatchControlService;
 use std::error::Error;
 use std::fmt;
 use std::io;
@@ -44,7 +44,10 @@ impl fmt::Display for HostStatusServerError {
             Self::Serve(error) => write!(formatter, "host status listener failed: {error}"),
             Self::Task(error) => write!(formatter, "host status task failed: {error}"),
             Self::ExitedUnexpectedly => {
-                write!(formatter, "host status listener exited before transport stopped")
+                write!(
+                    formatter,
+                    "host status listener exited before transport stopped"
+                )
             }
             Self::Transport(error) => error.fmt(formatter),
         }
@@ -286,7 +289,12 @@ async fn handle_status_connection(
     mut stream: TcpStream,
     state: &StatusState,
 ) -> Result<(), io::Error> {
-    let request = match tokio::time::timeout(REQUEST_HEADER_TIMEOUT, read_request_header(&mut stream)).await {
+    let request = match tokio::time::timeout(
+        REQUEST_HEADER_TIMEOUT,
+        read_request_header(&mut stream),
+    )
+    .await
+    {
         Ok(Ok(request)) => request,
         Ok(Err(RequestReadError::Io(error))) => return Err(error),
         Ok(Err(RequestReadError::TooLarge)) => {
@@ -354,7 +362,10 @@ async fn read_request_header(stream: &mut TcpStream) -> Result<String, RequestRe
             return Err(RequestReadError::Incomplete);
         }
         used += read;
-        if buffer[..used].windows(4).any(|window| window == b"\r\n\r\n") {
+        if buffer[..used]
+            .windows(4)
+            .any(|window| window == b"\r\n\r\n")
+        {
             return String::from_utf8(buffer[..used].to_vec())
                 .map_err(|_| RequestReadError::Incomplete);
         }
@@ -411,10 +422,7 @@ fn route_match_request(path: &str, state: &StatusState) -> Option<HttpResponse> 
     }
     let facts = state.match_facts(id)?;
     match endpoint {
-        "healthz" => Some(ok(format!(
-            "{{\"id\":\"{}\",\"healthy\":true}}",
-            facts.id
-        ))),
+        "healthz" => Some(ok(format!("{{\"id\":\"{}\",\"healthy\":true}}", facts.id))),
         "readyz" => Some(match_readiness_response(state, facts)),
         "status" => Some(ok(state.match_status_json(facts))),
         _ => None,
