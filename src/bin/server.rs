@@ -1,6 +1,7 @@
 use game_server::{
-    ControlContext, ControlService, ControlServiceError, DEFAULT_RECONNECT_GRACE_TICKS,
-    DemoSimulation, WebTransportConfig, serve_with_control_and_shutdown,
+    BrowserRoutePrefix, ControlContext, ControlService, ControlServiceError,
+    DEFAULT_RECONNECT_GRACE_TICKS, DemoSimulation, MatchId, WebTransportConfig,
+    serve_with_control_and_shutdown,
 };
 use std::env;
 use std::error::Error;
@@ -39,6 +40,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let private_key_pem =
         PathBuf::from(env::var("GAME_SERVER_KEY_PEM").unwrap_or_else(|_| "key.pem".to_owned()));
     let session_path = env::var("GAME_SERVER_SESSION_PATH").unwrap_or_else(|_| "/game".to_owned());
+    let session_path = match env::var("GAME_SERVER_MATCH_ID") {
+        Ok(value) => {
+            let route_prefix = BrowserRoutePrefix::new(session_path)?;
+            route_prefix.match_path(&MatchId::new(value)?)
+        }
+        Err(env::VarError::NotPresent) => session_path,
+        Err(error) => return Err(error.into()),
+    };
     let recovery_path = env::var("GAME_SERVER_RECOVERY_PATH")
         .ok()
         .map(PathBuf::from);
