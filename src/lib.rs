@@ -1,3 +1,4 @@
+pub mod browser;
 pub mod control;
 pub mod host;
 #[cfg(feature = "physics")]
@@ -11,6 +12,11 @@ pub mod simulation;
 pub mod transport;
 pub mod world;
 
+pub use browser::{
+    BROWSER_MATCH_SEGMENT, BROWSER_PROTOCOL_CONTRACT, BROWSER_RECONNECT_SEGMENT,
+    BROWSER_ROUTE_VERSION, BrowserAdmission, BrowserProtocolContract, BrowserRouteError,
+    BrowserRoutePrefix, BrowserSessionRoute,
+};
 pub use control::{
     CONTROL_FORMAT_VERSION, CONTROL_HEADER_BYTES, ControlContext, ControlRequest, ControlResponse,
     ControlService, ControlServiceError, ControlWireError, MAX_CONTROL_FRAME_BYTES,
@@ -24,8 +30,9 @@ pub use host::{
 #[cfg(feature = "physics")]
 pub use physics::{PINNED_PHYSICS_ENGINE_REVISION, PhysicsWorldAdapter};
 pub use protocol::{
-    CommandFrame, MAX_COMMAND_PAYLOAD_BYTES, MAX_SNAPSHOT_PAYLOAD_BYTES, PlayerId, ProtocolError,
-    RECONNECT_TOKEN_BYTES, SnapshotFrame, Welcome, decode_command, decode_snapshot, decode_welcome,
+    COMMAND_HEADER_BYTES, CommandFrame, MAX_COMMAND_PAYLOAD_BYTES, MAX_SNAPSHOT_PAYLOAD_BYTES,
+    PROTOCOL_VERSION, PlayerId, ProtocolError, RECONNECT_TOKEN_BYTES, SNAPSHOT_HEADER_BYTES,
+    SnapshotFrame, WELCOME_BYTES, Welcome, decode_command, decode_snapshot, decode_welcome,
     encode_command, encode_snapshot, encode_welcome, snapshot_hash,
 };
 pub use recovery::{

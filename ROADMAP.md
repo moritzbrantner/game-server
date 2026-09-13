@@ -54,10 +54,13 @@ Graceful recovery freezes authoritative mutation before producing a bounded reco
 ## Milestone F — process hosting
 
 - [x] Host multiple matches per process with bounded match count and existing per-match player capacity.
-- [ ] Add transport routing plus externally served draining and health/ready state.
+- [x] Publish a versioned browser route/protocol contract and explicit match-addressed WebTransport path for single-runtime serving.
+- [ ] Route one WebTransport listener across `MatchHost` entries and expose externally served draining and health/ready state.
 - [ ] Keep cross-process orchestration out of the core until a real deployment needs it.
 
-The in-process `MatchHost` uses deterministic URL-safe match IDs, bounded placement, explicit per-match/process draining, and safe removal only after active and reconnectable slots are gone. Host and match status expose lifecycle/capacity facts and derive readiness rather than storing mutable readiness state. The next slice should route WebTransport sessions to a match ID and expose truthful process health/readiness without adding a fleet scheduler.
+The in-process `MatchHost` uses deterministic URL-safe match IDs, bounded placement, explicit per-match/process draining, and safe removal only after active and reconnectable slots are gone. Host and match status expose lifecycle/capacity facts and derive readiness rather than storing mutable readiness state.
+
+The browser-routing slice establishes `/game/matches/<match-id>` plus reconnect addressing and binds that route version to the existing command/snapshot and reliable-control versions. It deliberately reuses the existing single-runtime transport path rather than pretending that process-level dispatch already exists. The next slice should use the parsed match ID to select a `MatchHost` runtime, keep snapshots and reconnect state isolated per match, and expose truthful process health/readiness without adding a fleet scheduler.
 
 The region/process-placement experiments in `server-lab` are evidence for this milestone, not code to copy wholesale. `game-server` should first expose truthful per-process capacity, health, and drain state; a separate fleet scheduler can consume those facts later.
 
