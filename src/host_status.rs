@@ -1,5 +1,6 @@
 use crate::MatchControlService;
 use crate::host::{MatchHost, MatchId};
+use crate::host_recovery::{MatchHostRecoveryPlan, PreparedMatchHost};
 use crate::host_transport::{
     MatchHostTransportError, MatchHostWebTransportConfig,
     serve_match_host_with_control_and_shutdown_notifying_ready,
@@ -195,7 +196,53 @@ pub async fn serve_match_host_with_status_and_control_and_shutdown<S, C>(
     control: C,
     transport_config: MatchHostWebTransportConfig,
     status_config: MatchHostStatusConfig,
+    shutdown_requests: mpsc::Receiver<()>,
+) -> Result<(), HostStatusServerError>
+where
+    S: GameSimulation,
+    C: MatchControlService,
+{
+    serve_match_host_with_status_control_shutdown_inner(
+        host,
+        control,
+        transport_config,
+        status_config,
+        shutdown_requests,
+        None,
+    )
+    .await
+}
+
+pub async fn serve_prepared_match_host_with_status_and_control_and_shutdown<S, C>(
+    prepared: PreparedMatchHost<S>,
+    control: C,
+    transport_config: MatchHostWebTransportConfig,
+    status_config: MatchHostStatusConfig,
+    shutdown_requests: mpsc::Receiver<()>,
+) -> Result<(), HostStatusServerError>
+where
+    S: GameSimulation,
+    C: MatchControlService,
+{
+    let PreparedMatchHost { host, recovery } = prepared;
+    serve_match_host_with_status_control_shutdown_inner(
+        host,
+        control,
+        transport_config,
+        status_config,
+        shutdown_requests,
+        Some(recovery),
+    )
+    .await
+}
+
+async fn serve_match_host_with_status_control_shutdown_inner<S, C>(
+    host: MatchHost<S>,
+    control: C,
+    transport_config: MatchHostWebTransportConfig,
+    status_config: MatchHostStatusConfig,
     mut shutdown_requests: mpsc::Receiver<()>,
+    recovery: Option<MatchHostRecoveryPlan>,
 ) -> Result<(), HostStatusServerError>
 where
     S: GameSimulation,
@@ -237,6 +284,7 @@ where
         transport_config,
         transport_shutdown_receiver,
         Some(transport_ready_sender),
+        recovery,
     );
     tokio::pin!(transport);
 
