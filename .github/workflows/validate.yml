@@ -33,3 +33,5 @@ jobs:
         run: bash hosting/match-dispatch-experiment.sh
       - name: Run graceful restart recovery experiment
         run: bash recovery/restart-experiment.sh
+      - name: Run hosted graceful restart recovery experiment
+        run: bash recovery/hosted-restart-experiment.sh
