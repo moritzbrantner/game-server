@@ -48,7 +48,20 @@ The acceptance probes cover successful and rejected control exchanges, malformed
 
 `serve_match_host*` now routes admission, reconnect, commands, authoritative snapshots, and reliable control to the addressed hosted runtime. Each match has an independent snapshot channel and tick loop; player/session numbering and command watermarks stay isolated by `MatchId`. The real-network acceptance starts two matches on one listener, proves both independently allocate player ID 1, verifies different command sequences converge only in their addressed match, checks match-scoped control identity, and rejects an unknown match route.
 
-Draining is explicit at both match and process level. Process shutdown marks the full host draining before the grace window, so new admissions fail while existing reconnects can still use their addressed runtime. Externally served health/readiness/drain state is the next process-hosting slice.
+Draining is explicit at both match and process level. Process shutdown marks the full host draining before the grace window, so new admissions fail while existing reconnects can still use their addressed runtime.
+
+Hosted serving can additionally expose a read-only HTTP status surface through `serve_match_host_with_status_and_control_and_shutdown`. The demo server enables it for `GAME_SERVER_MATCH_IDS` mode on `GAME_SERVER_STATUS_PORT` (default `8080`). The contract is versioned by `HOST_STATUS_CONTRACT_VERSION` and exposes:
+
+```text
+GET /healthz
+GET /readyz
+GET /status
+GET /matches/<match-id>/healthz
+GET /matches/<match-id>/readyz
+GET /matches/<match-id>/status
+```
+
+Health is process liveness and remains `200` during an intentional drain. Readiness means the hosted process or addressed runtime is available to serve gameplay rather than whether another match can be placed; a host already at its configured match count can therefore still be ready. Process and match readiness return `503` once draining begins, while `/status` reports the drain flag and immutable host/match capacity facts. Unknown match routes and mutating methods fail closed. The status surface deliberately does not duplicate game rules, transport admission, or mutable gameplay counters.
 
 ## Graceful recovery
 
@@ -56,6 +69,6 @@ Set `GAME_SERVER_RECOVERY_PATH` to enable replay-backed graceful restart recover
 
 Recovery persistence is intentionally fail-closed: malformed evidence prevents startup, failed shutdown persistence resumes the live runtime, recovery I/O does not hold the runtime mutex, and the reliable welcome handshake is time-bounded so a peer cannot retain capacity indefinitely. This is graceful restart recovery rather than per-command crash journaling.
 
-Hosted transport intentionally rejects `GAME_SERVER_RECOVERY_PATH` for now rather than pretending one recovery file can represent multiple independent matches. Per-match hosted recovery remains a follow-up boundary.
+Hosted transport intentionally rejects `GAME_SERVER_RECOVERY_PATH` for now rather than pretending one recovery file can represent multiple independent matches. Per-match hosted recovery remains the next process-hosting boundary.
 
 See `ROADMAP.md` for the extraction plan and remaining process-hosting work.
