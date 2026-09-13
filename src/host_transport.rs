@@ -17,7 +17,7 @@ use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Mutex, Semaphore, broadcast, mpsc};
+use tokio::sync::{Mutex, RwLock, Semaphore, broadcast, mpsc};
 use tokio::task::{JoinHandle, spawn_blocking};
 use tokio::time::MissedTickBehavior;
 use wtransport::{Connection, Endpoint, Identity, RecvStream, SendStream, ServerConfig, VarInt};
@@ -79,26 +79,26 @@ impl fmt::Display for MatchHostTransportError {
 
 impl Error for MatchHostTransportError {}
 
-#[derive(Clone)]
-struct MatchChannels {
+struct HostedMatch<S> {
+    runtime: Mutex<MatchRuntime<S>>,
     snapshots: broadcast::Sender<Vec<u8>>,
 }
 
 struct HostedServerState<S> {
-    host: Arc<Mutex<MatchHost<S>>>,
+    matches: Arc<BTreeMap<MatchId, HostedMatch<S>>>,
+    admission_gate: Arc<RwLock<bool>>,
     control: Arc<dyn MatchControlService>,
     control_handlers: Arc<Semaphore>,
-    channels: Arc<BTreeMap<MatchId, MatchChannels>>,
     shutdown: broadcast::Sender<()>,
 }
 
 impl<S> Clone for HostedServerState<S> {
     fn clone(&self) -> Self {
         Self {
-            host: Arc::clone(&self.host),
+            matches: Arc::clone(&self.matches),
+            admission_gate: Arc::clone(&self.admission_gate),
             control: Arc::clone(&self.control),
             control_handlers: Arc::clone(&self.control_handlers),
-            channels: Arc::clone(&self.channels),
             shutdown: self.shutdown.clone(),
         }
     }
@@ -110,8 +110,9 @@ impl<S: GameSimulation> HostedServerState<S> {
         match_id: &MatchId,
         operation: impl FnOnce(&MatchRuntime<S>) -> R,
     ) -> Option<R> {
-        let host = self.host.lock().await;
-        host.runtime(match_id).map(operation)
+        let hosted = self.matches.get(match_id)?;
+        let runtime = hosted.runtime.lock().await;
+        Some(operation(&runtime))
     }
 
     async fn with_runtime_mut<R>(
@@ -119,14 +120,23 @@ impl<S: GameSimulation> HostedServerState<S> {
         match_id: &MatchId,
         operation: impl FnOnce(&mut MatchRuntime<S>) -> R,
     ) -> Option<R> {
-        let mut host = self.host.lock().await;
-        host.with_runtime_mut(match_id, operation)
+        let hosted = self.matches.get(match_id)?;
+        let mut runtime = hosted.runtime.lock().await;
+        Some(operation(&mut runtime))
     }
 
     fn snapshots(&self, match_id: &MatchId) -> Option<broadcast::Receiver<Vec<u8>>> {
-        self.channels
+        self.matches
             .get(match_id)
-            .map(|channels| channels.snapshots.subscribe())
+            .map(|hosted| hosted.snapshots.subscribe())
+    }
+
+    async fn begin_process_drain(&self) {
+        let mut draining = self.admission_gate.write().await;
+        *draining = true;
+        for hosted in self.matches.values() {
+            hosted.runtime.lock().await.begin_drain();
+        }
     }
 }
 
@@ -195,17 +205,12 @@ where
     let endpoint = Endpoint::server(server_config)
         .map_err(|error| MatchHostTransportError::Endpoint(error.to_string()))?;
 
-    let mut channels = BTreeMap::new();
-    for (match_id, _) in &match_tick_rates {
-        let (snapshots, _) = broadcast::channel::<Vec<u8>>(SNAPSHOT_CHANNEL_DEPTH);
-        channels.insert(match_id.clone(), MatchChannels { snapshots });
-    }
     let (shutdown, _) = broadcast::channel::<()>(1);
     let state = HostedServerState {
-        host: Arc::new(Mutex::new(host)),
+        matches: Arc::new(isolate_hosted_runtimes(host)),
+        admission_gate: Arc::new(RwLock::new(false)),
         control: Arc::new(control),
         control_handlers: Arc::new(Semaphore::new(MAX_CONCURRENT_CONTROL_HANDLERS)),
-        channels: Arc::new(channels),
         shutdown,
     };
     let tick_tasks = spawn_tick_loops(state.clone(), &match_tick_rates);
@@ -223,7 +228,7 @@ where
                 }
             };
             let route = match route_prefix.parse(request.path()) {
-                Ok(Some(route)) if state.channels.contains_key(&route.match_id) => route,
+                Ok(Some(route)) if state.matches.contains_key(&route.match_id) => route,
                 Ok(Some(_)) | Ok(None) | Err(_) => {
                     let _ = request.not_found().await;
                     return;
@@ -252,7 +257,7 @@ where
                     continue;
                 };
 
-                state.host.lock().await.begin_drain();
+                state.begin_process_drain().await;
                 let drain_deadline = tokio::time::sleep(config.drain_grace);
                 tokio::pin!(drain_deadline);
                 loop {
@@ -301,6 +306,24 @@ fn validate_host<S: GameSimulation>(
         .collect()
 }
 
+fn isolate_hosted_runtimes<S: GameSimulation>(
+    host: MatchHost<S>,
+) -> BTreeMap<MatchId, HostedMatch<S>> {
+    host.into_runtimes()
+        .into_iter()
+        .map(|(match_id, runtime)| {
+            let (snapshots, _) = broadcast::channel::<Vec<u8>>(SNAPSHOT_CHANNEL_DEPTH);
+            (
+                match_id,
+                HostedMatch {
+                    runtime: Mutex::new(runtime),
+                    snapshots,
+                },
+            )
+        })
+        .collect()
+}
+
 fn spawn_tick_loops<S: GameSimulation>(
     state: HostedServerState<S>,
     match_tick_rates: &[(MatchId, u16)],
@@ -312,7 +335,7 @@ fn spawn_tick_loops<S: GameSimulation>(
             let match_id = match_id.clone();
             let tick_hz = *tick_hz;
             let snapshots = state
-                .channels
+                .matches
                 .get(&match_id)
                 .expect("validated match must have a snapshot channel")
                 .snapshots
@@ -382,16 +405,25 @@ async fn handle_connection<S: GameSimulation>(
     };
 
     let replacement_token = generate_reconnect_token()?;
-    let admission = route.admission.clone();
-    let lease = state
-        .with_runtime_mut(&route.match_id, |runtime| match admission {
-            BrowserAdmission::New => runtime.admit(replacement_token),
-            BrowserAdmission::Reconnect(previous_token) => {
-                runtime.reconnect(previous_token, replacement_token)
+    let lease = match route.admission.clone() {
+        BrowserAdmission::New => {
+            let draining = state.admission_gate.read().await;
+            if *draining {
+                close(&connection, CLOSE_RUNTIME, &RuntimeError::Draining.to_string());
+                return Ok(());
             }
-        })
-        .await
-        .ok_or_else(|| "match disappeared before admission".to_owned())?;
+            state
+                .with_runtime_mut(&route.match_id, |runtime| runtime.admit(replacement_token))
+                .await
+                .ok_or_else(|| "match disappeared before admission".to_owned())?
+        }
+        BrowserAdmission::Reconnect(previous_token) => state
+            .with_runtime_mut(&route.match_id, |runtime| {
+                runtime.reconnect(previous_token, replacement_token)
+            })
+            .await
+            .ok_or_else(|| "match disappeared before reconnect".to_owned())?,
+    };
     let lease = match lease {
         Ok(lease) => lease,
         Err(error) => {
@@ -749,6 +781,16 @@ mod tests {
         assert_eq!(tick_rates[0].0.as_str(), "alpha");
         assert_eq!(tick_rates[1].0.as_str(), "beta");
         assert!(tick_rates.iter().all(|(_, tick_hz)| *tick_hz > 0));
+    }
+
+    #[test]
+    fn hosted_runtimes_have_independent_locks() {
+        let matches = isolate_hosted_runtimes(host_with(&["alpha", "beta"]));
+        let alpha = matches.get(&MatchId::new("alpha").unwrap()).unwrap();
+        let beta = matches.get(&MatchId::new("beta").unwrap()).unwrap();
+
+        let _alpha_guard = alpha.runtime.try_lock().unwrap();
+        let _beta_guard = beta.runtime.try_lock().unwrap();
     }
 
     #[test]
