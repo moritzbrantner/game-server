@@ -1,8 +1,7 @@
 use crate::control::{CONTROL_FORMAT_VERSION, MAX_CONTROL_PAYLOAD_BYTES};
 use crate::host::{MatchId, MatchIdError};
 use crate::protocol::{
-    MAX_COMMAND_PAYLOAD_BYTES, MAX_SNAPSHOT_PAYLOAD_BYTES, PROTOCOL_VERSION,
-    RECONNECT_TOKEN_BYTES,
+    MAX_COMMAND_PAYLOAD_BYTES, MAX_SNAPSHOT_PAYLOAD_BYTES, PROTOCOL_VERSION, RECONNECT_TOKEN_BYTES,
 };
 use crate::session::ReconnectToken;
 use std::error::Error;
@@ -84,8 +83,8 @@ impl BrowserRoutePrefix {
         };
         let mut segments = remainder.split('/');
         let match_id_segment = segments.next().unwrap_or_default();
-        let match_id = MatchId::new(match_id_segment.to_owned())
-            .map_err(BrowserRouteError::InvalidMatchId)?;
+        let match_id =
+            MatchId::new(match_id_segment.to_owned()).map_err(BrowserRouteError::InvalidMatchId)?;
 
         match (segments.next(), segments.next(), segments.next()) {
             (None, None, None) => Ok(Some(BrowserSessionRoute {
@@ -188,9 +187,7 @@ mod tests {
             })
         );
         assert_eq!(
-            prefix
-                .parse(&prefix.reconnect_path(&id, token))
-                .unwrap(),
+            prefix.parse(&prefix.reconnect_path(&id, token)).unwrap(),
             Some(BrowserSessionRoute {
                 match_id: id,
                 admission: BrowserAdmission::Reconnect(token),
