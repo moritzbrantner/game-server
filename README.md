@@ -28,30 +28,34 @@ Use `BrowserRoutePrefix` plus a validated `MatchId` to address a match. With a `
 
 `BrowserRoutePrefix::parse` fails closed for malformed owned routes and returns no match for unrelated paths. Match IDs keep the existing URL-safe 64-byte bound, and reconnect tokens continue to use the same rotating capability already enforced by the session runtime.
 
-The demo server opts into this addressing when `GAME_SERVER_MATCH_ID` is set. `GAME_SERVER_SESSION_PATH` then means the browser route base path rather than the full session path. If `GAME_SERVER_MATCH_ID` is absent, the old exact-session-path behavior remains available for existing experiments.
+The single-match demo mode opts into this addressing when `GAME_SERVER_MATCH_ID` is set. `GAME_SERVER_SESSION_PATH` then means the browser route base path rather than the full session path. If `GAME_SERVER_MATCH_ID` is absent, the old exact-session-path behavior remains available for existing experiments.
 
-This slice gives browser games a stable explicit match URL without moving game rules or authority into routing. A later process-hosting slice still needs to route one listener across multiple `MatchHost` entries rather than binding one server process invocation to one runtime.
+For process-hosted matches, `serve_match_host*` owns one WebTransport listener and dispatches each canonical match/reconnect route to the matching `MatchHost` runtime. Unknown or malformed routes fail closed before admission. `GAME_SERVER_MATCH_IDS=alpha,beta` enables that mode in the demo server and serves `/game/matches/alpha` and `/game/matches/beta` from the same listener.
 
 ## Reliable control
 
 Realtime game commands and latest authoritative snapshots use WebTransport datagrams. Transactional/session control uses an independent versioned request/response frame over bidirectional WebTransport streams. Each payload is bounded to 4 KiB, each exchange is time-bounded to five seconds, and each connection can have at most four control exchanges in flight.
 
-Applications opt in with `serve_with_control` or `serve_with_control_and_shutdown` and provide a `ControlService`. Each request receives a `ControlContext` containing the authenticated player ID and current connection epoch, so services that perform external side effects can fence delayed work after a reconnect. The service has no access to `GameSimulation`; authoritative game mutation therefore remains on the deterministic command/tick path. The default `serve` and `serve_with_shutdown` entry points reject control requests.
+Single-match applications opt in with `serve_with_control` or `serve_with_control_and_shutdown` and provide a `ControlService`. Hosted applications use `serve_match_host_with_control*` and provide a `MatchControlService`, which receives the validated `MatchId` in addition to the authenticated player ID and connection epoch. That preserves fencing identity even when different matches both allocate player ID 1. Neither control service has access to `GameSimulation`; authoritative game mutation therefore remains on the deterministic command/tick path.
 
 Control handlers run off the async runtime. A server instance admits at most 64 handler executions at once, and that permit remains occupied until the synchronous handler actually exits even if its WebTransport exchange has already timed out. This prevents repeated transport timeouts from creating an unbounded tail of detached blocking work.
 
-The real-network acceptance probe covers successful and rejected control exchanges, malformed, oversized, and trailing-byte fail-closed handling, stalled-stream timeout, the per-connection concurrency cap, and continued realtime command/snapshot progress while a control stream is stalled.
+The acceptance probes cover successful and rejected control exchanges, malformed, oversized, and trailing-byte fail-closed handling, stalled-stream timeout, the per-connection concurrency cap, continued realtime command/snapshot progress while a control stream is stalled, and match-scoped control routing through one hosted listener.
 
 ## Multi-match host
 
 `MatchHost` owns a bounded set of homogeneous `MatchRuntime` instances inside one process. Match IDs are URL-safe ASCII identifiers capped at 64 bytes, iteration is deterministic, and placement fails closed on duplicate IDs, process drain, or configured match capacity. Failed placement returns a `PlacementFailure` containing the original ID and runtime intact, so authoritative state is never discarded merely because placement must be retried elsewhere. Existing per-match player capacity remains owned by each simulation/runtime rather than being duplicated in the host.
 
-Draining is explicit at both match and process level. Removing a match requires it to be draining and to have no active or reconnectable player slots; the removed runtime is returned to the caller rather than silently discarded. Mutable runtime operations also reassert any pre-existing match/process drain before returning. `HostStatus` and per-match status expose capacity and lifecycle facts and derive readiness from those facts instead of storing a second mutable ready flag. Network routing across hosted matches and externally served health/readiness endpoints remain the next process-hosting slice.
+`serve_match_host*` now routes admission, reconnect, commands, authoritative snapshots, and reliable control to the addressed hosted runtime. Each match has an independent snapshot channel and tick loop; player/session numbering and command watermarks stay isolated by `MatchId`. The real-network acceptance starts two matches on one listener, proves both independently allocate player ID 1, verifies different command sequences converge only in their addressed match, checks match-scoped control identity, and rejects an unknown match route.
+
+Draining is explicit at both match and process level. Process shutdown marks the full host draining before the grace window, so new admissions fail while existing reconnects can still use their addressed runtime. Externally served health/readiness/drain state is the next process-hosting slice.
 
 ## Graceful recovery
 
-Set `GAME_SERVER_RECOVERY_PATH` to enable replay-backed graceful restart recovery. On SIGTERM or Ctrl-C the demo host drains, freezes authoritative mutation, writes a bounded recovery image atomically, and then closes established sessions. On the next successful endpoint startup the image is verified, authoritative state and command watermarks are reconstructed, and saved sessions become disconnected/reconnectable before the consumed image is removed.
+Set `GAME_SERVER_RECOVERY_PATH` to enable replay-backed graceful restart recovery for the single-match transport. On SIGTERM or Ctrl-C the runtime drains, freezes authoritative mutation, writes a bounded recovery image atomically, and then closes established sessions. On the next successful endpoint startup the image is verified, authoritative state and command watermarks are reconstructed, and saved sessions become disconnected/reconnectable before the consumed image is removed.
 
 Recovery persistence is intentionally fail-closed: malformed evidence prevents startup, failed shutdown persistence resumes the live runtime, recovery I/O does not hold the runtime mutex, and the reliable welcome handshake is time-bounded so a peer cannot retain capacity indefinitely. This is graceful restart recovery rather than per-command crash journaling.
+
+Hosted transport intentionally rejects `GAME_SERVER_RECOVERY_PATH` for now rather than pretending one recovery file can represent multiple independent matches. Per-match hosted recovery remains a follow-up boundary.
 
 See `ROADMAP.md` for the extraction plan and remaining process-hosting work.
