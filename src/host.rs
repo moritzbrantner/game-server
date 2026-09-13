@@ -327,6 +327,10 @@ impl<S: GameSimulation> MatchHost<S> {
         Some(result)
     }
 
+    pub fn into_runtimes(self) -> BTreeMap<MatchId, MatchRuntime<S>> {
+        self.matches
+    }
+
     pub fn begin_match_drain(&mut self, id: &MatchId) -> Result<(), HostError> {
         let runtime = self
             .matches
@@ -479,6 +483,19 @@ mod tests {
         let statuses = host.statuses();
         assert_eq!(statuses[0].id, id("a"));
         assert_eq!(statuses[1].id, id("b"));
+    }
+
+    #[test]
+    fn consuming_host_transfers_authoritative_runtimes_without_cloning() {
+        let mut live = runtime(10);
+        let lease = live.admit(token(1)).unwrap();
+        let mut host = MatchHost::new(1).unwrap();
+        host.insert(id("one"), live).unwrap();
+
+        let mut runtimes = host.into_runtimes();
+        let runtime = runtimes.get_mut(&id("one")).unwrap();
+        assert_eq!(runtime.active_count(), 1);
+        assert!(runtime.disconnect(lease.player_id, lease.connection_epoch));
     }
 
     #[test]

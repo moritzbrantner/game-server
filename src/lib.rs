@@ -1,6 +1,7 @@
 pub mod browser;
 pub mod control;
 pub mod host;
+pub mod host_transport;
 #[cfg(feature = "physics")]
 pub mod physics;
 pub mod protocol;
@@ -20,12 +21,18 @@ pub use browser::{
 pub use control::{
     CONTROL_FORMAT_VERSION, CONTROL_HEADER_BYTES, ControlContext, ControlRequest, ControlResponse,
     ControlService, ControlServiceError, ControlWireError, MAX_CONTROL_FRAME_BYTES,
-    MAX_CONTROL_PAYLOAD_BYTES, RejectControlService, decode_control_request,
-    decode_control_response, encode_control_request, encode_control_response,
+    MAX_CONTROL_PAYLOAD_BYTES, MatchControlService, RejectControlService,
+    RejectMatchControlService, decode_control_request, decode_control_response,
+    encode_control_request, encode_control_response,
 };
 pub use host::{
     HostError, HostStatus, MAX_MATCH_ID_BYTES, MatchHost, MatchId, MatchIdError, MatchStatus,
     PlacementFailure,
+};
+pub use host_transport::{
+    MatchHostTransportError, MatchHostWebTransportConfig, serve_match_host,
+    serve_match_host_with_control, serve_match_host_with_control_and_shutdown,
+    serve_match_host_with_shutdown,
 };
 #[cfg(feature = "physics")]
 pub use physics::{PINNED_PHYSICS_ENGINE_REVISION, PhysicsWorldAdapter};

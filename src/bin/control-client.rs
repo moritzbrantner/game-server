@@ -28,6 +28,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let certificate_hash = args
         .get(1)
         .ok_or("certificate SHA-256 fingerprint is required")?;
+    let expected_match_id = args.get(2).cloned();
 
     let digest = Sha256Digest::from_str_fmt(certificate_hash, Sha256DigestFmt::DottedHex)?;
     let client_config = ClientConfig::builder()
@@ -45,6 +46,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let accepted = control_exchange(&connection, b"ping").await?;
     let accepted_round_trip = accepted.accepted && accepted.payload == b"pong";
+
+    let match_scope_round_trip = match expected_match_id.as_deref() {
+        Some(expected) => {
+            let response = control_exchange(&connection, b"match-id").await?;
+            response.accepted && response.payload == expected.as_bytes()
+        }
+        None => true,
+    };
 
     let rejected = control_exchange(&connection, b"reject").await?;
     let service_rejection = !rejected.accepted && rejected.payload.is_empty();
@@ -73,6 +82,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let concurrency_bound_observed = observe_concurrency_bound(&connection).await?;
 
     let expectations_hold = accepted_round_trip
+        && match_scope_round_trip
         && service_rejection
         && malformed_rejected
         && oversized_rejected
@@ -83,9 +93,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         && concurrency_bound_observed;
 
     println!(
-        "{{\"mode\":\"webtransport-control-client\",\"playerId\":{},\"acceptedRoundTrip\":{},\"serviceRejection\":{},\"malformedRejected\":{},\"oversizedRejected\":{},\"trailingRejected\":{},\"connectionRemainedUsable\":{},\"datagramProgressWhileControlStalled\":{},\"stalledStreamTimedOut\":{},\"concurrencyBoundObserved\":{},\"expectationsHold\":{}}}",
+        "{{\"mode\":\"webtransport-control-client\",\"playerId\":{},\"acceptedRoundTrip\":{},\"matchScopeRoundTrip\":{},\"serviceRejection\":{},\"malformedRejected\":{},\"oversizedRejected\":{},\"trailingRejected\":{},\"connectionRemainedUsable\":{},\"datagramProgressWhileControlStalled\":{},\"stalledStreamTimedOut\":{},\"concurrencyBoundObserved\":{},\"expectationsHold\":{}}}",
         welcome.player_id,
         accepted_round_trip,
+        match_scope_round_trip,
         service_rejection,
         malformed_rejected,
         oversized_rejected,

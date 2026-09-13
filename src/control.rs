@@ -1,4 +1,5 @@
 use crate::PlayerId;
+use crate::host::MatchId;
 use std::error::Error;
 use std::fmt;
 
@@ -95,12 +96,35 @@ pub trait ControlService: Send + Sync + 'static {
     ) -> Result<Vec<u8>, ControlServiceError>;
 }
 
+pub trait MatchControlService: Send + Sync + 'static {
+    fn handle(
+        &self,
+        match_id: &MatchId,
+        context: ControlContext,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, ControlServiceError>;
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RejectControlService;
 
 impl ControlService for RejectControlService {
     fn handle(
         &self,
+        _context: ControlContext,
+        _payload: &[u8],
+    ) -> Result<Vec<u8>, ControlServiceError> {
+        Err(ControlServiceError::new("reliable control is disabled"))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RejectMatchControlService;
+
+impl MatchControlService for RejectMatchControlService {
+    fn handle(
+        &self,
+        _match_id: &MatchId,
         _context: ControlContext,
         _payload: &[u8],
     ) -> Result<Vec<u8>, ControlServiceError> {
