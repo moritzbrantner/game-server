@@ -34,4 +34,14 @@ jobs:
       - name: Run graceful restart recovery experiment
         run: bash recovery/restart-experiment.sh
       - name: Run hosted graceful restart recovery experiment
-        run: bash recovery/hosted-restart-experiment.sh
+        id: hosted-restart
+        run: |
+          set -o pipefail
+          bash recovery/hosted-restart-experiment.sh 2>&1 | tee hosted-restart.log
+      - name: Upload hosted recovery failure diagnostics
+        if: failure() && steps.hosted-restart.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: hosted-restart-failure
+          path: hosted-restart.log
+          if-no-files-found: error
