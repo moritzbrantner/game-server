@@ -1,6 +1,7 @@
 pub mod browser;
 pub mod control;
 pub mod host;
+pub mod host_status;
 pub mod host_transport;
 #[cfg(feature = "physics")]
 pub mod physics;
@@ -28,6 +29,10 @@ pub use control::{
 pub use host::{
     HostError, HostStatus, MAX_MATCH_ID_BYTES, MatchHost, MatchId, MatchIdError, MatchStatus,
     PlacementFailure,
+};
+pub use host_status::{
+    DEFAULT_HOST_STATUS_PORT, HOST_STATUS_CONTRACT_VERSION, HostStatusServerError,
+    MatchHostStatusConfig, serve_match_host_with_status_and_control_and_shutdown,
 };
 pub use host_transport::{
     MatchHostTransportError, MatchHostWebTransportConfig, serve_match_host,
