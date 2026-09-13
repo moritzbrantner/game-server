@@ -46,7 +46,7 @@ The acceptance probes cover successful and rejected control exchanges, malformed
 
 `MatchHost` owns a bounded set of homogeneous `MatchRuntime` instances inside one process. Match IDs are URL-safe ASCII identifiers capped at 64 bytes, iteration is deterministic, and placement fails closed on duplicate IDs, process drain, or configured match capacity. Failed placement returns a `PlacementFailure` containing the original ID and runtime intact, so authoritative state is never discarded merely because placement must be retried elsewhere. Existing per-match player capacity remains owned by each simulation/runtime rather than being duplicated in the host.
 
-`serve_match_host*` now routes admission, reconnect, commands, authoritative snapshots, and reliable control to the addressed hosted runtime. Each match has an independent snapshot channel and tick loop; player/session numbering and command watermarks stay isolated by `MatchId`. The real-network acceptance starts two matches on one listener, proves both independently allocate player ID 1, verifies different command sequences converge only in their addressed match, checks match-scoped control identity, and rejects an unknown match route.
+`serve_match_host*` routes admission, reconnect, commands, authoritative snapshots, and reliable control to the addressed hosted runtime. Each match has an independent snapshot channel and tick loop; player/session numbering and command watermarks stay isolated by `MatchId`. The real-network acceptance starts two matches on one listener, proves both independently allocate player ID 1, verifies different command sequences converge only in their addressed match, checks match-scoped control identity, and rejects an unknown match route.
 
 Draining is explicit at both match and process level. Process shutdown marks the full host draining before the grace window, so new admissions fail while existing reconnects can still use their addressed runtime.
 
@@ -69,6 +69,21 @@ Set `GAME_SERVER_RECOVERY_PATH` to enable replay-backed graceful restart recover
 
 Recovery persistence is intentionally fail-closed: malformed evidence prevents startup, failed shutdown persistence resumes the live runtime, recovery I/O does not hold the runtime mutex, and the reliable welcome handshake is time-bounded so a peer cannot retain capacity indefinitely. This is graceful restart recovery rather than per-command crash journaling.
 
-Hosted transport intentionally rejects `GAME_SERVER_RECOVERY_PATH` for now rather than pretending one recovery file can represent multiple independent matches. Per-match hosted recovery remains the next process-hosting boundary.
+For process-hosted matches, use `prepare_match_host_for_recovery` plus `serve_prepared_match_host_with_status_and_control_and_shutdown`. The demo server enables this path with `GAME_SERVER_MATCH_IDS` and `GAME_SERVER_RECOVERY_DIR`; `GAME_SERVER_RECOVERY_PATH` remains single-match only.
 
-See `ROADMAP.md` for the extraction plan and remaining process-hosting work.
+A hosted recovery directory is a versioned bundle containing an exact sorted match manifest and one existing `RecoveryImage` per `MatchId`:
+
+```text
+host.recovery/
+  manifest
+  alpha.recovery
+  beta.recovery
+```
+
+The complete configured match set must match the manifest exactly. Startup reads and validates every per-match image off the async runtime and fails closed if any image, manifest entry, or directory entry is missing, extra, malformed, or incompatible. The validated bundle is consumed only after the WebTransport endpoint has bound successfully, so a bind/TLS failure does not discard restart evidence.
+
+On graceful hosted shutdown, new admissions drain first. After the grace window every runtime is frozen, all per-match recovery images are produced, and the complete bundle is staged in a sibling temporary directory before one directory rename publishes it. If image creation or persistence fails, all frozen runtimes are resumed while the host remains drained/unready; existing sessions, reconnects, and deterministic ticks can therefore continue while a later shutdown signal retries persistence, without admitting new nondurable match state.
+
+The hosted restart acceptance proves independent reconnect tokens, connection epochs, command watermarks, and simulation continuity across two matches. It also corrupts only one match image and verifies that startup rejects the complete bundle without consuming the healthy match or silently replacing the failed match with fresh authoritative state.
+
+See `ROADMAP.md` for the extraction plan and ownership boundaries.
