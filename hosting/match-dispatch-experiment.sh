@@ -99,7 +99,7 @@ assert status["capacity"] == {
     "hostedMatches": 2,
     "maxMatches": 2,
     "remainingMatches": 0,
-    "playerCapacity": 8,
+    "playerCapacity": 32,
 }, status
 assert [match["id"] for match in status["matches"]] == ["alpha", "beta"], status
 assert all(match["ready"] for match in status["matches"]), status
