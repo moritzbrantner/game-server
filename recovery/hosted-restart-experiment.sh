@@ -73,10 +73,31 @@ start_server() {
   : >"$SERVER_LOG"
   server_env "$SERVER_BIN" >>"$SERVER_LOG" 2>&1 &
   SERVER_PID=$!
-  sleep 0.45
-  if ! kill -0 "$SERVER_PID" 2>/dev/null; then
-    wait "$SERVER_PID"
-  fi
+  python3 - "$STATUS_URL" "$SERVER_PID" <<'PY'
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+
+base = sys.argv[1]
+pid = int(sys.argv[2])
+deadline = time.monotonic() + 5.0
+last_error = None
+while time.monotonic() < deadline:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        raise SystemExit("game-server exited before becoming ready")
+    try:
+        with urllib.request.urlopen(base + "/readyz", timeout=0.2) as response:
+            if response.status == 200:
+                sys.exit(0)
+    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as error:
+        last_error = error
+    time.sleep(0.05)
+raise SystemExit(f"game-server did not become ready: {last_error}")
+PY
 }
 
 stop_server() {
@@ -105,6 +126,7 @@ assert_bundle() {
 
 ALPHA_URL="https://127.0.0.1:$PORT/game/matches/alpha"
 BETA_URL="https://127.0.0.1:$PORT/game/matches/beta"
+STATUS_URL="http://127.0.0.1:$STATUS_PORT"
 
 start_server
 alpha_first=$("$CLIENT_BIN" "$ALPHA_URL" "$CERT_HASH" 20 10 2000 10 1)
