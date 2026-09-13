@@ -29,10 +29,13 @@ impl ControlService for DemoControlService {
 impl MatchControlService for DemoControlService {
     fn handle(
         &self,
-        _match_id: &MatchId,
+        match_id: &MatchId,
         _context: ControlContext,
         payload: &[u8],
     ) -> Result<Vec<u8>, ControlServiceError> {
+        if payload == b"match-id" {
+            return Ok(match_id.as_str().as_bytes().to_vec());
+        }
         handle_demo_control(payload)
     }
 }
