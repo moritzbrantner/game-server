@@ -353,8 +353,22 @@ async fn persist_host_recovery<S: GameSimulation>(
     }
 
     let directory = directory.to_path_buf();
-    let result = match spawn_blocking(move || write_recovery_bundle(&directory, &images)).await {
-        Ok(result) => result.map_err(|error| error.to_string()),
+    let persistence = spawn_blocking(move || {
+        let existed_before = directory.exists();
+        let result = write_recovery_bundle(&directory, &images);
+        let exists_after = directory.exists();
+        (result, existed_before, exists_after)
+    })
+    .await;
+    let result = match persistence {
+        Ok((Ok(()), _, _)) => Ok(()),
+        Ok((Err(error), false, true)) => {
+            eprintln!(
+                "hosted recovery bundle exists after an atomic publish reported an error; treating it as committed to avoid resuming beyond that snapshot: {error}"
+            );
+            Ok(())
+        }
+        Ok((Err(error), _, _)) => Err(error.to_string()),
         Err(error) => Err(format!("hosted recovery persistence task failed: {error}")),
     };
     if result.is_err() {
