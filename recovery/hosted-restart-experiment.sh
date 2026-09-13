@@ -63,22 +63,24 @@ openssl req -new -x509 -sha256 -key "$KEY_PEM" -out "$CERT_PEM" -days 1 \
   -addext "subjectAltName=IP:127.0.0.1,DNS:localhost" >/dev/null 2>&1
 CERT_HASH=$(openssl x509 -in "$CERT_PEM" -noout -fingerprint -sha256 | cut -d= -f2 | tr 'A-F' 'a-f')
 
+SERVER_ENV=(
+  "GAME_SERVER_PORT=$PORT"
+  "GAME_SERVER_STATUS_PORT=$STATUS_PORT"
+  "GAME_SERVER_CERT_PEM=$CERT_PEM"
+  "GAME_SERVER_KEY_PEM=$KEY_PEM"
+  "GAME_SERVER_SESSION_PATH=/game"
+  "GAME_SERVER_MATCH_IDS=alpha,beta"
+  "GAME_SERVER_RECOVERY_DIR=$RECOVERY_DIR"
+  "GAME_SERVER_DRAIN_GRACE_MS=50"
+)
+
 server_env() {
-  env \
-    GAME_SERVER_PORT="$PORT" \
-    GAME_SERVER_STATUS_PORT="$STATUS_PORT" \
-    GAME_SERVER_CERT_PEM="$CERT_PEM" \
-    GAME_SERVER_KEY_PEM="$KEY_PEM" \
-    GAME_SERVER_SESSION_PATH=/game \
-    GAME_SERVER_MATCH_IDS=alpha,beta \
-    GAME_SERVER_RECOVERY_DIR="$RECOVERY_DIR" \
-    GAME_SERVER_DRAIN_GRACE_MS=50 \
-    "$@"
+  env "${SERVER_ENV[@]}" "$@"
 }
 
 start_server() {
   : >"$SERVER_LOG"
-  server_env "$SERVER_BIN" >>"$SERVER_LOG" 2>&1 &
+  env "${SERVER_ENV[@]}" "$SERVER_BIN" >>"$SERVER_LOG" 2>&1 &
   SERVER_PID=$!
   python3 - "$STATUS_URL" "$SERVER_PID" <<'PY'
 import os
