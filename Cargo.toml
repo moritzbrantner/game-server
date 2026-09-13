@@ -20,7 +20,7 @@ physics = ["dep:physics-engine"]
 [dependencies]
 physics-engine = { git = "https://github.com/moritzbrantner/physics-engine.git", rev = "8ea513395ad6893e45da7d6fa983b6cd3949a4ac", optional = true }
 ring = "0.17.14"
-tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 wtransport = { version = "0.7.2", default-features = false, features = ["ring"] }
 
 [lints.rust]
