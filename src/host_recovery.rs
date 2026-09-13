@@ -47,7 +47,10 @@ impl fmt::Display for MatchHostRecoveryError {
         match self {
             Self::EmptyMatchSet => write!(formatter, "hosted recovery requires at least one match"),
             Self::DuplicateMatch(id) => {
-                write!(formatter, "hosted recovery match {id} is configured more than once")
+                write!(
+                    formatter,
+                    "hosted recovery match {id} is configured more than once"
+                )
             }
             Self::Host(error) => write!(formatter, "hosted recovery host error: {error}"),
             Self::Manifest(error) => write!(formatter, "hosted recovery manifest error: {error}"),
@@ -68,12 +71,7 @@ pub async fn prepare_match_host_for_recovery<S: GameSimulation>(
     config: MatchHostRecoveryConfig,
 ) -> Result<PreparedMatchHost<S>, MatchHostRecoveryError> {
     spawn_blocking(move || {
-        prepare_match_host_for_recovery_sync(
-            matches,
-            max_matches,
-            reconnect_grace_ticks,
-            config,
-        )
+        prepare_match_host_for_recovery_sync(matches, max_matches, reconnect_grace_ticks, config)
     })
     .await
     .map_err(|error| {
@@ -98,12 +96,11 @@ fn prepare_match_host_for_recovery_sync<S: GameSimulation>(
         }
     }
 
-    cleanup_consumed_bundle(&config.directory)?;
+    ensure_no_incomplete_consumption(&config.directory)?;
     let recovery_images = match fs::metadata(&config.directory) {
-        Ok(metadata) if metadata.is_dir() => Some(read_recovery_bundle(
-            &config.directory,
-            &expected_ids,
-        )?),
+        Ok(metadata) if metadata.is_dir() => {
+            Some(read_recovery_bundle(&config.directory, &expected_ids)?)
+        }
         Ok(_) => {
             return Err(MatchHostRecoveryError::Io(format!(
                 "{} exists but is not a directory",
@@ -148,10 +145,8 @@ fn prepare_match_host_for_recovery_sync<S: GameSimulation>(
 }
 
 pub(crate) fn consume_recovery_bundle(directory: &Path) -> Result<(), MatchHostRecoveryError> {
+    ensure_no_incomplete_consumption(directory)?;
     let consumed = sibling_path(directory, ".consumed")?;
-    if consumed.exists() {
-        fs::remove_dir_all(&consumed).map_err(io_error)?;
-    }
     fs::rename(directory, &consumed).map_err(io_error)?;
     sync_parent_directory(directory)?;
     fs::remove_dir_all(&consumed).map_err(io_error)?;
@@ -168,6 +163,7 @@ pub(crate) fn write_recovery_bundle(
             directory.display()
         )));
     }
+    ensure_no_incomplete_consumption(directory)?;
     let temp = sibling_path(directory, ".tmp")?;
     if temp.exists() {
         fs::remove_dir_all(&temp).map_err(io_error)?;
@@ -187,7 +183,16 @@ pub(crate) fn write_recovery_bundle(
         }
         sync_directory(&temp)?;
         fs::rename(&temp, directory).map_err(io_error)?;
-        sync_parent_directory(directory)
+        if let Err(error) = sync_parent_directory(directory) {
+            let rollback = fs::rename(directory, &temp);
+            if rollback.is_ok() {
+                let _ = sync_parent_directory(directory);
+            }
+            return Err(MatchHostRecoveryError::Io(format!(
+                "recovery bundle commit sync failed: {error}"
+            )));
+        }
+        Ok(())
     })();
 
     if result.is_err() {
@@ -215,11 +220,12 @@ fn read_recovery_bundle(
     expected_ids
         .iter()
         .map(|id| {
-            let image = RecoveryImage::read_file(&directory.join(recovery_file_name(id)))
-                .map_err(|error| MatchHostRecoveryError::Match {
+            let image = RecoveryImage::read_file(&directory.join(recovery_file_name(id))).map_err(
+                |error| MatchHostRecoveryError::Match {
                     id: id.clone(),
                     error: error.to_string(),
-                })?;
+                },
+            )?;
             Ok((id.clone(), image))
         })
         .collect()
@@ -284,10 +290,13 @@ fn recovery_file_name(id: &MatchId) -> String {
     format!("{}{RECOVERY_FILE_SUFFIX}", id.as_str())
 }
 
-fn cleanup_consumed_bundle(directory: &Path) -> Result<(), MatchHostRecoveryError> {
+fn ensure_no_incomplete_consumption(directory: &Path) -> Result<(), MatchHostRecoveryError> {
     let consumed = sibling_path(directory, ".consumed")?;
-    match fs::remove_dir_all(consumed) {
-        Ok(()) => sync_parent_directory(directory),
+    match fs::metadata(&consumed) {
+        Ok(_) => Err(MatchHostRecoveryError::Manifest(format!(
+            "incomplete recovery consumption marker {} exists",
+            consumed.display()
+        ))),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(io_error(error)),
     }
