@@ -1,5 +1,5 @@
-use crate::host::MatchId;
 use crate::PlayerId;
+use crate::host::MatchId;
 use std::error::Error;
 use std::fmt;
 
