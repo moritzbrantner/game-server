@@ -1,5 +1,12 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
+
+PHASE=setup
+report_error() {
+  status=$?
+  echo "hosted-restart failure: phase=$PHASE line=$LINENO status=$status command=$BASH_COMMAND" >&2
+}
+trap report_error ERR
 
 for command in openssl python3; do
   command -v "$command" >/dev/null || {
@@ -128,10 +135,14 @@ ALPHA_URL="https://127.0.0.1:$PORT/game/matches/alpha"
 BETA_URL="https://127.0.0.1:$PORT/game/matches/beta"
 STATUS_URL="http://127.0.0.1:$STATUS_PORT"
 
+PHASE=fresh-start
 start_server
+PHASE=fresh-alpha
 alpha_first=$("$CLIENT_BIN" "$ALPHA_URL" "$CERT_HASH" 20 10 2000 10 1)
+PHASE=fresh-beta
 beta_first=$("$CLIENT_BIN" "$BETA_URL" "$CERT_HASH" 12 10 2000 10 1)
 
+PHASE=parse-fresh-alpha
 readarray -t alpha_values < <(python3 - "$alpha_first" <<'PY'
 import json
 import sys
@@ -146,6 +157,7 @@ print(receipt["connectionEpoch"])
 print(receipt["reconnectToken"])
 PY
 )
+PHASE=parse-fresh-beta
 readarray -t beta_values < <(python3 - "$beta_first" <<'PY'
 import json
 import sys
@@ -161,22 +173,29 @@ print(receipt["reconnectToken"])
 PY
 )
 
+PHASE=first-shutdown
 stop_server
+PHASE=first-bundle
 assert_bundle
 
+PHASE=recovered-start
 start_server
+PHASE=consume-check
 [[ ! -e "$RECOVERY_DIR" ]] || {
   echo "startup did not consume the hosted recovery bundle" >&2
   exit 1
 }
 
+PHASE=reconnect-alpha
 alpha_second=$(
   "$CLIENT_BIN" "$ALPHA_URL/reconnect/${alpha_values[2]}" "$CERT_HASH" 20 10 2000 10 21
 )
+PHASE=reconnect-beta
 beta_second=$(
   "$CLIENT_BIN" "$BETA_URL/reconnect/${beta_values[2]}" "$CERT_HASH" 12 10 2000 10 13
 )
 
+PHASE=verify-reconnect
 python3 - "$alpha_first" "$alpha_second" "${alpha_values[0]}" "${alpha_values[1]}" \
   "$beta_first" "$beta_second" "${beta_values[0]}" "${beta_values[1]}" <<'PY'
 import json
@@ -207,20 +226,27 @@ assert beta_second["finalAppliedSequence"] == 24, beta_second
 assert beta_second["welcomeTick"] >= beta_first["lastAcceptedTick"], (beta_first, beta_second)
 PY
 
+PHASE=second-shutdown
 stop_server
+PHASE=second-bundle
 assert_bundle
 
+PHASE=corrupt-beta
 printf 'bad' >"$RECOVERY_DIR/beta.recovery"
+trap - ERR
 set +e
 server_env "$SERVER_BIN" >"$CORRUPT_LOG" 2>&1
 corrupt_status=$?
 set -e
+trap report_error ERR
 [[ $corrupt_status -ne 0 ]] || {
   echo "server accepted a corrupted per-match hosted recovery image" >&2
   exit 1
 }
+PHASE=corrupt-bundle
 assert_bundle
 
+PHASE=complete
 python3 - "$alpha_first" "$alpha_second" "$beta_first" "$beta_second" <<'PY'
 import json
 import sys
