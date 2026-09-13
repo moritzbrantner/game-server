@@ -117,7 +117,7 @@ impl fmt::Display for BrowserRouteError {
         match self {
             Self::InvalidBasePath => write!(
                 formatter,
-                "browser route base path must be an absolute non-root path without a trailing slash, query, fragment, or duplicate separator"
+                "browser route base path must use canonical absolute ASCII segments containing only letters, digits, '-' or '_'"
             ),
             Self::InvalidMatchId(error) => write!(formatter, "invalid browser match id: {error}"),
             Self::InvalidReconnectToken => {
@@ -131,15 +131,19 @@ impl fmt::Display for BrowserRouteError {
 impl Error for BrowserRouteError {}
 
 fn validate_base_path(value: &str) -> Result<(), BrowserRouteError> {
-    if value.len() < 2
-        || !value.starts_with('/')
-        || value.ends_with('/')
-        || value.contains("//")
-        || value.contains('?')
-        || value.contains('#')
-    {
+    if value.len() < 2 || !value.starts_with('/') || value.ends_with('/') {
         return Err(BrowserRouteError::InvalidBasePath);
     }
+
+    if value[1..].split('/').any(|segment| {
+        segment.is_empty()
+            || segment
+                .chars()
+                .any(|character| !(character.is_ascii_alphanumeric() || matches!(character, '-' | '_')))
+    }) {
+        return Err(BrowserRouteError::InvalidBasePath);
+    }
+
     Ok(())
 }
 
@@ -171,10 +175,15 @@ mod tests {
     #[test]
     fn builds_and_parses_match_and_reconnect_routes() {
         let prefix = BrowserRoutePrefix::new("/game").unwrap();
+        let nested_prefix = BrowserRoutePrefix::new("/api/game_v1").unwrap();
         let id = match_id("uno_01");
         let token = ReconnectToken([0xab; RECONNECT_TOKEN_BYTES]);
 
         assert_eq!(prefix.match_path(&id), "/game/matches/uno_01");
+        assert_eq!(
+            nested_prefix.match_path(&id),
+            "/api/game_v1/matches/uno_01"
+        );
         assert_eq!(
             prefix.reconnect_path(&id, token),
             format!("/game/matches/uno_01/reconnect/{}", token.encode_hex())
@@ -215,8 +224,21 @@ mod tests {
     }
 
     #[test]
-    fn rejects_ambiguous_base_paths() {
-        for value in ["", "/", "game", "/game/", "/game//sessions", "/game?x=1"] {
+    fn rejects_ambiguous_or_browser_normalized_base_paths() {
+        for value in [
+            "",
+            "/",
+            "game",
+            "/game/",
+            "/game//sessions",
+            "/game?x=1",
+            "/game/.",
+            "/game/..",
+            "/game\\sessions",
+            "/game sessions",
+            "/gáme",
+            "/game/%2e%2e",
+        ] {
             assert_eq!(
                 BrowserRoutePrefix::new(value),
                 Err(BrowserRouteError::InvalidBasePath)
