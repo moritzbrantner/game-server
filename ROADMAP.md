@@ -56,7 +56,7 @@ Graceful recovery freezes authoritative mutation before producing a bounded reco
 - [x] Host multiple matches per process with bounded match count and existing per-match player capacity.
 - [x] Publish a versioned browser route/protocol contract and explicit match-addressed WebTransport path for single-runtime serving.
 - [x] Route one WebTransport listener across `MatchHost` entries with isolated admission, reconnect, commands, snapshots, ticks, and reliable control.
-- [ ] Expose externally served process/match draining and health/ready state.
+- [x] Expose externally served process/match draining and health/ready state.
 - [ ] Add explicit per-match recovery semantics for process-hosted matches before enabling hosted recovery.
 - [ ] Keep cross-process orchestration out of the core until a real deployment needs it.
 
@@ -64,9 +64,11 @@ The in-process `MatchHost` uses deterministic URL-safe match IDs, bounded placem
 
 The browser-routing contract establishes `/game/matches/<match-id>` plus reconnect addressing and binds that route version to the existing command/snapshot and reliable-control versions. The hosted transport now uses that parsed ID to select the authoritative `MatchHost` runtime on one listener. Each match owns an independent tick loop and latest-snapshot channel; player IDs and command watermarks can overlap safely because transport lookup remains match-scoped. Hosted reliable control additionally receives the validated match ID so external side effects are not ambiguous across matches.
 
-Real-network acceptance starts two hosted matches on one listener, verifies both independently allocate player ID 1, drives different command sequences to different final authoritative states, checks match-scoped reliable control, and rejects an unknown match route. The next slice should expose truthful process and per-match health/readiness/drain state without adding a fleet scheduler.
+The process-host status contract is a separate read-only HTTP surface with process and match `healthz`, `readyz`, and `status` routes. Health remains live through intentional drain, readiness turns `503` before the existing drain grace window, and status reports immutable process/match capacity plus drain/frozen facts without copying game rules or mutable gameplay counters. Service readiness is intentionally distinct from placement capacity, so a fully populated host remains ready to serve its existing matches. Real-network acceptance verifies the status surface alongside isolated multi-match WebTransport routing and observes the not-ready/draining transition after SIGTERM.
 
-The region/process-placement experiments in `server-lab` are evidence for this milestone, not code to copy wholesale. `game-server` should first expose truthful per-process capacity, health, and drain state; a separate fleet scheduler can consume those facts later.
+The next slice should define per-match recovery paths, startup restore ordering, failure isolation, and recovery evidence ownership for hosted matches before `GAME_SERVER_RECOVERY_PATH` can be enabled in multi-match mode.
+
+The region/process-placement experiments in `server-lab` are evidence for this milestone, not code to copy wholesale. `game-server` exposes the process facts a separate fleet scheduler can consume; scheduler policy and cross-process orchestration remain outside the core until a real deployment needs them.
 
 ## Deliberately out of scope
 
