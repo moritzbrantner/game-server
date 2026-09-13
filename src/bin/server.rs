@@ -1,10 +1,11 @@
 use game_server::{
     BrowserRoutePrefix, ControlContext, ControlService, ControlServiceError,
     DEFAULT_HOST_STATUS_PORT, DEFAULT_RECONNECT_GRACE_TICKS, DemoSimulation, MatchControlService,
-    MatchHost, MatchHostRecoveryConfig, MatchHostStatusConfig, MatchHostWebTransportConfig, MatchId,
-    MatchRuntime, WebTransportConfig, prepare_match_host_for_recovery,
+    MatchHost, MatchHostRecoveryConfig, MatchHostStatusConfig, MatchHostWebTransportConfig,
+    MatchId, MatchRuntime, WebTransportConfig, prepare_match_host_for_recovery,
     serve_match_host_with_status_and_control_and_shutdown,
-    serve_prepared_match_host_with_status_and_control_and_shutdown, serve_with_control_and_shutdown,
+    serve_prepared_match_host_with_status_and_control_and_shutdown,
+    serve_with_control_and_shutdown,
 };
 use std::env;
 use std::error::Error;
@@ -73,9 +74,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let recovery_path = env::var("GAME_SERVER_RECOVERY_PATH")
         .ok()
         .map(PathBuf::from);
-    let recovery_directory = env::var("GAME_SERVER_RECOVERY_DIR")
-        .ok()
-        .map(PathBuf::from);
+    let recovery_directory = env::var("GAME_SERVER_RECOVERY_DIR").ok().map(PathBuf::from);
     if recovery_path.is_some() && recovery_directory.is_some() {
         return Err(
             "GAME_SERVER_RECOVERY_PATH and GAME_SERVER_RECOVERY_DIR are mutually exclusive".into(),
