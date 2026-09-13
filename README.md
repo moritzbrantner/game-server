@@ -15,6 +15,23 @@ Reusable server-authoritative multiplayer runtime extracted from the proven `ser
 
 It does **not** own game-specific rules, matchmaking/accounts/rankings, or physics algorithms. Games supply deterministic simulation logic. Physics is delegated to `physics-engine` through an adapter boundary.
 
+## Browser integration contract
+
+`browser` exposes the versioned browser-facing boundary without creating a second gameplay protocol. `BROWSER_PROTOCOL_CONTRACT` binds the route version to the existing command/snapshot protocol version, reliable-control format version, reconnect-token size, and payload ceilings so browser clients can pin one explicit compatibility surface.
+
+Use `BrowserRoutePrefix` plus a validated `MatchId` to address a match. With a `/game` base path and match ID `uno_01`, the canonical paths are:
+
+```text
+/game/matches/uno_01
+/game/matches/uno_01/reconnect/<32-hex-character-token>
+```
+
+`BrowserRoutePrefix::parse` fails closed for malformed owned routes and returns no match for unrelated paths. Match IDs keep the existing URL-safe 64-byte bound, and reconnect tokens continue to use the same rotating capability already enforced by the session runtime.
+
+The demo server opts into this addressing when `GAME_SERVER_MATCH_ID` is set. `GAME_SERVER_SESSION_PATH` then means the browser route base path rather than the full session path. If `GAME_SERVER_MATCH_ID` is absent, the old exact-session-path behavior remains available for existing experiments.
+
+This slice gives browser games a stable explicit match URL without moving game rules or authority into routing. A later process-hosting slice still needs to route one listener across multiple `MatchHost` entries rather than binding one server process invocation to one runtime.
+
 ## Reliable control
 
 Realtime game commands and latest authoritative snapshots use WebTransport datagrams. Transactional/session control uses an independent versioned request/response frame over bidirectional WebTransport streams. Each payload is bounded to 4 KiB, each exchange is time-bounded to five seconds, and each connection can have at most four control exchanges in flight.
@@ -29,7 +46,7 @@ The real-network acceptance probe covers successful and rejected control exchang
 
 `MatchHost` owns a bounded set of homogeneous `MatchRuntime` instances inside one process. Match IDs are URL-safe ASCII identifiers capped at 64 bytes, iteration is deterministic, and placement fails closed on duplicate IDs, process drain, or configured match capacity. Failed placement returns a `PlacementFailure` containing the original ID and runtime intact, so authoritative state is never discarded merely because placement must be retried elsewhere. Existing per-match player capacity remains owned by each simulation/runtime rather than being duplicated in the host.
 
-Draining is explicit at both match and process level. Removing a match requires it to be draining and to have no active or reconnectable player slots; the removed runtime is returned to the caller rather than silently discarded. Mutable runtime operations also reassert any pre-existing match/process drain before returning. `HostStatus` and per-match status expose capacity and lifecycle facts and derive readiness from those facts instead of storing a second mutable ready flag. Network routing and externally served health/readiness endpoints are the next process-hosting slice.
+Draining is explicit at both match and process level. Removing a match requires it to be draining and to have no active or reconnectable player slots; the removed runtime is returned to the caller rather than silently discarded. Mutable runtime operations also reassert any pre-existing match/process drain before returning. `HostStatus` and per-match status expose capacity and lifecycle facts and derive readiness from those facts instead of storing a second mutable ready flag. Network routing across hosted matches and externally served health/readiness endpoints remain the next process-hosting slice.
 
 ## Graceful recovery
 
