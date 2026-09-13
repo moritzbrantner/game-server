@@ -4,9 +4,7 @@ use crate::control::{
     RejectMatchControlService, decode_control_request, encode_control_response,
 };
 use crate::host::{MatchHost, MatchId};
-use crate::host_recovery::{
-    MatchHostRecoveryPlan, consume_recovery_bundle, write_recovery_bundle,
-};
+use crate::host_recovery::{MatchHostRecoveryPlan, consume_recovery_bundle, write_recovery_bundle};
 use crate::protocol::{
     RECONNECT_TOKEN_BYTES, SnapshotFrame, Welcome, decode_command, encode_snapshot, encode_welcome,
 };
@@ -355,10 +353,10 @@ async fn persist_host_recovery<S: GameSimulation>(
     }
 
     let directory = directory.to_path_buf();
-    let result = spawn_blocking(move || write_recovery_bundle(&directory, &images))
-        .await
-        .map_err(|error| format!("hosted recovery persistence task failed: {error}"))?
-        .map_err(|error| error.to_string());
+    let result = match spawn_blocking(move || write_recovery_bundle(&directory, &images)).await {
+        Ok(result) => result.map_err(|error| error.to_string()),
+        Err(error) => Err(format!("hosted recovery persistence task failed: {error}")),
+    };
     if result.is_err() {
         resume_host_after_failed_recovery(state).await;
     }
