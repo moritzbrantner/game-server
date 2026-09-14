@@ -1,8 +1,10 @@
 use game_server::{
     BrowserRoutePrefix, ControlContext, ControlService, ControlServiceError,
     DEFAULT_HOST_STATUS_PORT, DEFAULT_RECONNECT_GRACE_TICKS, DemoSimulation, MatchControlService,
-    MatchHost, MatchHostStatusConfig, MatchHostWebTransportConfig, MatchId, MatchRuntime,
-    WebTransportConfig, serve_match_host_with_status_and_control_and_shutdown,
+    MatchHost, MatchHostRecoveryConfig, MatchHostStatusConfig, MatchHostWebTransportConfig,
+    MatchId, MatchRuntime, WebTransportConfig, prepare_match_host_for_recovery,
+    serve_match_host_with_status_and_control_and_shutdown,
+    serve_prepared_match_host_with_status_and_control_and_shutdown,
     serve_with_control_and_shutdown,
 };
 use std::env;
@@ -72,6 +74,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let recovery_path = env::var("GAME_SERVER_RECOVERY_PATH")
         .ok()
         .map(PathBuf::from);
+    let recovery_directory = env::var("GAME_SERVER_RECOVERY_DIR").ok().map(PathBuf::from);
+    if recovery_path.is_some() && recovery_directory.is_some() {
+        return Err(
+            "GAME_SERVER_RECOVERY_PATH and GAME_SERVER_RECOVERY_DIR are mutually exclusive".into(),
+        );
+    }
     let drain_grace_ms = env::var("GAME_SERVER_DRAIN_GRACE_MS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
@@ -84,32 +92,65 @@ async fn main() -> Result<(), Box<dyn Error>> {
     if let Some(match_ids) = hosted_match_ids {
         if recovery_path.is_some() {
             return Err(
-                "GAME_SERVER_RECOVERY_PATH is not yet supported with GAME_SERVER_MATCH_IDS".into(),
+                "GAME_SERVER_RECOVERY_PATH is single-match only; use GAME_SERVER_RECOVERY_DIR with GAME_SERVER_MATCH_IDS"
+                    .into(),
             );
         }
         let route_prefix = BrowserRoutePrefix::new(session_path)?;
-        let mut host = MatchHost::new(match_ids.len())?;
-        for match_id in match_ids {
-            host.insert(
-                match_id,
-                MatchRuntime::new(DemoSimulation::new(), DEFAULT_RECONNECT_GRACE_TICKS),
-            )?;
+        let transport_config = MatchHostWebTransportConfig {
+            port,
+            certificate_pem,
+            private_key_pem,
+            route_prefix,
+            drain_grace,
+        };
+        let status_config = MatchHostStatusConfig { port: status_port };
+
+        if let Some(directory) = recovery_directory {
+            let max_matches = match_ids.len();
+            let matches = match_ids
+                .into_iter()
+                .map(|match_id| (match_id, DemoSimulation::new()))
+                .collect();
+            let prepared = prepare_match_host_for_recovery(
+                matches,
+                max_matches,
+                DEFAULT_RECONNECT_GRACE_TICKS,
+                MatchHostRecoveryConfig { directory },
+            )
+            .await?;
+            serve_prepared_match_host_with_status_and_control_and_shutdown(
+                prepared,
+                DemoControlService,
+                transport_config,
+                status_config,
+                shutdown_receiver,
+            )
+            .await?;
+        } else {
+            let mut host = MatchHost::new(match_ids.len())?;
+            for match_id in match_ids {
+                host.insert(
+                    match_id,
+                    MatchRuntime::new(DemoSimulation::new(), DEFAULT_RECONNECT_GRACE_TICKS),
+                )?;
+            }
+            serve_match_host_with_status_and_control_and_shutdown(
+                host,
+                DemoControlService,
+                transport_config,
+                status_config,
+                shutdown_receiver,
+            )
+            .await?;
         }
-        serve_match_host_with_status_and_control_and_shutdown(
-            host,
-            DemoControlService,
-            MatchHostWebTransportConfig {
-                port,
-                certificate_pem,
-                private_key_pem,
-                route_prefix,
-                drain_grace,
-            },
-            MatchHostStatusConfig { port: status_port },
-            shutdown_receiver,
-        )
-        .await?;
     } else {
+        if recovery_directory.is_some() {
+            return Err(
+                "GAME_SERVER_RECOVERY_DIR requires GAME_SERVER_MATCH_IDS; use GAME_SERVER_RECOVERY_PATH for single-match serving"
+                    .into(),
+            );
+        }
         let session_path = match single_match_id {
             Some(match_id) => {
                 let route_prefix = BrowserRoutePrefix::new(session_path)?;

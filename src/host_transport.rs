@@ -4,9 +4,11 @@ use crate::control::{
     RejectMatchControlService, decode_control_request, encode_control_response,
 };
 use crate::host::{MatchHost, MatchId};
+use crate::host_recovery::{MatchHostRecoveryPlan, consume_recovery_bundle, write_recovery_bundle};
 use crate::protocol::{
     RECONNECT_TOKEN_BYTES, SnapshotFrame, Welcome, decode_command, encode_snapshot, encode_welcome,
 };
+use crate::recovery::RecoveryImage;
 use crate::runtime::{MatchRuntime, RuntimeError};
 use crate::session::{ReconnectToken, SessionLease};
 use crate::simulation::GameSimulation;
@@ -14,7 +16,7 @@ use ring::rand::{SecureRandom, SystemRandom};
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock, Semaphore, broadcast, mpsc, oneshot};
@@ -45,6 +47,7 @@ pub struct MatchHostWebTransportConfig {
 pub enum MatchHostTransportError {
     Identity(String),
     Endpoint(String),
+    Recovery(String),
     EmptyHost,
     HostAlreadyDraining,
     InvalidTickRate(MatchId),
@@ -56,6 +59,7 @@ impl fmt::Display for MatchHostTransportError {
         match self {
             Self::Identity(error) => write!(formatter, "TLS identity error: {error}"),
             Self::Endpoint(error) => write!(formatter, "WebTransport endpoint error: {error}"),
+            Self::Recovery(error) => write!(formatter, "host recovery error: {error}"),
             Self::EmptyHost => write!(formatter, "match host must contain at least one match"),
             Self::HostAlreadyDraining => {
                 write!(
@@ -199,6 +203,7 @@ where
         config,
         shutdown_requests,
         None,
+        None,
     )
     .await
 }
@@ -209,6 +214,7 @@ pub(crate) async fn serve_match_host_with_control_and_shutdown_notifying_ready<S
     config: MatchHostWebTransportConfig,
     mut shutdown_requests: mpsc::Receiver<()>,
     ready: Option<oneshot::Sender<()>>,
+    recovery: Option<MatchHostRecoveryPlan>,
 ) -> Result<(), MatchHostTransportError>
 where
     S: GameSimulation,
@@ -225,6 +231,41 @@ where
         .build();
     let endpoint = Endpoint::server(server_config)
         .map_err(|error| MatchHostTransportError::Endpoint(error.to_string()))?;
+
+    if recovery.as_ref().is_some_and(|plan| plan.consume_on_start) {
+        let directory = recovery
+            .as_ref()
+            .expect("checked recovery plan")
+            .directory
+            .clone();
+        let consumption = spawn_blocking(move || {
+            let result = consume_recovery_bundle(&directory);
+            let active_exists = directory.exists();
+            let consumed_exists = directory.file_name().is_some_and(|file_name| {
+                let mut consumed_name = file_name.to_os_string();
+                consumed_name.push(".consumed");
+                directory.with_file_name(consumed_name).exists()
+            });
+            (result, active_exists, consumed_exists)
+        })
+        .await;
+        match consumption {
+            Ok((Ok(()), _, _)) => {}
+            Ok((Err(error), false, false)) => {
+                eprintln!(
+                    "hosted recovery bundle was fully consumed but the final durability step reported an error; continuing with the already-restored authoritative state: {error}"
+                );
+            }
+            Ok((Err(error), _, _)) => {
+                return Err(MatchHostTransportError::Recovery(error.to_string()));
+            }
+            Err(error) => {
+                return Err(MatchHostTransportError::Recovery(format!(
+                    "recovery consumption task failed: {error}"
+                )));
+            }
+        }
+    }
 
     let (shutdown, _) = broadcast::channel::<()>(1);
     let state = HostedServerState {
@@ -291,11 +332,73 @@ where
                     }
                 }
 
+                if let Some(plan) = &recovery
+                    && let Err(error) = persist_host_recovery(&state, &plan.directory).await
+                {
+                    eprintln!(
+                        "graceful hosted shutdown aborted because recovery persistence failed: {error}"
+                    );
+                    continue;
+                }
+
                 let _ = state.shutdown.send(());
                 stop_tick_loops(tick_tasks).await;
                 return Ok(());
             }
         }
+    }
+}
+
+async fn persist_host_recovery<S: GameSimulation>(
+    state: &HostedServerState<S>,
+    directory: &Path,
+) -> Result<(), String> {
+    let mut images = BTreeMap::<MatchId, RecoveryImage>::new();
+    for (id, hosted) in state.matches.iter() {
+        let image = {
+            let mut runtime = hosted.runtime.lock().await;
+            runtime.freeze_for_recovery();
+            runtime.recovery_image()
+        };
+        match image {
+            Ok(image) => {
+                images.insert(id.clone(), image);
+            }
+            Err(error) => {
+                resume_host_after_failed_recovery(state).await;
+                return Err(format!("match {id}: {error}"));
+            }
+        }
+    }
+
+    let directory = directory.to_path_buf();
+    let persistence = spawn_blocking(move || {
+        let existed_before = directory.exists();
+        let result = write_recovery_bundle(&directory, &images);
+        let exists_after = directory.exists();
+        (result, existed_before, exists_after)
+    })
+    .await;
+    let result = match persistence {
+        Ok((Ok(()), _, _)) => Ok(()),
+        Ok((Err(error), false, true)) => {
+            eprintln!(
+                "hosted recovery bundle exists after an atomic publish reported an error; treating it as committed to avoid resuming beyond that snapshot: {error}"
+            );
+            Ok(())
+        }
+        Ok((Err(error), _, _)) => Err(error.to_string()),
+        Err(error) => Err(format!("hosted recovery persistence task failed: {error}")),
+    };
+    if result.is_err() {
+        resume_host_after_failed_recovery(state).await;
+    }
+    result
+}
+
+async fn resume_host_after_failed_recovery<S: GameSimulation>(state: &HostedServerState<S>) {
+    for hosted in state.matches.values() {
+        hosted.runtime.lock().await.resume_after_failed_recovery();
     }
 }
 
