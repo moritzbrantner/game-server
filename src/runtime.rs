@@ -348,10 +348,7 @@ impl<S: GameSimulation> MatchRuntime<S> {
         Ok(self.simulation.snapshot()?)
     }
 
-    pub fn snapshot_for(
-        &self,
-        player_id: PlayerId,
-    ) -> Result<SimulationSnapshot, RuntimeError> {
+    pub fn snapshot_for(&self, player_id: PlayerId) -> Result<SimulationSnapshot, RuntimeError> {
         Ok(self.simulation.snapshot_for(player_id)?)
     }
 
@@ -491,10 +488,7 @@ mod tests {
             ))
         }
 
-        fn snapshot_for(
-            &self,
-            player_id: PlayerId,
-        ) -> Result<SimulationSnapshot, SimulationError> {
+        fn snapshot_for(&self, player_id: PlayerId) -> Result<SimulationSnapshot, SimulationError> {
             let secret = self
                 .secrets
                 .get(&player_id)
