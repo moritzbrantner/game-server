@@ -5,9 +5,7 @@ use crate::control::{
 };
 use crate::host::{MatchHost, MatchId};
 use crate::host_recovery::{MatchHostRecoveryPlan, consume_recovery_bundle, write_recovery_bundle};
-use crate::protocol::{
-    RECONNECT_TOKEN_BYTES, SnapshotFrame, Welcome, decode_command, encode_snapshot, encode_welcome,
-};
+use crate::protocol::{RECONNECT_TOKEN_BYTES, Welcome, decode_command, encode_welcome};
 use crate::recovery::RecoveryImage;
 use crate::runtime::{MatchRuntime, RuntimeError};
 use crate::session::{ReconnectToken, SessionLease};
