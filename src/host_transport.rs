@@ -10,9 +10,7 @@ use crate::recovery::RecoveryImage;
 use crate::runtime::{MatchRuntime, RuntimeError};
 use crate::session::{ReconnectToken, SessionLease};
 use crate::simulation::GameSimulation;
-use crate::transport::{
-    SnapshotPublication, encode_simulation_snapshot, snapshot_publication,
-};
+use crate::transport::{SnapshotPublication, encode_simulation_snapshot, snapshot_publication};
 use ring::rand::{SecureRandom, SystemRandom};
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -130,10 +128,7 @@ impl<S: GameSimulation> HostedServerState<S> {
         Some(operation(&mut runtime))
     }
 
-    fn snapshots(
-        &self,
-        match_id: &MatchId,
-    ) -> Option<broadcast::Receiver<SnapshotPublication>> {
+    fn snapshots(&self, match_id: &MatchId) -> Option<broadcast::Receiver<SnapshotPublication>> {
         self.matches
             .get(match_id)
             .map(|hosted| hosted.snapshots.subscribe())
@@ -443,8 +438,7 @@ fn isolate_hosted_runtimes<S: GameSimulation>(
     host.into_runtimes()
         .into_iter()
         .map(|(match_id, runtime)| {
-            let (snapshots, _) =
-                broadcast::channel::<SnapshotPublication>(SNAPSHOT_CHANNEL_DEPTH);
+            let (snapshots, _) = broadcast::channel::<SnapshotPublication>(SNAPSHOT_CHANNEL_DEPTH);
             (
                 match_id,
                 HostedMatch {
@@ -481,8 +475,10 @@ fn spawn_tick_loops<S: GameSimulation>(
                     ticker.tick().await;
                     let (scope, snapshot) = match state
                         .with_runtime_mut(&match_id, |runtime| {
-                            let scope = runtime.snapshot_scope();
-                            runtime.advance_tick().map(|snapshot| (scope, snapshot))
+                            runtime.advance_tick().map(|snapshot| {
+                                let scope = runtime.snapshot_scope();
+                                (scope, snapshot)
+                            })
                         })
                         .await
                     {
