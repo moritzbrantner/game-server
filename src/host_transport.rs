@@ -12,6 +12,9 @@ use crate::recovery::RecoveryImage;
 use crate::runtime::{MatchRuntime, RuntimeError};
 use crate::session::{ReconnectToken, SessionLease};
 use crate::simulation::GameSimulation;
+use crate::transport::{
+    SnapshotPublication, encode_simulation_snapshot, snapshot_publication,
+};
 use ring::rand::{SecureRandom, SystemRandom};
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -85,7 +88,7 @@ impl Error for MatchHostTransportError {}
 
 struct HostedMatch<S> {
     runtime: Mutex<MatchRuntime<S>>,
-    snapshots: broadcast::Sender<Vec<u8>>,
+    snapshots: broadcast::Sender<SnapshotPublication>,
 }
 
 struct HostedServerState<S> {
@@ -129,7 +132,10 @@ impl<S: GameSimulation> HostedServerState<S> {
         Some(operation(&mut runtime))
     }
 
-    fn snapshots(&self, match_id: &MatchId) -> Option<broadcast::Receiver<Vec<u8>>> {
+    fn snapshots(
+        &self,
+        match_id: &MatchId,
+    ) -> Option<broadcast::Receiver<SnapshotPublication>> {
         self.matches
             .get(match_id)
             .map(|hosted| hosted.snapshots.subscribe())
@@ -439,7 +445,8 @@ fn isolate_hosted_runtimes<S: GameSimulation>(
     host.into_runtimes()
         .into_iter()
         .map(|(match_id, runtime)| {
-            let (snapshots, _) = broadcast::channel::<Vec<u8>>(SNAPSHOT_CHANNEL_DEPTH);
+            let (snapshots, _) =
+                broadcast::channel::<SnapshotPublication>(SNAPSHOT_CHANNEL_DEPTH);
             (
                 match_id,
                 HostedMatch {
@@ -474,11 +481,14 @@ fn spawn_tick_loops<S: GameSimulation>(
                 ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
                 loop {
                     ticker.tick().await;
-                    let snapshot = match state
-                        .with_runtime_mut(&match_id, |runtime| runtime.advance_tick())
+                    let (scope, snapshot) = match state
+                        .with_runtime_mut(&match_id, |runtime| {
+                            let scope = runtime.snapshot_scope();
+                            runtime.advance_tick().map(|snapshot| (scope, snapshot))
+                        })
                         .await
                     {
-                        Some(Ok(snapshot)) => snapshot,
+                        Some(Ok(result)) => result,
                         Some(Err(RuntimeError::Frozen)) => continue,
                         Some(Err(error)) => {
                             eprintln!("authoritative tick failed for match {match_id}: {error}");
@@ -486,14 +496,9 @@ fn spawn_tick_loops<S: GameSimulation>(
                         }
                         None => return,
                     };
-                    let frame = SnapshotFrame {
-                        tick: snapshot.tick,
-                        state_hash: snapshot.state_hash,
-                        payload: snapshot.payload,
-                    };
-                    match encode_snapshot(&frame) {
-                        Ok(encoded) => {
-                            let _ = snapshots.send(encoded);
+                    match snapshot_publication(scope, snapshot) {
+                        Ok(publication) => {
+                            let _ = snapshots.send(publication);
                         }
                         Err(error) => {
                             eprintln!("snapshot encoding failed for match {match_id}: {error}")
@@ -684,7 +689,7 @@ async fn run_established_connection<S: GameSimulation>(
     connection: &Connection,
     lease: SessionLease,
     max_datagram_size: usize,
-    mut snapshots: broadcast::Receiver<Vec<u8>>,
+    mut snapshots: broadcast::Receiver<SnapshotPublication>,
     state: &HostedServerState<S>,
     match_id: MatchId,
 ) -> Result<(), String> {
@@ -763,7 +768,35 @@ async fn run_established_connection<S: GameSimulation>(
             }
             snapshot = snapshots.recv() => {
                 match snapshot {
-                    Ok(snapshot) => {
+                    Ok(publication) => {
+                        let snapshot = match publication {
+                            SnapshotPublication::Shared(snapshot) => snapshot,
+                            SnapshotPublication::PlayerScoped => {
+                                let projected = state
+                                    .with_runtime(&match_id, |runtime| {
+                                        runtime.snapshot_for(lease.player_id)
+                                    })
+                                    .await;
+                                let projected = match projected {
+                                    Some(Ok(snapshot)) => snapshot,
+                                    Some(Err(error)) => {
+                                        close(connection, CLOSE_RUNTIME, &error.to_string());
+                                        return Ok(());
+                                    }
+                                    None => {
+                                        close(connection, CLOSE_SERVER, "match is no longer hosted");
+                                        return Ok(());
+                                    }
+                                };
+                                match encode_simulation_snapshot(projected) {
+                                    Ok(snapshot) => snapshot,
+                                    Err(error) => {
+                                        close(connection, CLOSE_RUNTIME, &error);
+                                        return Ok(());
+                                    }
+                                }
+                            }
+                        };
                         if snapshot.len() > max_datagram_size {
                             close(connection, CLOSE_DATAGRAM, "snapshot exceeds negotiated datagram budget");
                             return Ok(());
