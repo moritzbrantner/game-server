@@ -40,6 +40,12 @@ impl SimulationSnapshot {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SnapshotScope {
+    Shared,
+    PlayerScoped,
+}
+
 pub trait GameSimulation: Send + 'static {
     fn tick_hz(&self) -> u16;
     fn max_players(&self) -> usize;
@@ -53,5 +59,14 @@ pub trait GameSimulation: Send + 'static {
         payload: &[u8],
     ) -> Result<(), SimulationError>;
     fn advance_tick(&mut self) -> Result<(), SimulationError>;
+
+    fn snapshot_scope(&self) -> SnapshotScope {
+        SnapshotScope::Shared
+    }
+
     fn snapshot(&self) -> Result<SimulationSnapshot, SimulationError>;
+
+    fn snapshot_for(&self, _player_id: PlayerId) -> Result<SimulationSnapshot, SimulationError> {
+        self.snapshot()
+    }
 }
