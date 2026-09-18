@@ -70,6 +70,22 @@ Hosted recovery uses a versioned bundle directory containing an exact determinis
 
 The region/process-placement experiments in `server-lab` remain evidence for this milestone, not code to copy wholesale. `game-server` now exposes the process facts a separate fleet scheduler can consume; scheduler policy, provider provisioning, and cross-process orchestration remain outside the core until a concrete deployment requires them.
 
+## Milestone G — turn-based browser integration
+
+### Slice G1 — player-scoped snapshots — completed
+
+- [x] Keep shared-state simulations on the existing single-encode broadcast fast path.
+- [x] Add an explicit player-scoped projection boundary for simulations with private state.
+- [x] Keep canonical replay/recovery snapshots separate from player-visible transport snapshots.
+- [x] Apply the same visibility behavior to single-match and process-hosted WebTransport serving.
+
+`GameSimulation::snapshot()` remains the canonical deterministic state used for replay and recovery. Hidden-information games opt into `SnapshotScope::PlayerScoped` and provide `snapshot_for(player_id)`; the transport then broadcasts only an update signal and encodes the authenticated player's projection per connection. Transport code therefore never becomes an authority for hand visibility or other game-specific secrecy rules.
+
+### Next slices
+
+- [ ] Add the deterministic external-simulation adapter boundary needed to host non-Rust game logic without copying rules into this repository.
+- [ ] Add a cross-repository fixture with `card-game-template` proving that local and server-hosted accepted moves converge to the same deterministic replay fingerprint.
+
 ## Deliberately out of scope
 
 Accounts, matchmaking/rankings, game-specific inventory/combat rules, persistent-world databases, provider provisioning, and a custom physics engine are not owned here.

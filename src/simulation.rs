@@ -40,6 +40,12 @@ impl SimulationSnapshot {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SnapshotScope {
+    Shared,
+    PlayerScoped,
+}
+
 pub trait GameSimulation: Send + 'static {
     fn tick_hz(&self) -> u16;
     fn max_players(&self) -> usize;
@@ -53,5 +59,85 @@ pub trait GameSimulation: Send + 'static {
         payload: &[u8],
     ) -> Result<(), SimulationError>;
     fn advance_tick(&mut self) -> Result<(), SimulationError>;
+
+    fn snapshot_scope(&self) -> SnapshotScope {
+        SnapshotScope::Shared
+    }
+
     fn snapshot(&self) -> Result<SimulationSnapshot, SimulationError>;
+
+    fn snapshot_for(&self, _player_id: PlayerId) -> Result<SimulationSnapshot, SimulationError> {
+        Err(SimulationError::new(
+            "player-scoped snapshots require an explicit per-player projection",
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct PlayerScopedWithoutProjection {
+        tick: u64,
+    }
+
+    impl GameSimulation for PlayerScopedWithoutProjection {
+        fn tick_hz(&self) -> u16 {
+            20
+        }
+
+        fn max_players(&self) -> usize {
+            1
+        }
+
+        fn current_tick(&self) -> u64 {
+            self.tick
+        }
+
+        fn add_player(&mut self, _player_id: PlayerId) -> Result<(), SimulationError> {
+            Ok(())
+        }
+
+        fn remove_player(&mut self, _player_id: PlayerId) -> bool {
+            true
+        }
+
+        fn apply_command(
+            &mut self,
+            _player_id: PlayerId,
+            _sequence: u32,
+            _payload: &[u8],
+        ) -> Result<(), SimulationError> {
+            Ok(())
+        }
+
+        fn advance_tick(&mut self) -> Result<(), SimulationError> {
+            self.tick += 1;
+            Ok(())
+        }
+
+        fn snapshot_scope(&self) -> SnapshotScope {
+            SnapshotScope::PlayerScoped
+        }
+
+        fn snapshot(&self) -> Result<SimulationSnapshot, SimulationError> {
+            Ok(SimulationSnapshot::new(
+                self.tick,
+                b"canonical-private-state".to_vec(),
+            ))
+        }
+    }
+
+    #[test]
+    fn player_scoped_default_projection_fails_closed() {
+        let simulation = PlayerScopedWithoutProjection::default();
+
+        let error = simulation.snapshot_for(1).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "player-scoped snapshots require an explicit per-player projection"
+        );
+    }
 }

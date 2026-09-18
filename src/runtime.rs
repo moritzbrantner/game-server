@@ -3,7 +3,7 @@ use crate::protocol::MAX_COMMAND_PAYLOAD_BYTES;
 use crate::recovery::{RecoveryError, RecoveryImage};
 use crate::replay::{ReplayLog, ReplayRecord};
 use crate::session::{ReconnectToken, SessionError, SessionLease, SessionRegistry};
-use crate::simulation::{GameSimulation, SimulationError, SimulationSnapshot};
+use crate::simulation::{GameSimulation, SimulationError, SimulationSnapshot, SnapshotScope};
 use std::collections::BTreeMap;
 use std::fmt;
 
@@ -151,6 +151,10 @@ impl<S: GameSimulation> MatchRuntime<S> {
 
     pub fn current_tick(&self) -> u64 {
         self.simulation.current_tick()
+    }
+
+    pub fn snapshot_scope(&self) -> SnapshotScope {
+        self.simulation.snapshot_scope()
     }
 
     pub fn slot_count(&self) -> usize {
@@ -344,6 +348,10 @@ impl<S: GameSimulation> MatchRuntime<S> {
         Ok(self.simulation.snapshot()?)
     }
 
+    pub fn snapshot_for(&self, player_id: PlayerId) -> Result<SimulationSnapshot, RuntimeError> {
+        Ok(self.simulation.snapshot_for(player_id)?)
+    }
+
     fn record(&mut self, record: ReplayRecord) {
         if let Some(replay) = &mut self.replay {
             replay.append(record);
@@ -416,6 +424,103 @@ mod tests {
 
     fn token(value: u8) -> ReconnectToken {
         ReconnectToken([value; crate::RECONNECT_TOKEN_BYTES])
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct PrivateSimulation {
+        tick: u64,
+        secrets: BTreeMap<PlayerId, u8>,
+    }
+
+    impl GameSimulation for PrivateSimulation {
+        fn tick_hz(&self) -> u16 {
+            20
+        }
+
+        fn max_players(&self) -> usize {
+            2
+        }
+
+        fn current_tick(&self) -> u64 {
+            self.tick
+        }
+
+        fn add_player(&mut self, player_id: PlayerId) -> Result<(), SimulationError> {
+            self.secrets.insert(player_id, 0);
+            Ok(())
+        }
+
+        fn remove_player(&mut self, player_id: PlayerId) -> bool {
+            self.secrets.remove(&player_id).is_some()
+        }
+
+        fn apply_command(
+            &mut self,
+            player_id: PlayerId,
+            _sequence: u32,
+            payload: &[u8],
+        ) -> Result<(), SimulationError> {
+            let secret = payload
+                .first()
+                .copied()
+                .ok_or_else(|| SimulationError::new("private command must carry one byte"))?;
+            let slot = self
+                .secrets
+                .get_mut(&player_id)
+                .ok_or_else(|| SimulationError::new("unknown private player"))?;
+            *slot = secret;
+            Ok(())
+        }
+
+        fn advance_tick(&mut self) -> Result<(), SimulationError> {
+            self.tick += 1;
+            Ok(())
+        }
+
+        fn snapshot_scope(&self) -> SnapshotScope {
+            SnapshotScope::PlayerScoped
+        }
+
+        fn snapshot(&self) -> Result<SimulationSnapshot, SimulationError> {
+            Ok(SimulationSnapshot::new(
+                self.tick,
+                self.secrets.values().copied().collect(),
+            ))
+        }
+
+        fn snapshot_for(&self, player_id: PlayerId) -> Result<SimulationSnapshot, SimulationError> {
+            let secret = self
+                .secrets
+                .get(&player_id)
+                .copied()
+                .ok_or_else(|| SimulationError::new("unknown private player"))?;
+            Ok(SimulationSnapshot::new(self.tick, vec![secret]))
+        }
+    }
+
+    #[test]
+    fn player_scoped_snapshots_keep_canonical_state_off_the_client_projection() {
+        let mut runtime = MatchRuntime::new(PrivateSimulation::default(), 10);
+        let first = runtime.admit(token(1)).unwrap();
+        let second = runtime.admit(token(2)).unwrap();
+
+        runtime
+            .submit_command(first.player_id, first.connection_epoch, 1, &[11])
+            .unwrap();
+        runtime
+            .submit_command(second.player_id, second.connection_epoch, 1, &[22])
+            .unwrap();
+
+        assert_eq!(runtime.snapshot_scope(), SnapshotScope::PlayerScoped);
+        assert_eq!(runtime.snapshot().unwrap().payload, vec![11, 22]);
+        assert_eq!(
+            runtime.snapshot_for(first.player_id).unwrap().payload,
+            vec![11]
+        );
+        assert_eq!(
+            runtime.snapshot_for(second.player_id).unwrap().payload,
+            vec![22]
+        );
     }
 
     #[test]

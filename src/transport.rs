@@ -8,7 +8,7 @@ use crate::protocol::{
 use crate::recovery::RecoveryImage;
 use crate::runtime::{MatchRuntime, RuntimeError};
 use crate::session::{ReconnectToken, SessionLease};
-use crate::simulation::GameSimulation;
+use crate::simulation::{GameSimulation, SimulationSnapshot, SnapshotScope};
 use ring::rand::{SecureRandom, SystemRandom};
 use std::error::Error;
 use std::fmt;
@@ -79,11 +79,38 @@ enum AdmissionRequest {
     Reconnect(ReconnectToken),
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum SnapshotPublication {
+    Shared(Vec<u8>),
+    PlayerScoped,
+}
+
+pub(crate) fn snapshot_publication(
+    scope: SnapshotScope,
+    snapshot: SimulationSnapshot,
+) -> Result<SnapshotPublication, String> {
+    match scope {
+        SnapshotScope::Shared => {
+            encode_simulation_snapshot(snapshot).map(SnapshotPublication::Shared)
+        }
+        SnapshotScope::PlayerScoped => Ok(SnapshotPublication::PlayerScoped),
+    }
+}
+
+pub(crate) fn encode_simulation_snapshot(snapshot: SimulationSnapshot) -> Result<Vec<u8>, String> {
+    encode_snapshot(&SnapshotFrame {
+        tick: snapshot.tick,
+        state_hash: snapshot.state_hash,
+        payload: snapshot.payload,
+    })
+    .map_err(|error| error.to_string())
+}
+
 struct ServerState<S> {
     runtime: Arc<Mutex<MatchRuntime<S>>>,
     control: Arc<dyn ControlService>,
     control_handlers: Arc<Semaphore>,
-    snapshots: broadcast::Sender<Vec<u8>>,
+    snapshots: broadcast::Sender<SnapshotPublication>,
     shutdown: broadcast::Sender<()>,
 }
 
@@ -195,7 +222,7 @@ where
         config.recovery_path.as_deref(),
     )?;
     let tick_hz = runtime.tick_hz();
-    let (snapshots, _) = broadcast::channel::<Vec<u8>>(SNAPSHOT_CHANNEL_DEPTH);
+    let (snapshots, _) = broadcast::channel::<SnapshotPublication>(SNAPSHOT_CHANNEL_DEPTH);
     let (shutdown, _) = broadcast::channel::<()>(1);
     let state = ServerState {
         runtime: Arc::new(Mutex::new(runtime)),
@@ -350,22 +377,22 @@ fn spawn_tick_loop<S: GameSimulation>(state: ServerState<S>, tick_hz: u16) -> Jo
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
-            let snapshot = match state.runtime.lock().await.advance_tick() {
-                Ok(snapshot) => snapshot,
-                Err(RuntimeError::Frozen) => continue,
-                Err(error) => {
-                    eprintln!("authoritative tick failed: {error}");
-                    continue;
-                }
+            let (scope, snapshot) = {
+                let mut runtime = state.runtime.lock().await;
+                let snapshot = match runtime.advance_tick() {
+                    Ok(snapshot) => snapshot,
+                    Err(RuntimeError::Frozen) => continue,
+                    Err(error) => {
+                        eprintln!("authoritative tick failed: {error}");
+                        continue;
+                    }
+                };
+                let scope = runtime.snapshot_scope();
+                (scope, snapshot)
             };
-            let frame = SnapshotFrame {
-                tick: snapshot.tick,
-                state_hash: snapshot.state_hash,
-                payload: snapshot.payload,
-            };
-            match encode_snapshot(&frame) {
-                Ok(encoded) => {
-                    let _ = state.snapshots.send(encoded);
+            match snapshot_publication(scope, snapshot) {
+                Ok(publication) => {
+                    let _ = state.snapshots.send(publication);
                 }
                 Err(error) => eprintln!("snapshot encoding failed: {error}"),
             }
@@ -585,7 +612,30 @@ async fn run_established_connection<S: GameSimulation>(
             }
             snapshot = snapshots.recv() => {
                 match snapshot {
-                    Ok(snapshot) => {
+                    Ok(publication) => {
+                        let snapshot = match publication {
+                            SnapshotPublication::Shared(snapshot) => snapshot,
+                            SnapshotPublication::PlayerScoped => {
+                                let projected = {
+                                    let runtime = state.runtime.lock().await;
+                                    runtime.snapshot_for(lease.player_id)
+                                };
+                                let projected = match projected {
+                                    Ok(snapshot) => snapshot,
+                                    Err(error) => {
+                                        close(connection, CLOSE_RUNTIME, &error.to_string());
+                                        return Ok(());
+                                    }
+                                };
+                                match encode_simulation_snapshot(projected) {
+                                    Ok(snapshot) => snapshot,
+                                    Err(error) => {
+                                        close(connection, CLOSE_RUNTIME, &error);
+                                        return Ok(());
+                                    }
+                                }
+                            }
+                        };
                         if snapshot.len() > max_datagram_size {
                             close(connection, CLOSE_DATAGRAM, "snapshot exceeds negotiated datagram budget");
                             return Ok(());
@@ -722,6 +772,26 @@ mod tests {
     use super::*;
     use crate::world::DemoSimulation;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn player_scoped_publication_never_broadcasts_canonical_payload() {
+        let snapshot = SimulationSnapshot::new(7, b"canonical-private-state".to_vec());
+
+        assert_eq!(
+            snapshot_publication(SnapshotScope::PlayerScoped, snapshot).unwrap(),
+            SnapshotPublication::PlayerScoped
+        );
+    }
+
+    #[test]
+    fn shared_publication_keeps_the_single_encode_fast_path() {
+        let snapshot = SimulationSnapshot::new(7, b"shared-state".to_vec());
+
+        assert!(matches!(
+            snapshot_publication(SnapshotScope::Shared, snapshot).unwrap(),
+            SnapshotPublication::Shared(_)
+        ));
+    }
 
     #[test]
     fn parses_new_and_reconnect_paths() {
