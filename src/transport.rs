@@ -90,14 +90,14 @@ pub(crate) fn snapshot_publication(
     snapshot: SimulationSnapshot,
 ) -> Result<SnapshotPublication, String> {
     match scope {
-        SnapshotScope::Shared => encode_simulation_snapshot(snapshot).map(SnapshotPublication::Shared),
+        SnapshotScope::Shared => {
+            encode_simulation_snapshot(snapshot).map(SnapshotPublication::Shared)
+        }
         SnapshotScope::PlayerScoped => Ok(SnapshotPublication::PlayerScoped),
     }
 }
 
-pub(crate) fn encode_simulation_snapshot(
-    snapshot: SimulationSnapshot,
-) -> Result<Vec<u8>, String> {
+pub(crate) fn encode_simulation_snapshot(snapshot: SimulationSnapshot) -> Result<Vec<u8>, String> {
     encode_snapshot(&SnapshotFrame {
         tick: snapshot.tick,
         state_hash: snapshot.state_hash,
@@ -379,7 +379,6 @@ fn spawn_tick_loop<S: GameSimulation>(state: ServerState<S>, tick_hz: u16) -> Jo
             ticker.tick().await;
             let (scope, snapshot) = {
                 let mut runtime = state.runtime.lock().await;
-                let scope = runtime.snapshot_scope();
                 let snapshot = match runtime.advance_tick() {
                     Ok(snapshot) => snapshot,
                     Err(RuntimeError::Frozen) => continue,
@@ -388,6 +387,7 @@ fn spawn_tick_loop<S: GameSimulation>(state: ServerState<S>, tick_hz: u16) -> Jo
                         continue;
                     }
                 };
+                let scope = runtime.snapshot_scope();
                 (scope, snapshot)
             };
             match snapshot_publication(scope, snapshot) {
