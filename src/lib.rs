@@ -1,4 +1,5 @@
 pub mod browser;
+mod connection;
 pub mod control;
 pub mod host;
 pub mod host_recovery;
@@ -73,3 +74,6 @@ pub use world::{
     DEMO_MAX_PLAYERS, DEMO_TICK_HZ, DemoSimulation, DemoSnapshotPlayer, WorldError,
     decode_demo_snapshot, encode_demo_command,
 };
+
+#[cfg(test)]
+mod benchmarks;

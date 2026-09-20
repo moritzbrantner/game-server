@@ -1,17 +1,17 @@
-use crate::browser::{BrowserAdmission, BrowserRoutePrefix, BrowserSessionRoute};
+use crate::browser::{BrowserAdmission, BrowserRoutePrefix};
+use crate::connection::{
+    AdmissionRequest, ConnectionState, MAX_CONCURRENT_CONTROL_HANDLERS, SNAPSHOT_CHANNEL_DEPTH,
+    SnapshotPublication, handle_connection, snapshot_publication,
+};
 use crate::control::{
-    CONTROL_HEADER_BYTES, ControlContext, MAX_CONTROL_PAYLOAD_BYTES, MatchControlService,
-    RejectMatchControlService, decode_control_request, encode_control_response,
+    ControlContext, ControlService, ControlServiceError, MatchControlService,
+    RejectMatchControlService,
 };
 use crate::host::{MatchHost, MatchId};
 use crate::host_recovery::{MatchHostRecoveryPlan, consume_recovery_bundle, write_recovery_bundle};
-use crate::protocol::{RECONNECT_TOKEN_BYTES, Welcome, decode_command, encode_welcome};
 use crate::recovery::RecoveryImage;
 use crate::runtime::{MatchRuntime, RuntimeError};
-use crate::session::{ReconnectToken, SessionLease};
 use crate::simulation::GameSimulation;
-use crate::transport::{SnapshotPublication, encode_simulation_snapshot, snapshot_publication};
-use ring::rand::{SecureRandom, SystemRandom};
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
@@ -19,19 +19,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock, Semaphore, broadcast, mpsc, oneshot};
-use tokio::task::{JoinHandle, spawn_blocking};
+use tokio::task::{JoinSet, spawn_blocking};
 use tokio::time::MissedTickBehavior;
-use wtransport::{Connection, Endpoint, Identity, RecvStream, SendStream, ServerConfig, VarInt};
-
-const CLOSE_PROTOCOL: u32 = 1;
-const CLOSE_DATAGRAM: u32 = 2;
-const CLOSE_RUNTIME: u32 = 3;
-const CLOSE_SERVER: u32 = 4;
-const SNAPSHOT_CHANNEL_DEPTH: usize = 1;
-const WELCOME_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
-const CONTROL_STREAM_TIMEOUT: Duration = Duration::from_secs(5);
-const MAX_CONCURRENT_CONTROL_STREAMS: usize = 4;
-const MAX_CONCURRENT_CONTROL_HANDLERS: usize = 64;
+use wtransport::{Endpoint, Identity, ServerConfig};
 
 #[derive(Clone, Debug)]
 pub struct MatchHostWebTransportConfig {
@@ -83,7 +73,7 @@ impl fmt::Display for MatchHostTransportError {
 impl Error for MatchHostTransportError {}
 
 struct HostedMatch<S> {
-    runtime: Mutex<MatchRuntime<S>>,
+    runtime: Arc<Mutex<MatchRuntime<S>>>,
     snapshots: broadcast::Sender<SnapshotPublication>,
 }
 
@@ -108,16 +98,6 @@ impl<S> Clone for HostedServerState<S> {
 }
 
 impl<S: GameSimulation> HostedServerState<S> {
-    async fn with_runtime<R>(
-        &self,
-        match_id: &MatchId,
-        operation: impl FnOnce(&MatchRuntime<S>) -> R,
-    ) -> Option<R> {
-        let hosted = self.matches.get(match_id)?;
-        let runtime = hosted.runtime.lock().await;
-        Some(operation(&runtime))
-    }
-
     async fn with_runtime_mut<R>(
         &self,
         match_id: &MatchId,
@@ -128,10 +108,19 @@ impl<S: GameSimulation> HostedServerState<S> {
         Some(operation(&mut runtime))
     }
 
-    fn snapshots(&self, match_id: &MatchId) -> Option<broadcast::Receiver<SnapshotPublication>> {
-        self.matches
-            .get(match_id)
-            .map(|hosted| hosted.snapshots.subscribe())
+    fn connection_state(&self, match_id: &MatchId) -> Option<ConnectionState<S>> {
+        let hosted = self.matches.get(match_id)?;
+        Some(ConnectionState {
+            runtime: Arc::clone(&hosted.runtime),
+            control: Arc::new(HostedControl {
+                match_id: match_id.clone(),
+                service: Arc::clone(&self.control),
+            }),
+            control_handlers: Arc::clone(&self.control_handlers),
+            snapshots: hosted.snapshots.clone(),
+            shutdown: self.shutdown.clone(),
+            admission_gate: Some(Arc::clone(&self.admission_gate)),
+        })
     }
 
     async fn begin_process_drain(&self) {
@@ -140,6 +129,22 @@ impl<S: GameSimulation> HostedServerState<S> {
         for hosted in self.matches.values() {
             hosted.runtime.lock().await.begin_drain();
         }
+    }
+}
+
+// Bind match identity once; the shared connection module only knows ControlService.
+struct HostedControl {
+    match_id: MatchId,
+    service: Arc<dyn MatchControlService>,
+}
+
+impl ControlService for HostedControl {
+    fn handle(
+        &self,
+        context: ControlContext,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, ControlServiceError> {
+        self.service.handle(&self.match_id, context, payload)
     }
 }
 
@@ -274,16 +279,17 @@ where
         control_handlers: Arc::new(Semaphore::new(MAX_CONCURRENT_CONTROL_HANDLERS)),
         shutdown,
     };
-    let tick_tasks = spawn_tick_loops(state.clone(), &match_tick_rates);
+    let mut tick_tasks = spawn_tick_loops(state.clone(), &match_tick_rates);
     let route_prefix = config.route_prefix.clone();
     if let Some(ready) = ready {
         let _ = ready.send(());
     }
 
-    let spawn_incoming = |incoming: wtransport::endpoint::IncomingSession| {
+    let mut connections = JoinSet::new();
+    let incoming_session = |incoming: wtransport::endpoint::IncomingSession| {
         let state = state.clone();
         let route_prefix = route_prefix.clone();
-        tokio::spawn(async move {
+        async move {
             let request = match incoming.await {
                 Ok(request) => request,
                 Err(error) => {
@@ -305,16 +311,28 @@ where
                     return;
                 }
             };
-            if let Err(error) = handle_connection(connection, state, route).await {
+            let Some(connection_state) = state.connection_state(&route.match_id) else {
+                return;
+            };
+            let admission = match route.admission {
+                BrowserAdmission::New => AdmissionRequest::New,
+                BrowserAdmission::Reconnect(token) => AdmissionRequest::Reconnect(token),
+            };
+            if let Err(error) = handle_connection(connection, connection_state, admission).await {
                 eprintln!("hosted game session failed: {error}");
             }
-        });
+        }
     };
 
     let mut shutdown_channel_open = true;
     loop {
         tokio::select! {
-            incoming = endpoint.accept() => spawn_incoming(incoming),
+            incoming = endpoint.accept() => { connections.spawn(incoming_session(incoming)); },
+            completed = connections.join_next(), if !connections.is_empty() => {
+                if let Some(Err(error)) = completed {
+                    eprintln!("connection task failed: {error}");
+                }
+            },
             shutdown = shutdown_requests.recv(), if shutdown_channel_open => {
                 let Some(()) = shutdown else {
                     shutdown_channel_open = false;
@@ -327,7 +345,12 @@ where
                 loop {
                     tokio::select! {
                         _ = &mut drain_deadline => break,
-                        incoming = endpoint.accept() => spawn_incoming(incoming),
+                        incoming = endpoint.accept() => { connections.spawn(incoming_session(incoming)); },
+                        completed = connections.join_next(), if !connections.is_empty() => {
+                            if let Some(Err(error)) = completed {
+                                eprintln!("connection task failed: {error}");
+                            }
+                        },
                     }
                 }
 
@@ -341,7 +364,8 @@ where
                 }
 
                 let _ = state.shutdown.send(());
-                stop_tick_loops(tick_tasks).await;
+                tick_tasks.shutdown().await;
+                connections.shutdown().await;
                 return Ok(());
             }
         }
@@ -442,7 +466,7 @@ fn isolate_hosted_runtimes<S: GameSimulation>(
             (
                 match_id,
                 HostedMatch {
-                    runtime: Mutex::new(runtime),
+                    runtime: Arc::new(Mutex::new(runtime)),
                     snapshots,
                 },
             )
@@ -453,465 +477,53 @@ fn isolate_hosted_runtimes<S: GameSimulation>(
 fn spawn_tick_loops<S: GameSimulation>(
     state: HostedServerState<S>,
     match_tick_rates: &[(MatchId, u16)],
-) -> Vec<JoinHandle<()>> {
-    match_tick_rates
-        .iter()
-        .map(|(match_id, tick_hz)| {
-            let state = state.clone();
-            let match_id = match_id.clone();
-            let tick_hz = *tick_hz;
-            let snapshots = state
-                .matches
-                .get(&match_id)
-                .expect("validated match must have a snapshot channel")
-                .snapshots
-                .clone();
-            tokio::spawn(async move {
-                let mut ticker = tokio::time::interval(Duration::from_micros(
-                    1_000_000_u64 / u64::from(tick_hz),
-                ));
-                ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-                loop {
-                    ticker.tick().await;
-                    let (scope, snapshot) = match state
-                        .with_runtime_mut(&match_id, |runtime| {
-                            runtime.advance_tick().map(|snapshot| {
-                                let scope = runtime.snapshot_scope();
-                                (scope, snapshot)
-                            })
+) -> JoinSet<()> {
+    let mut tasks = JoinSet::new();
+    for (match_id, tick_hz) in match_tick_rates {
+        let state = state.clone();
+        let match_id = match_id.clone();
+        let tick_hz = *tick_hz;
+        let snapshots = state
+            .matches
+            .get(&match_id)
+            .expect("validated match must have a snapshot channel")
+            .snapshots
+            .clone();
+        tasks.spawn(async move {
+            let mut ticker =
+                tokio::time::interval(Duration::from_micros(1_000_000_u64 / u64::from(tick_hz)));
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                let (scope, snapshot) = match state
+                    .with_runtime_mut(&match_id, |runtime| {
+                        runtime.advance_tick().map(|snapshot| {
+                            let scope = runtime.snapshot_scope();
+                            (scope, snapshot)
                         })
-                        .await
-                    {
-                        Some(Ok(result)) => result,
-                        Some(Err(RuntimeError::Frozen)) => continue,
-                        Some(Err(error)) => {
-                            eprintln!("authoritative tick failed for match {match_id}: {error}");
-                            continue;
-                        }
-                        None => return,
-                    };
-                    match snapshot_publication(scope, snapshot) {
-                        Ok(publication) => {
-                            let _ = snapshots.send(publication);
-                        }
-                        Err(error) => {
-                            eprintln!("snapshot encoding failed for match {match_id}: {error}")
-                        }
-                    }
-                }
-            })
-        })
-        .collect()
-}
-
-async fn stop_tick_loops(tick_tasks: Vec<JoinHandle<()>>) {
-    for task in &tick_tasks {
-        task.abort();
-    }
-    for task in tick_tasks {
-        let _ = task.await;
-    }
-}
-
-async fn handle_connection<S: GameSimulation>(
-    connection: Connection,
-    state: HostedServerState<S>,
-    route: BrowserSessionRoute,
-) -> Result<(), String> {
-    let max_datagram_size = match connection.max_datagram_size() {
-        Some(max_datagram_size) => max_datagram_size,
-        None => {
-            close(
-                &connection,
-                CLOSE_DATAGRAM,
-                "WebTransport datagrams are required",
-            );
-            return Ok(());
-        }
-    };
-
-    let replacement_token = generate_reconnect_token()?;
-    let lease = match route.admission.clone() {
-        BrowserAdmission::New => {
-            let draining = state.admission_gate.read().await;
-            if *draining {
-                close(
-                    &connection,
-                    CLOSE_RUNTIME,
-                    &RuntimeError::Draining.to_string(),
-                );
-                return Ok(());
-            }
-            state
-                .with_runtime_mut(&route.match_id, |runtime| runtime.admit(replacement_token))
-                .await
-                .ok_or_else(|| "match disappeared before admission".to_owned())?
-        }
-        BrowserAdmission::Reconnect(previous_token) => state
-            .with_runtime_mut(&route.match_id, |runtime| {
-                runtime.reconnect(previous_token, replacement_token)
-            })
-            .await
-            .ok_or_else(|| "match disappeared before reconnect".to_owned())?,
-    };
-    let lease = match lease {
-        Ok(lease) => lease,
-        Err(error) => {
-            close(&connection, CLOSE_RUNTIME, &error.to_string());
-            return Ok(());
-        }
-    };
-
-    if let Err(error) = send_welcome(&connection, lease, &state, &route.match_id).await {
-        let cleanup = state
-            .with_runtime_mut(&route.match_id, |runtime| {
-                rollback_failed_welcome(runtime, route.admission, lease)
-            })
-            .await;
-        if let Some(Err(cleanup_error)) = cleanup {
-            eprintln!("failed to roll back incomplete hosted welcome: {cleanup_error}");
-        }
-        close(&connection, CLOSE_RUNTIME, &error);
-        return Ok(());
-    }
-
-    let snapshots = state
-        .snapshots(&route.match_id)
-        .ok_or_else(|| "match snapshot channel disappeared".to_owned())?;
-    let result = run_established_connection(
-        &connection,
-        lease,
-        max_datagram_size,
-        snapshots,
-        &state,
-        route.match_id.clone(),
-    )
-    .await;
-    let _ = state
-        .with_runtime_mut(&route.match_id, |runtime| {
-            runtime.disconnect(lease.player_id, lease.connection_epoch)
-        })
-        .await;
-    result
-}
-
-async fn send_welcome<S: GameSimulation>(
-    connection: &Connection,
-    lease: SessionLease,
-    state: &HostedServerState<S>,
-    match_id: &MatchId,
-) -> Result<(), String> {
-    let (tick_hz, max_players, current_tick) = state
-        .with_runtime(match_id, |runtime| {
-            (
-                runtime.tick_hz(),
-                runtime.max_players(),
-                runtime.current_tick(),
-            )
-        })
-        .await
-        .ok_or_else(|| "match disappeared before welcome".to_owned())?;
-    let max_players =
-        u16::try_from(max_players).map_err(|_| "player capacity exceeds wire limit")?;
-    let welcome = encode_welcome(Welcome {
-        player_id: lease.player_id,
-        tick_hz,
-        max_players,
-        current_tick,
-        connection_epoch: lease.connection_epoch,
-        reconnect_token: lease.reconnect_token.0,
-        reconnect_grace_ticks: lease.reconnect_grace_ticks,
-    });
-    let handshake = async {
-        let opening = connection
-            .open_uni()
-            .await
-            .map_err(|error| error.to_string())?;
-        let mut welcome_stream = opening.await.map_err(|error| error.to_string())?;
-        welcome_stream
-            .write_all(&welcome)
-            .await
-            .map_err(|error| error.to_string())?;
-        welcome_stream
-            .finish()
-            .await
-            .map_err(|error| error.to_string())?;
-        Ok(())
-    };
-
-    tokio::select! {
-        result = tokio::time::timeout(WELCOME_HANDSHAKE_TIMEOUT, handshake) => {
-            match result {
-                Ok(result) => result,
-                Err(_) => Err("welcome handshake timed out".to_owned()),
-            }
-        }
-        _ = connection.closed() => Err("connection closed before welcome completed".to_owned()),
-    }
-}
-
-fn rollback_failed_welcome<S: GameSimulation>(
-    runtime: &mut MatchRuntime<S>,
-    admission: BrowserAdmission,
-    lease: SessionLease,
-) -> Result<(), String> {
-    if runtime.is_frozen() {
-        return Err("runtime froze before welcome rollback".to_owned());
-    }
-
-    match admission {
-        BrowserAdmission::New => runtime
-            .abort_admission(lease.player_id, lease.connection_epoch)
-            .then_some(())
-            .ok_or_else(|| "failed to release incomplete new admission".to_owned()),
-        BrowserAdmission::Reconnect(previous_token) => {
-            if !runtime.disconnect(lease.player_id, lease.connection_epoch) {
-                return Err("welcome rollback no longer owns the connection epoch".to_owned());
-            }
-            let restored = runtime
-                .reconnect(lease.reconnect_token, previous_token)
-                .map_err(|error| format!("failed to restore previous reconnect token: {error}"))?;
-            if !runtime.disconnect(restored.player_id, restored.connection_epoch) {
-                return Err("failed to return restored reconnect token to grace state".to_owned());
-            }
-            Ok(())
-        }
-    }
-}
-
-async fn run_established_connection<S: GameSimulation>(
-    connection: &Connection,
-    lease: SessionLease,
-    max_datagram_size: usize,
-    mut snapshots: broadcast::Receiver<SnapshotPublication>,
-    state: &HostedServerState<S>,
-    match_id: MatchId,
-) -> Result<(), String> {
-    let mut shutdown = state.shutdown.subscribe();
-    let control_permits = Arc::new(Semaphore::new(MAX_CONCURRENT_CONTROL_STREAMS));
-    loop {
-        tokio::select! {
-            datagram = connection.receive_datagram() => {
-                match datagram {
-                    Ok(datagram) => match decode_command(datagram.as_ref()) {
-                        Ok(command) => {
-                            match state
-                                .with_runtime_mut(&match_id, |runtime| {
-                                    runtime.submit_command(
-                                        lease.player_id,
-                                        lease.connection_epoch,
-                                        command.sequence,
-                                        &command.payload,
-                                    )
-                                })
-                                .await
-                            {
-                                Some(Ok(_)) | Some(Err(RuntimeError::Frozen)) => {}
-                                Some(Err(error)) => {
-                                    close(connection, CLOSE_PROTOCOL, &error.to_string());
-                                    return Ok(());
-                                }
-                                None => {
-                                    close(connection, CLOSE_SERVER, "match is no longer hosted");
-                                    return Ok(());
-                                }
-                            }
-                        }
-                        Err(error) => {
-                            close(connection, CLOSE_PROTOCOL, &error.to_string());
-                            return Ok(());
-                        }
-                    },
-                    Err(_) => return Ok(()),
-                }
-            }
-            control_stream = connection.accept_bi() => {
-                let (send_stream, recv_stream) = match control_stream {
-                    Ok(streams) => streams,
-                    Err(_) => return Ok(()),
-                };
-                let permit = match Arc::clone(&control_permits).try_acquire_owned() {
-                    Ok(permit) => permit,
-                    Err(_) => {
-                        eprintln!("reliable control stream rejected: concurrency limit reached");
+                    })
+                    .await
+                {
+                    Some(Ok(result)) => result,
+                    Some(Err(RuntimeError::Frozen)) => continue,
+                    Some(Err(error)) => {
+                        eprintln!("authoritative tick failed for match {match_id}: {error}");
                         continue;
                     }
+                    None => return,
                 };
-                let control = Arc::clone(&state.control);
-                let control_handlers = Arc::clone(&state.control_handlers);
-                let context = ControlContext {
-                    player_id: lease.player_id,
-                    connection_epoch: lease.connection_epoch,
-                };
-                let control_match_id = match_id.clone();
-                tokio::spawn(async move {
-                    let _permit = permit;
-                    if let Err(error) = run_control_stream(
-                        send_stream,
-                        recv_stream,
-                        control_match_id,
-                        context,
-                        control,
-                        control_handlers,
-                    )
-                    .await
-                    {
-                        eprintln!("reliable control stream failed: {error}");
-                    }
-                });
-            }
-            snapshot = snapshots.recv() => {
-                match snapshot {
+                match snapshot_publication(scope, snapshot) {
                     Ok(publication) => {
-                        let snapshot = match publication {
-                            SnapshotPublication::Shared(snapshot) => snapshot,
-                            SnapshotPublication::PlayerScoped => {
-                                let projected = state
-                                    .with_runtime(&match_id, |runtime| {
-                                        runtime.snapshot_for(lease.player_id)
-                                    })
-                                    .await;
-                                let projected = match projected {
-                                    Some(Ok(snapshot)) => snapshot,
-                                    Some(Err(error)) => {
-                                        close(connection, CLOSE_RUNTIME, &error.to_string());
-                                        return Ok(());
-                                    }
-                                    None => {
-                                        close(connection, CLOSE_SERVER, "match is no longer hosted");
-                                        return Ok(());
-                                    }
-                                };
-                                match encode_simulation_snapshot(projected) {
-                                    Ok(snapshot) => snapshot,
-                                    Err(error) => {
-                                        close(connection, CLOSE_RUNTIME, &error);
-                                        return Ok(());
-                                    }
-                                }
-                            }
-                        };
-                        if snapshot.len() > max_datagram_size {
-                            close(connection, CLOSE_DATAGRAM, "snapshot exceeds negotiated datagram budget");
-                            return Ok(());
-                        }
-                        let _ = connection.send_datagram(snapshot);
+                        let _ = snapshots.send(publication);
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(broadcast::error::RecvError::Closed) => {
-                        close(connection, CLOSE_SERVER, "snapshot source closed");
-                        return Ok(());
+                    Err(error) => {
+                        eprintln!("snapshot encoding failed for match {match_id}: {error}")
                     }
                 }
             }
-            _ = shutdown.recv() => {
-                close(connection, CLOSE_SERVER, "server shutting down");
-                return Ok(());
-            }
-            _ = connection.closed() => return Ok(()),
-        }
+        });
     }
-}
-
-async fn run_control_stream(
-    mut send_stream: SendStream,
-    mut recv_stream: RecvStream,
-    match_id: MatchId,
-    context: ControlContext,
-    control: Arc<dyn MatchControlService>,
-    control_handlers: Arc<Semaphore>,
-) -> Result<(), String> {
-    let exchange = async {
-        let mut header = [0_u8; CONTROL_HEADER_BYTES];
-        recv_stream
-            .read_exact(&mut header)
-            .await
-            .map_err(|error| error.to_string())?;
-        let payload_len = usize::from(u16::from_be_bytes([header[6], header[7]]));
-        if payload_len > MAX_CONTROL_PAYLOAD_BYTES {
-            return Err(format!(
-                "declared reliable-control payload {payload_len} exceeds maximum {MAX_CONTROL_PAYLOAD_BYTES}"
-            ));
-        }
-
-        let mut frame = Vec::with_capacity(CONTROL_HEADER_BYTES + payload_len);
-        frame.extend_from_slice(&header);
-        frame.resize(CONTROL_HEADER_BYTES + payload_len, 0);
-        if payload_len > 0 {
-            recv_stream
-                .read_exact(&mut frame[CONTROL_HEADER_BYTES..])
-                .await
-                .map_err(|error| error.to_string())?;
-        }
-        let request = decode_control_request(&frame).map_err(|error| error.to_string())?;
-        let mut trailing = [0_u8; 1];
-        match recv_stream
-            .read(&mut trailing)
-            .await
-            .map_err(|error| error.to_string())?
-        {
-            None => {}
-            Some(count) => {
-                return Err(format!(
-                    "reliable-control request has {count} trailing byte(s)"
-                ));
-            }
-        }
-
-        let handler_permit = control_handlers
-            .acquire_owned()
-            .await
-            .map_err(|_| "reliable-control handler capacity closed".to_owned())?;
-        let service = Arc::clone(&control);
-        let payload = request.payload;
-        let handled = spawn_blocking(move || {
-            let _handler_permit = handler_permit;
-            service.handle(&match_id, context, &payload)
-        })
-        .await
-        .map_err(|error| format!("reliable-control handler task failed: {error}"))?;
-        let response = match handled {
-            Ok(payload) => match encode_control_response(true, &payload) {
-                Ok(response) => response,
-                Err(error) => {
-                    eprintln!("reliable-control response rejected: {error}");
-                    encode_control_response(false, b"")
-                        .expect("empty reliable-control rejection is always encodable")
-                }
-            },
-            Err(error) => {
-                eprintln!("reliable-control request rejected: {error}");
-                encode_control_response(false, b"")
-                    .expect("empty reliable-control rejection is always encodable")
-            }
-        };
-
-        send_stream
-            .write_all(&response)
-            .await
-            .map_err(|error| error.to_string())?;
-        send_stream
-            .finish()
-            .await
-            .map_err(|error| error.to_string())?;
-        Ok(())
-    };
-
-    tokio::time::timeout(CONTROL_STREAM_TIMEOUT, exchange)
-        .await
-        .map_err(|_| "reliable control stream timed out".to_owned())?
-}
-
-fn generate_reconnect_token() -> Result<ReconnectToken, String> {
-    let mut bytes = [0_u8; RECONNECT_TOKEN_BYTES];
-    SystemRandom::new()
-        .fill(&mut bytes)
-        .map_err(|_| "secure reconnect-token generation failed".to_owned())?;
-    Ok(ReconnectToken(bytes))
-}
-
-fn close(connection: &Connection, code: u32, reason: &str) {
-    connection.close(VarInt::from_u32(code), reason.as_bytes());
+    tasks
 }
 
 #[cfg(test)]
@@ -965,5 +577,35 @@ mod tests {
             validate_host(&draining),
             Err(MatchHostTransportError::HostAlreadyDraining)
         );
+    }
+    #[tokio::test]
+    async fn dropping_host_tick_owner_closes_every_snapshot_source() {
+        let host = host_with(&["alpha", "beta"]);
+        let rates = validate_host(&host).unwrap();
+        let matches = isolate_hosted_runtimes(host);
+        let mut publications: Vec<_> = matches
+            .values()
+            .map(|hosted| hosted.snapshots.subscribe())
+            .collect();
+        let (shutdown, _) = broadcast::channel(1);
+        let state = HostedServerState {
+            matches: Arc::new(matches),
+            admission_gate: Arc::new(RwLock::new(false)),
+            control: Arc::new(RejectMatchControlService),
+            control_handlers: Arc::new(Semaphore::new(MAX_CONCURRENT_CONTROL_HANDLERS)),
+            shutdown,
+        };
+        let ticks = spawn_tick_loops(state, &rates);
+        for published in &mut publications {
+            published.recv().await.unwrap();
+        }
+        drop(ticks);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            for published in &mut publications {
+                while published.recv().await.is_ok() {}
+            }
+        })
+        .await
+        .expect("cancelled host must release every tick task and runtime");
     }
 }

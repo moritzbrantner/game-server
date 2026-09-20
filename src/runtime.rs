@@ -280,6 +280,18 @@ impl<S: GameSimulation> MatchRuntime<S> {
         true
     }
 
+    pub(crate) fn validate_connection(
+        &self,
+        player_id: PlayerId,
+        connection_epoch: u32,
+    ) -> Result<(), RuntimeError> {
+        if self.sessions.owns_connection(player_id, connection_epoch) {
+            Ok(())
+        } else {
+            Err(RuntimeError::StaleConnection)
+        }
+    }
+
     pub fn submit_command(
         &mut self,
         player_id: PlayerId,
@@ -293,9 +305,7 @@ impl<S: GameSimulation> MatchRuntime<S> {
         if sequence == 0 {
             return Err(RuntimeError::InvalidSequence);
         }
-        if !self.sessions.owns_connection(player_id, connection_epoch) {
-            return Err(RuntimeError::StaleConnection);
-        }
+        self.validate_connection(player_id, connection_epoch)?;
         let last_sequence = self
             .last_sequences
             .get(&player_id)
@@ -313,12 +323,14 @@ impl<S: GameSimulation> MatchRuntime<S> {
         self.simulation
             .apply_command(player_id, sequence, payload)?;
         self.last_sequences.insert(player_id, sequence);
-        self.record(ReplayRecord::CommandApplied {
-            tick: self.current_tick(),
-            player_id,
-            sequence,
-            payload: payload.to_vec(),
-        });
+        if let Some(replay) = &mut self.replay {
+            replay.append(ReplayRecord::CommandApplied {
+                tick: self.simulation.current_tick(),
+                player_id,
+                sequence,
+                payload: payload.to_vec(),
+            });
+        }
         Ok(CommandOutcome::Applied)
     }
 
@@ -338,9 +350,11 @@ impl<S: GameSimulation> MatchRuntime<S> {
         }
         self.simulation.advance_tick()?;
         let snapshot = self.simulation.snapshot()?;
-        self.record(ReplayRecord::Checkpoint {
-            snapshot: snapshot.clone(),
-        });
+        if let Some(replay) = &mut self.replay {
+            replay.append(ReplayRecord::Checkpoint {
+                snapshot: snapshot.clone(),
+            });
+        }
         Ok(snapshot)
     }
 
@@ -738,6 +752,41 @@ mod tests {
                 )
                 .unwrap(),
             CommandOutcome::Applied
+        );
+    }
+    #[test]
+    fn replay_capture_does_not_change_live_command_or_tick_results() {
+        let mut captured = MatchRuntime::new_with_replay_capture(FakeSimulation::default(), 2);
+        let mut uncaptured = MatchRuntime::new(FakeSimulation::default(), 2);
+        let first = captured.admit(token(1)).unwrap();
+        let second = uncaptured.admit(token(1)).unwrap();
+        for sequence in [1, 1, 3, 2, 4] {
+            let payload = vec![sequence as u8; MAX_COMMAND_PAYLOAD_BYTES];
+            assert_eq!(
+                captured.submit_command(
+                    first.player_id,
+                    first.connection_epoch,
+                    sequence,
+                    &payload
+                ),
+                uncaptured.submit_command(
+                    second.player_id,
+                    second.connection_epoch,
+                    sequence,
+                    &payload
+                )
+            );
+            assert_eq!(
+                captured.advance_tick().unwrap(),
+                uncaptured.advance_tick().unwrap()
+            );
+        }
+        assert!(uncaptured.replay_log().is_none());
+        assert_eq!(
+            verify_replay(FakeSimulation::default(), captured.replay_log().unwrap())
+                .unwrap()
+                .final_snapshot,
+            uncaptured.snapshot().unwrap()
         );
     }
 }

@@ -2,6 +2,7 @@ use crate::protocol::{
     MAX_COMMAND_PAYLOAD_BYTES, MAX_SNAPSHOT_PAYLOAD_BYTES, PlayerId, snapshot_hash,
 };
 use crate::simulation::{GameSimulation, SimulationError, SimulationSnapshot};
+use std::collections::BTreeMap;
 use std::fmt;
 
 pub const REPLAY_FORMAT_VERSION: u8 = 1;
@@ -155,6 +156,16 @@ pub enum ReplayError {
         actual: usize,
     },
     InvalidSequence,
+    NonIncreasingPlayerId {
+        previous: PlayerId,
+        actual: PlayerId,
+    },
+    UnknownCommandPlayer(PlayerId),
+    NonIncreasingSequence {
+        player_id: PlayerId,
+        previous: u32,
+        actual: u32,
+    },
     PayloadTooLarge {
         maximum: usize,
         actual: usize,
@@ -208,6 +219,22 @@ impl fmt::Display for ReplayError {
                 "replay record kind {kind} expected {expected} body bytes, received {actual}"
             ),
             Self::InvalidSequence => write!(formatter, "replay command sequence must be non-zero"),
+            Self::NonIncreasingPlayerId { previous, actual } => write!(
+                formatter,
+                "replay player ID {actual} must be greater than previously admitted ID {previous}"
+            ),
+            Self::UnknownCommandPlayer(player_id) => write!(
+                formatter,
+                "replay command addressed inactive player {player_id}"
+            ),
+            Self::NonIncreasingSequence {
+                player_id,
+                previous,
+                actual,
+            } => write!(
+                formatter,
+                "replay command sequence {actual} for player {player_id} must exceed {previous}"
+            ),
             Self::PayloadTooLarge { maximum, actual } => write!(
                 formatter,
                 "replay payload size {actual} exceeds maximum {maximum}"
@@ -270,9 +297,25 @@ impl From<SimulationError> for ReplayError {
 }
 
 pub fn verify_replay<S: GameSimulation>(
-    mut simulation: S,
+    simulation: S,
     log: &ReplayLog,
 ) -> Result<ReplayVerification, ReplayError> {
+    let (simulation, checkpoints_verified) = replay_into(simulation, log)?;
+    Ok(ReplayVerification {
+        records_verified: log.records().len(),
+        checkpoints_verified,
+        final_snapshot: simulation.snapshot()?,
+    })
+}
+
+// Verification and recovery must interpret the same authoritative history.
+// Runtime-owned identity and sequence rules cannot be delegated to game logic.
+pub(crate) fn replay_into<S: GameSimulation>(
+    mut simulation: S,
+    log: &ReplayLog,
+) -> Result<(S, usize), ReplayError> {
+    let mut last_admitted_player_id = 0;
+    let mut sequences = BTreeMap::new();
     let mut previous_tick = None;
     let mut checkpoints_verified = 0_usize;
 
@@ -305,7 +348,15 @@ pub fn verify_replay<S: GameSimulation>(
 
         match record {
             ReplayRecord::PlayerAdmitted { player_id, .. } => {
+                if *player_id <= last_admitted_player_id {
+                    return Err(ReplayError::NonIncreasingPlayerId {
+                        previous: last_admitted_player_id,
+                        actual: *player_id,
+                    });
+                }
                 simulation.add_player(*player_id)?;
+                sequences.insert(*player_id, 0);
+                last_admitted_player_id = *player_id;
             }
             ReplayRecord::CommandApplied {
                 player_id,
@@ -313,10 +364,24 @@ pub fn verify_replay<S: GameSimulation>(
                 payload,
                 ..
             } => {
+                let previous = sequences
+                    .get_mut(player_id)
+                    .ok_or(ReplayError::UnknownCommandPlayer(*player_id))?;
+                if *sequence == 0 {
+                    return Err(ReplayError::InvalidSequence);
+                }
+                if *sequence <= *previous {
+                    return Err(ReplayError::NonIncreasingSequence {
+                        player_id: *player_id,
+                        previous: *previous,
+                        actual: *sequence,
+                    });
+                }
                 simulation.apply_command(*player_id, *sequence, payload)?;
+                *previous = *sequence;
             }
             ReplayRecord::PlayerRemoved { player_id, .. } => {
-                if !simulation.remove_player(*player_id) {
+                if sequences.remove(player_id).is_none() || !simulation.remove_player(*player_id) {
                     return Err(ReplayError::MissingPlayerOnRemoval(*player_id));
                 }
             }
@@ -338,23 +403,16 @@ pub fn verify_replay<S: GameSimulation>(
         previous_tick = Some(record_tick);
     }
 
-    Ok(ReplayVerification {
-        records_verified: log.records().len(),
-        checkpoints_verified,
-        final_snapshot: simulation.snapshot()?,
-    })
+    Ok((simulation, checkpoints_verified))
 }
 
-fn encode_record(record: &ReplayRecord, output: &mut Vec<u8>) -> Result<(), ReplayError> {
-    let (kind, tick, body) = match record {
-        ReplayRecord::PlayerAdmitted { tick, player_id } => {
-            (ADMISSION_KIND, *tick, player_id.to_be_bytes().to_vec())
+fn record_body_len(record: &ReplayRecord) -> Result<usize, ReplayError> {
+    match record {
+        ReplayRecord::PlayerAdmitted { .. } | ReplayRecord::PlayerRemoved { .. } => {
+            Ok(PLAYER_BODY_BYTES)
         }
         ReplayRecord::CommandApplied {
-            tick,
-            player_id,
-            sequence,
-            payload,
+            sequence, payload, ..
         } => {
             if *sequence == 0 {
                 return Err(ReplayError::InvalidSequence);
@@ -365,19 +423,7 @@ fn encode_record(record: &ReplayRecord, output: &mut Vec<u8>) -> Result<(), Repl
                     actual: payload.len(),
                 });
             }
-            let mut body = Vec::with_capacity(COMMAND_FIXED_BODY_BYTES + payload.len());
-            body.extend_from_slice(&player_id.to_be_bytes());
-            body.extend_from_slice(&sequence.to_be_bytes());
-            body.extend_from_slice(
-                &u32::try_from(payload.len())
-                    .expect("bounded command payload length")
-                    .to_be_bytes(),
-            );
-            body.extend_from_slice(payload);
-            (COMMAND_KIND, *tick, body)
-        }
-        ReplayRecord::PlayerRemoved { tick, player_id } => {
-            (REMOVAL_KIND, *tick, player_id.to_be_bytes().to_vec())
+            Ok(COMMAND_FIXED_BODY_BYTES + payload.len())
         }
         ReplayRecord::Checkpoint { snapshot } => {
             if snapshot.payload.len() > MAX_SNAPSHOT_PAYLOAD_BYTES {
@@ -386,34 +432,65 @@ fn encode_record(record: &ReplayRecord, output: &mut Vec<u8>) -> Result<(), Repl
                     actual: snapshot.payload.len(),
                 });
             }
-            let expected_hash = snapshot_hash(snapshot.tick, &snapshot.payload);
-            if snapshot.state_hash != expected_hash {
+            let expected = snapshot_hash(snapshot.tick, &snapshot.payload);
+            if snapshot.state_hash != expected {
                 return Err(ReplayError::InvalidCheckpointHash {
                     tick: snapshot.tick,
-                    expected: expected_hash,
+                    expected,
                     actual: snapshot.state_hash,
                 });
             }
-            let mut body = Vec::with_capacity(CHECKPOINT_FIXED_BODY_BYTES + snapshot.payload.len());
-            body.extend_from_slice(&snapshot.state_hash.to_be_bytes());
-            body.extend_from_slice(
+            Ok(CHECKPOINT_FIXED_BODY_BYTES + snapshot.payload.len())
+        }
+    }
+}
+
+fn encode_record(record: &ReplayRecord, output: &mut Vec<u8>) -> Result<(), ReplayError> {
+    let body_len = record_body_len(record)?;
+    let kind = match record {
+        ReplayRecord::PlayerAdmitted { .. } => ADMISSION_KIND,
+        ReplayRecord::CommandApplied { .. } => COMMAND_KIND,
+        ReplayRecord::PlayerRemoved { .. } => REMOVAL_KIND,
+        ReplayRecord::Checkpoint { .. } => CHECKPOINT_KIND,
+    };
+    output.reserve(RECORD_HEADER_BYTES + body_len);
+    output.push(kind);
+    output.extend_from_slice(&record.tick().to_be_bytes());
+    output.extend_from_slice(
+        &u32::try_from(body_len)
+            .expect("bounded replay body length")
+            .to_be_bytes(),
+    );
+    match record {
+        ReplayRecord::PlayerAdmitted { player_id, .. }
+        | ReplayRecord::PlayerRemoved { player_id, .. } => {
+            output.extend_from_slice(&player_id.to_be_bytes());
+        }
+        ReplayRecord::CommandApplied {
+            player_id,
+            sequence,
+            payload,
+            ..
+        } => {
+            output.extend_from_slice(&player_id.to_be_bytes());
+            output.extend_from_slice(&sequence.to_be_bytes());
+            output.extend_from_slice(
+                &u32::try_from(payload.len())
+                    .expect("bounded command payload length")
+                    .to_be_bytes(),
+            );
+            output.extend_from_slice(payload);
+        }
+        ReplayRecord::Checkpoint { snapshot } => {
+            output.extend_from_slice(&snapshot.state_hash.to_be_bytes());
+            output.extend_from_slice(
                 &u32::try_from(snapshot.payload.len())
                     .expect("bounded snapshot payload length")
                     .to_be_bytes(),
             );
-            body.extend_from_slice(&snapshot.payload);
-            (CHECKPOINT_KIND, snapshot.tick, body)
+            output.extend_from_slice(&snapshot.payload);
         }
-    };
-
-    output.push(kind);
-    output.extend_from_slice(&tick.to_be_bytes());
-    output.extend_from_slice(
-        &u32::try_from(body.len())
-            .map_err(|_| ReplayError::RecordTooLarge(body.len()))?
-            .to_be_bytes(),
-    );
-    output.extend_from_slice(&body);
+    }
     Ok(())
 }
 
@@ -613,6 +690,172 @@ mod tests {
                 to_tick: u64::MAX,
                 maximum: MAX_VERIFIER_TICK_GAP,
             })
+        );
+    }
+    #[test]
+    fn verification_and_recovery_reject_impossible_command_sequences() {
+        use crate::{MatchRuntime, ReconnectToken};
+        let mut runtime = MatchRuntime::new_with_replay_capture(DemoSimulation::new(), 10);
+        let lease = runtime.admit(ReconnectToken([1; 16])).unwrap();
+        let command = encode_demo_command(1, 0).unwrap();
+        runtime
+            .submit_command(lease.player_id, lease.connection_epoch, 2, &command)
+            .unwrap();
+        runtime
+            .submit_command(lease.player_id, lease.connection_epoch, 3, &command)
+            .unwrap();
+        runtime.advance_tick().unwrap();
+        runtime.freeze_for_recovery();
+        let valid = runtime.recovery_image().unwrap();
+        assert!(verify_replay(DemoSimulation::new(), &valid.replay).is_ok());
+
+        for sequence in [1, 2] {
+            let mut image = valid.clone();
+            // Same payload and tick: even the final snapshot hash remains valid.
+            // Only the runtime's sequence invariant distinguishes this from history.
+            image.replay.records.insert(
+                2,
+                ReplayRecord::CommandApplied {
+                    tick: 0,
+                    player_id: lease.player_id,
+                    sequence,
+                    payload: command.to_vec(),
+                },
+            );
+            let encoded = image.encode().unwrap();
+            let decoded = crate::RecoveryImage::decode(&encoded).unwrap();
+            let expected = ReplayError::NonIncreasingSequence {
+                player_id: lease.player_id,
+                previous: 2,
+                actual: sequence,
+            };
+            assert_eq!(
+                verify_replay(DemoSimulation::new(), &decoded.replay).unwrap_err(),
+                expected
+            );
+            assert_eq!(
+                MatchRuntime::restore_from_recovery(DemoSimulation::new(), decoded).unwrap_err(),
+                crate::RuntimeRecoveryError::Recovery(crate::RecoveryError::Replay(expected))
+            );
+        }
+    }
+
+    #[test]
+    fn verification_and_recovery_reject_reused_player_identity() {
+        use crate::{MatchRuntime, ReconnectToken};
+        let mut runtime = MatchRuntime::new_with_replay_capture(DemoSimulation::new(), 10);
+        let lease = runtime.admit(ReconnectToken([1; 16])).unwrap();
+        runtime.freeze_for_recovery();
+        let mut image = runtime.recovery_image().unwrap();
+        image.replay.records.insert(
+            1,
+            ReplayRecord::PlayerRemoved {
+                tick: 0,
+                player_id: lease.player_id,
+            },
+        );
+        image.replay.records.insert(
+            2,
+            ReplayRecord::PlayerAdmitted {
+                tick: 0,
+                player_id: lease.player_id,
+            },
+        );
+        assert!(
+            verify_replay(DemoSimulation::new(), &image.replay).is_err(),
+            "verifier accepted reuse of a retired player ID"
+        );
+        assert!(
+            MatchRuntime::restore_from_recovery(DemoSimulation::new(), image).is_err(),
+            "recovery accepted reuse of a retired player ID"
+        );
+    }
+    #[test]
+    fn replay_encoding_preserves_the_version_one_wire_fixture() {
+        let mut log = ReplayLog::default();
+        log.append(ReplayRecord::PlayerAdmitted {
+            tick: 0,
+            player_id: 7,
+        });
+        log.append(ReplayRecord::CommandApplied {
+            tick: 0,
+            player_id: 7,
+            sequence: 9,
+            payload: vec![0xaa],
+        });
+        log.append(ReplayRecord::Checkpoint {
+            snapshot: SimulationSnapshot::new(1, vec![0xbb]),
+        });
+        log.append(ReplayRecord::PlayerRemoved {
+            tick: 1,
+            player_id: 7,
+        });
+        const FIXTURE_HEX: &str = "475352500101000000000000000000000004000000070200000000000000000000000d000000070000000900000001aa0400000000000000010000000d35594afc4eab92da00000001bb0300000000000000010000000400000007";
+        let expected: Vec<u8> = FIXTURE_HEX
+            .as_bytes()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect();
+        assert_eq!(log.encode().unwrap(), expected);
+        assert_eq!(ReplayLog::decode(&expected).unwrap(), log);
+    }
+    #[test]
+    fn replay_enforces_identity_before_delegating_to_simulation() {
+        let mut zero = ReplayLog::default();
+        zero.append(ReplayRecord::PlayerAdmitted {
+            tick: 0,
+            player_id: 0,
+        });
+        assert_eq!(
+            verify_replay(DemoSimulation::new(), &zero).unwrap_err(),
+            ReplayError::NonIncreasingPlayerId {
+                previous: 0,
+                actual: 0
+            }
+        );
+
+        let mut retired = ReplayLog::default();
+        retired.append(ReplayRecord::PlayerAdmitted {
+            tick: 0,
+            player_id: 1,
+        });
+        retired.append(ReplayRecord::PlayerRemoved {
+            tick: 0,
+            player_id: 1,
+        });
+        retired.append(ReplayRecord::CommandApplied {
+            tick: 0,
+            player_id: 1,
+            sequence: 1,
+            payload: encode_demo_command(1, 0).unwrap().to_vec(),
+        });
+        assert_eq!(
+            verify_replay(DemoSimulation::new(), &retired).unwrap_err(),
+            ReplayError::UnknownCommandPlayer(1)
+        );
+    }
+
+    #[test]
+    fn replay_allows_gaps_in_allocated_ids_and_command_sequences() {
+        let mut log = ReplayLog::default();
+        for player_id in [3, 8] {
+            log.append(ReplayRecord::PlayerAdmitted { tick: 0, player_id });
+            for sequence in [5, 9] {
+                log.append(ReplayRecord::CommandApplied {
+                    tick: 0,
+                    player_id,
+                    sequence,
+                    payload: encode_demo_command(1, 0).unwrap().to_vec(),
+                });
+            }
+        }
+        assert_eq!(
+            verify_replay(DemoSimulation::new(), &log)
+                .unwrap()
+                .records_verified,
+            6
         );
     }
 }

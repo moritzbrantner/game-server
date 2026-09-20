@@ -283,10 +283,10 @@ impl SessionRegistry {
         }
 
         let player_id = self.next_player_id;
-        self.next_player_id = self.next_player_id.checked_add(1).unwrap_or(0);
-        if player_id == 0 || self.next_player_id == 0 {
-            return Err(SessionError::PlayerCapacity);
-        }
+        let next_player_id = player_id
+            .checked_add(1)
+            .ok_or(SessionError::PlayerCapacity)?;
+        self.next_player_id = next_player_id;
         let session = PlayerSession {
             token: reconnect_token,
             connection_epoch: 1,
@@ -525,5 +525,29 @@ mod tests {
             SessionRegistry::restore(16, 10, 0, &invalid_next),
             Err(SessionRecoveryError::InvalidNextPlayerId)
         ));
+    }
+    #[test]
+    fn exhausted_player_ids_never_wrap_or_replace_live_sessions() {
+        let mut registry = SessionRegistry::new(4, 10);
+        let original = registry.admit(token(1)).unwrap();
+        let mut saved = registry.recovery_snapshot(0);
+        saved.next_player_id = PlayerId::MAX;
+        let mut restored = SessionRegistry::restore(4, 10, 0, &saved).unwrap();
+        let reconnected = restored
+            .reconnect(original.reconnect_token, token(2), 0)
+            .unwrap();
+        let before = restored.recovery_snapshot(0);
+        for value in 3..10 {
+            assert_eq!(
+                restored.admit(token(value)),
+                Err(SessionError::PlayerCapacity)
+            );
+            assert_eq!(
+                restored.recovery_snapshot(0),
+                before,
+                "failed admission changed identity state"
+            );
+            assert!(restored.owns_connection(reconnected.player_id, reconnected.connection_epoch));
+        }
     }
 }

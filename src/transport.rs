@@ -1,15 +1,12 @@
-use crate::control::{
-    CONTROL_HEADER_BYTES, ControlContext, ControlService, MAX_CONTROL_PAYLOAD_BYTES,
-    RejectControlService, decode_control_request, encode_control_response,
+use crate::connection::{
+    AdmissionRequest, ConnectionState as ServerState, MAX_CONCURRENT_CONTROL_HANDLERS,
+    SNAPSHOT_CHANNEL_DEPTH, SnapshotPublication, handle_connection, snapshot_publication,
 };
-use crate::protocol::{
-    RECONNECT_TOKEN_BYTES, SnapshotFrame, Welcome, decode_command, encode_snapshot, encode_welcome,
-};
+use crate::control::{ControlService, RejectControlService};
 use crate::recovery::RecoveryImage;
 use crate::runtime::{MatchRuntime, RuntimeError};
-use crate::session::{ReconnectToken, SessionLease};
-use crate::simulation::{GameSimulation, SimulationSnapshot, SnapshotScope};
-use ring::rand::{SecureRandom, SystemRandom};
+use crate::session::ReconnectToken;
+use crate::simulation::GameSimulation;
 use std::error::Error;
 use std::fmt;
 use std::fs::{self, File};
@@ -18,19 +15,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, Semaphore, broadcast, mpsc};
-use tokio::task::{JoinHandle, spawn_blocking};
+use tokio::task::{JoinSet, spawn_blocking};
 use tokio::time::MissedTickBehavior;
-use wtransport::{Connection, Endpoint, Identity, RecvStream, SendStream, ServerConfig, VarInt};
-
-const CLOSE_PROTOCOL: u32 = 1;
-const CLOSE_DATAGRAM: u32 = 2;
-const CLOSE_RUNTIME: u32 = 3;
-const CLOSE_SERVER: u32 = 4;
-const SNAPSHOT_CHANNEL_DEPTH: usize = 1;
-const WELCOME_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
-const CONTROL_STREAM_TIMEOUT: Duration = Duration::from_secs(5);
-const MAX_CONCURRENT_CONTROL_STREAMS: usize = 4;
-const MAX_CONCURRENT_CONTROL_HANDLERS: usize = 64;
+use wtransport::{Endpoint, Identity, ServerConfig};
 
 #[derive(Clone, Debug)]
 pub struct WebTransportConfig {
@@ -72,59 +59,6 @@ impl fmt::Display for TransportError {
 }
 
 impl Error for TransportError {}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum AdmissionRequest {
-    New,
-    Reconnect(ReconnectToken),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum SnapshotPublication {
-    Shared(Vec<u8>),
-    PlayerScoped,
-}
-
-pub(crate) fn snapshot_publication(
-    scope: SnapshotScope,
-    snapshot: SimulationSnapshot,
-) -> Result<SnapshotPublication, String> {
-    match scope {
-        SnapshotScope::Shared => {
-            encode_simulation_snapshot(snapshot).map(SnapshotPublication::Shared)
-        }
-        SnapshotScope::PlayerScoped => Ok(SnapshotPublication::PlayerScoped),
-    }
-}
-
-pub(crate) fn encode_simulation_snapshot(snapshot: SimulationSnapshot) -> Result<Vec<u8>, String> {
-    encode_snapshot(&SnapshotFrame {
-        tick: snapshot.tick,
-        state_hash: snapshot.state_hash,
-        payload: snapshot.payload,
-    })
-    .map_err(|error| error.to_string())
-}
-
-struct ServerState<S> {
-    runtime: Arc<Mutex<MatchRuntime<S>>>,
-    control: Arc<dyn ControlService>,
-    control_handlers: Arc<Semaphore>,
-    snapshots: broadcast::Sender<SnapshotPublication>,
-    shutdown: broadcast::Sender<()>,
-}
-
-impl<S> Clone for ServerState<S> {
-    fn clone(&self) -> Self {
-        Self {
-            runtime: Arc::clone(&self.runtime),
-            control: Arc::clone(&self.control),
-            control_handlers: Arc::clone(&self.control_handlers),
-            snapshots: self.snapshots.clone(),
-            shutdown: self.shutdown.clone(),
-        }
-    }
-}
 
 pub async fn serve<S>(
     simulation: S,
@@ -230,13 +164,15 @@ where
         control_handlers: Arc::new(Semaphore::new(MAX_CONCURRENT_CONTROL_HANDLERS)),
         snapshots,
         shutdown,
+        admission_gate: None,
     };
-    let tick_task = spawn_tick_loop(state.clone(), tick_hz);
+    let mut tick_task = spawn_tick_loop(state.clone(), tick_hz);
 
-    let spawn_incoming = |incoming: wtransport::endpoint::IncomingSession| {
+    let mut connections = JoinSet::new();
+    let incoming_session = |incoming: wtransport::endpoint::IncomingSession| {
         let state = state.clone();
         let session_path = config.session_path.clone();
-        tokio::spawn(async move {
+        async move {
             let request = match incoming.await {
                 Ok(request) => request,
                 Err(error) => {
@@ -258,13 +194,18 @@ where
             if let Err(error) = handle_connection(connection, state, admission).await {
                 eprintln!("game session failed: {error}");
             }
-        });
+        }
     };
 
     let mut shutdown_channel_open = true;
     loop {
         tokio::select! {
-            incoming = endpoint.accept() => spawn_incoming(incoming),
+            incoming = endpoint.accept() => { connections.spawn(incoming_session(incoming)); },
+            completed = connections.join_next(), if !connections.is_empty() => {
+                if let Some(Err(error)) = completed {
+                    eprintln!("connection task failed: {error}");
+                }
+            },
             shutdown = shutdown_requests.recv(), if shutdown_channel_open => {
                 let Some(()) = shutdown else {
                     shutdown_channel_open = false;
@@ -277,14 +218,20 @@ where
                 loop {
                     tokio::select! {
                         _ = &mut drain_deadline => break,
-                        incoming = endpoint.accept() => spawn_incoming(incoming),
+                        incoming = endpoint.accept() => { connections.spawn(incoming_session(incoming)); },
+                        completed = connections.join_next(), if !connections.is_empty() => {
+                            if let Some(Err(error)) = completed {
+                                eprintln!("connection task failed: {error}");
+                            }
+                        },
                     }
                 }
 
                 match persist_graceful_recovery(&state, config.recovery_path.as_deref()).await {
                     Ok(()) => {
                         let _ = state.shutdown.send(());
-                        stop_tick_loop(tick_task).await;
+                        tick_task.shutdown().await;
+                        connections.shutdown().await;
                         return Ok(());
                     }
                     Err(error) => {
@@ -370,8 +317,9 @@ fn consume_recovery_file(path: &Path) -> Result<(), TransportError> {
     Ok(())
 }
 
-fn spawn_tick_loop<S: GameSimulation>(state: ServerState<S>, tick_hz: u16) -> JoinHandle<()> {
-    tokio::spawn(async move {
+fn spawn_tick_loop<S: GameSimulation>(state: ServerState<S>, tick_hz: u16) -> JoinSet<()> {
+    let mut tasks = JoinSet::new();
+    tasks.spawn(async move {
         let mut ticker =
             tokio::time::interval(Duration::from_micros(1_000_000_u64 / u64::from(tick_hz)));
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -397,353 +345,8 @@ fn spawn_tick_loop<S: GameSimulation>(state: ServerState<S>, tick_hz: u16) -> Jo
                 Err(error) => eprintln!("snapshot encoding failed: {error}"),
             }
         }
-    })
-}
-
-async fn stop_tick_loop(tick_task: JoinHandle<()>) {
-    tick_task.abort();
-    let _ = tick_task.await;
-}
-
-async fn handle_connection<S: GameSimulation>(
-    connection: Connection,
-    state: ServerState<S>,
-    admission: AdmissionRequest,
-) -> Result<(), String> {
-    let max_datagram_size = match connection.max_datagram_size() {
-        Some(max_datagram_size) => max_datagram_size,
-        None => {
-            close(
-                &connection,
-                CLOSE_DATAGRAM,
-                "WebTransport datagrams are required",
-            );
-            return Ok(());
-        }
-    };
-
-    let replacement_token = generate_reconnect_token()?;
-    let lease = {
-        let mut runtime = state.runtime.lock().await;
-        match admission {
-            AdmissionRequest::New => runtime.admit(replacement_token),
-            AdmissionRequest::Reconnect(previous_token) => {
-                runtime.reconnect(previous_token, replacement_token)
-            }
-        }
-    };
-    let lease = match lease {
-        Ok(lease) => lease,
-        Err(error) => {
-            close(&connection, CLOSE_RUNTIME, &error.to_string());
-            return Ok(());
-        }
-    };
-
-    if let Err(error) = send_welcome(&connection, lease, &state).await {
-        let cleanup = {
-            let mut runtime = state.runtime.lock().await;
-            rollback_failed_welcome(&mut runtime, admission, lease)
-        };
-        if let Err(cleanup_error) = cleanup {
-            eprintln!("failed to roll back incomplete welcome: {cleanup_error}");
-        }
-        close(&connection, CLOSE_RUNTIME, &error);
-        return Ok(());
-    }
-
-    let result = run_established_connection(&connection, lease, max_datagram_size, &state).await;
-    state
-        .runtime
-        .lock()
-        .await
-        .disconnect(lease.player_id, lease.connection_epoch);
-    result
-}
-
-async fn send_welcome<S: GameSimulation>(
-    connection: &Connection,
-    lease: SessionLease,
-    state: &ServerState<S>,
-) -> Result<(), String> {
-    let (tick_hz, max_players, current_tick) = {
-        let runtime = state.runtime.lock().await;
-        (
-            runtime.tick_hz(),
-            u16::try_from(runtime.max_players())
-                .map_err(|_| "player capacity exceeds wire limit")?,
-            runtime.current_tick(),
-        )
-    };
-    let welcome = encode_welcome(Welcome {
-        player_id: lease.player_id,
-        tick_hz,
-        max_players,
-        current_tick,
-        connection_epoch: lease.connection_epoch,
-        reconnect_token: lease.reconnect_token.0,
-        reconnect_grace_ticks: lease.reconnect_grace_ticks,
     });
-    let handshake = async {
-        let opening = connection
-            .open_uni()
-            .await
-            .map_err(|error| error.to_string())?;
-        let mut welcome_stream = opening.await.map_err(|error| error.to_string())?;
-        welcome_stream
-            .write_all(&welcome)
-            .await
-            .map_err(|error| error.to_string())?;
-        welcome_stream
-            .finish()
-            .await
-            .map_err(|error| error.to_string())?;
-        Ok(())
-    };
-
-    tokio::select! {
-        result = tokio::time::timeout(WELCOME_HANDSHAKE_TIMEOUT, handshake) => {
-            match result {
-                Ok(result) => result,
-                Err(_) => Err("welcome handshake timed out".to_owned()),
-            }
-        }
-        _ = connection.closed() => Err("connection closed before welcome completed".to_owned()),
-    }
-}
-
-fn rollback_failed_welcome<S: GameSimulation>(
-    runtime: &mut MatchRuntime<S>,
-    admission: AdmissionRequest,
-    lease: SessionLease,
-) -> Result<(), String> {
-    if runtime.is_frozen() {
-        return Err("runtime froze before welcome rollback".to_owned());
-    }
-
-    match admission {
-        AdmissionRequest::New => runtime
-            .abort_admission(lease.player_id, lease.connection_epoch)
-            .then_some(())
-            .ok_or_else(|| "failed to release incomplete new admission".to_owned()),
-        AdmissionRequest::Reconnect(previous_token) => {
-            if !runtime.disconnect(lease.player_id, lease.connection_epoch) {
-                return Err("welcome rollback no longer owns the connection epoch".to_owned());
-            }
-            let restored = runtime
-                .reconnect(lease.reconnect_token, previous_token)
-                .map_err(|error| format!("failed to restore previous reconnect token: {error}"))?;
-            if !runtime.disconnect(restored.player_id, restored.connection_epoch) {
-                return Err("failed to return restored reconnect token to grace state".to_owned());
-            }
-            Ok(())
-        }
-    }
-}
-
-async fn run_established_connection<S: GameSimulation>(
-    connection: &Connection,
-    lease: SessionLease,
-    max_datagram_size: usize,
-    state: &ServerState<S>,
-) -> Result<(), String> {
-    let mut snapshots = state.snapshots.subscribe();
-    let mut shutdown = state.shutdown.subscribe();
-    let control_permits = Arc::new(Semaphore::new(MAX_CONCURRENT_CONTROL_STREAMS));
-    loop {
-        tokio::select! {
-            datagram = connection.receive_datagram() => {
-                match datagram {
-                    Ok(datagram) => match decode_command(datagram.as_ref()) {
-                        Ok(command) => {
-                            match state.runtime.lock().await.submit_command(
-                                lease.player_id,
-                                lease.connection_epoch,
-                                command.sequence,
-                                &command.payload,
-                            ) {
-                                Ok(_) | Err(RuntimeError::Frozen) => {}
-                                Err(error) => {
-                                    close(connection, CLOSE_PROTOCOL, &error.to_string());
-                                    return Ok(());
-                                }
-                            }
-                        }
-                        Err(error) => {
-                            close(connection, CLOSE_PROTOCOL, &error.to_string());
-                            return Ok(());
-                        }
-                    },
-                    Err(_) => return Ok(()),
-                }
-            }
-            control_stream = connection.accept_bi() => {
-                let (send_stream, recv_stream) = match control_stream {
-                    Ok(streams) => streams,
-                    Err(_) => return Ok(()),
-                };
-                let permit = match Arc::clone(&control_permits).try_acquire_owned() {
-                    Ok(permit) => permit,
-                    Err(_) => {
-                        eprintln!("reliable control stream rejected: concurrency limit reached");
-                        continue;
-                    }
-                };
-                let control = Arc::clone(&state.control);
-                let control_handlers = Arc::clone(&state.control_handlers);
-                let context = ControlContext {
-                    player_id: lease.player_id,
-                    connection_epoch: lease.connection_epoch,
-                };
-                tokio::spawn(async move {
-                    let _permit = permit;
-                    if let Err(error) = run_control_stream(
-                        send_stream,
-                        recv_stream,
-                        context,
-                        control,
-                        control_handlers,
-                    )
-                    .await
-                    {
-                        eprintln!("reliable control stream failed: {error}");
-                    }
-                });
-            }
-            snapshot = snapshots.recv() => {
-                match snapshot {
-                    Ok(publication) => {
-                        let snapshot = match publication {
-                            SnapshotPublication::Shared(snapshot) => snapshot,
-                            SnapshotPublication::PlayerScoped => {
-                                let projected = {
-                                    let runtime = state.runtime.lock().await;
-                                    runtime.snapshot_for(lease.player_id)
-                                };
-                                let projected = match projected {
-                                    Ok(snapshot) => snapshot,
-                                    Err(error) => {
-                                        close(connection, CLOSE_RUNTIME, &error.to_string());
-                                        return Ok(());
-                                    }
-                                };
-                                match encode_simulation_snapshot(projected) {
-                                    Ok(snapshot) => snapshot,
-                                    Err(error) => {
-                                        close(connection, CLOSE_RUNTIME, &error);
-                                        return Ok(());
-                                    }
-                                }
-                            }
-                        };
-                        if snapshot.len() > max_datagram_size {
-                            close(connection, CLOSE_DATAGRAM, "snapshot exceeds negotiated datagram budget");
-                            return Ok(());
-                        }
-                        let _ = connection.send_datagram(snapshot);
-                    }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(broadcast::error::RecvError::Closed) => {
-                        close(connection, CLOSE_SERVER, "snapshot source closed");
-                        return Ok(());
-                    }
-                }
-            }
-            _ = shutdown.recv() => {
-                close(connection, CLOSE_SERVER, "server shutting down");
-                return Ok(());
-            }
-            _ = connection.closed() => return Ok(()),
-        }
-    }
-}
-
-async fn run_control_stream(
-    mut send_stream: SendStream,
-    mut recv_stream: RecvStream,
-    context: ControlContext,
-    control: Arc<dyn ControlService>,
-    control_handlers: Arc<Semaphore>,
-) -> Result<(), String> {
-    let exchange = async {
-        let mut header = [0_u8; CONTROL_HEADER_BYTES];
-        recv_stream
-            .read_exact(&mut header)
-            .await
-            .map_err(|error| error.to_string())?;
-        let payload_len = usize::from(u16::from_be_bytes([header[6], header[7]]));
-        if payload_len > MAX_CONTROL_PAYLOAD_BYTES {
-            return Err(format!(
-                "declared reliable-control payload {payload_len} exceeds maximum {MAX_CONTROL_PAYLOAD_BYTES}"
-            ));
-        }
-
-        let mut frame = Vec::with_capacity(CONTROL_HEADER_BYTES + payload_len);
-        frame.extend_from_slice(&header);
-        frame.resize(CONTROL_HEADER_BYTES + payload_len, 0);
-        if payload_len > 0 {
-            recv_stream
-                .read_exact(&mut frame[CONTROL_HEADER_BYTES..])
-                .await
-                .map_err(|error| error.to_string())?;
-        }
-        let request = decode_control_request(&frame).map_err(|error| error.to_string())?;
-        let mut trailing = [0_u8; 1];
-        match recv_stream
-            .read(&mut trailing)
-            .await
-            .map_err(|error| error.to_string())?
-        {
-            None => {}
-            Some(count) => {
-                return Err(format!(
-                    "reliable-control request has {count} trailing byte(s)"
-                ));
-            }
-        }
-
-        let handler_permit = control_handlers
-            .acquire_owned()
-            .await
-            .map_err(|_| "reliable-control handler capacity closed".to_owned())?;
-        let service = Arc::clone(&control);
-        let payload = request.payload;
-        let handled = spawn_blocking(move || {
-            let _handler_permit = handler_permit;
-            service.handle(context, &payload)
-        })
-        .await
-        .map_err(|error| format!("reliable-control handler task failed: {error}"))?;
-        let response = match handled {
-            Ok(payload) => match encode_control_response(true, &payload) {
-                Ok(response) => response,
-                Err(error) => {
-                    eprintln!("reliable-control response rejected: {error}");
-                    encode_control_response(false, b"")
-                        .expect("empty reliable-control rejection is always encodable")
-                }
-            },
-            Err(error) => {
-                eprintln!("reliable-control request rejected: {error}");
-                encode_control_response(false, b"")
-                    .expect("empty reliable-control rejection is always encodable")
-            }
-        };
-
-        send_stream
-            .write_all(&response)
-            .await
-            .map_err(|error| error.to_string())?;
-        send_stream
-            .finish()
-            .await
-            .map_err(|error| error.to_string())?;
-        Ok(())
-    };
-
-    tokio::time::timeout(CONTROL_STREAM_TIMEOUT, exchange)
-        .await
-        .map_err(|_| "reliable control stream timed out".to_owned())?
+    tasks
 }
 
 fn parse_admission_request(path: &str, session_path: &str) -> Option<AdmissionRequest> {
@@ -755,43 +358,12 @@ fn parse_admission_request(path: &str, session_path: &str) -> Option<AdmissionRe
     ReconnectToken::decode_hex(token).map(AdmissionRequest::Reconnect)
 }
 
-fn generate_reconnect_token() -> Result<ReconnectToken, String> {
-    let mut bytes = [0_u8; RECONNECT_TOKEN_BYTES];
-    SystemRandom::new()
-        .fill(&mut bytes)
-        .map_err(|_| "secure reconnect-token generation failed".to_owned())?;
-    Ok(ReconnectToken(bytes))
-}
-
-fn close(connection: &Connection, code: u32, reason: &str) {
-    connection.close(VarInt::from_u32(code), reason.as_bytes());
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::RECONNECT_TOKEN_BYTES;
     use crate::world::DemoSimulation;
     use std::time::{SystemTime, UNIX_EPOCH};
-
-    #[test]
-    fn player_scoped_publication_never_broadcasts_canonical_payload() {
-        let snapshot = SimulationSnapshot::new(7, b"canonical-private-state".to_vec());
-
-        assert_eq!(
-            snapshot_publication(SnapshotScope::PlayerScoped, snapshot).unwrap(),
-            SnapshotPublication::PlayerScoped
-        );
-    }
-
-    #[test]
-    fn shared_publication_keeps_the_single_encode_fast_path() {
-        let snapshot = SimulationSnapshot::new(7, b"shared-state".to_vec());
-
-        assert!(matches!(
-            snapshot_publication(SnapshotScope::Shared, snapshot).unwrap(),
-            SnapshotPublication::Shared(_)
-        ));
-    }
 
     #[test]
     fn parses_new_and_reconnect_paths() {
@@ -810,47 +382,6 @@ mod tests {
         assert_eq!(
             parse_admission_request("/match/one/reconnect/not-valid", "/match/one"),
             None
-        );
-    }
-
-    #[test]
-    fn failed_new_welcome_releases_unusable_slot() {
-        let mut runtime = MatchRuntime::new_with_replay_capture(DemoSimulation::new(), 10);
-        let lease = runtime
-            .admit(ReconnectToken([1; RECONNECT_TOKEN_BYTES]))
-            .unwrap();
-
-        rollback_failed_welcome(&mut runtime, AdmissionRequest::New, lease).unwrap();
-
-        assert_eq!(runtime.slot_count(), 0);
-        assert_eq!(runtime.active_count(), 0);
-    }
-
-    #[test]
-    fn failed_reconnect_welcome_restores_the_client_known_token() {
-        let previous_token = ReconnectToken([1; RECONNECT_TOKEN_BYTES]);
-        let replacement_token = ReconnectToken([2; RECONNECT_TOKEN_BYTES]);
-        let next_token = ReconnectToken([3; RECONNECT_TOKEN_BYTES]);
-        let mut runtime = MatchRuntime::new_with_replay_capture(DemoSimulation::new(), 10);
-        let original = runtime.admit(previous_token).unwrap();
-        assert!(runtime.disconnect(original.player_id, original.connection_epoch));
-        let failed = runtime
-            .reconnect(previous_token, replacement_token)
-            .unwrap();
-
-        rollback_failed_welcome(
-            &mut runtime,
-            AdmissionRequest::Reconnect(previous_token),
-            failed,
-        )
-        .unwrap();
-
-        let recovered = runtime.reconnect(previous_token, next_token).unwrap();
-        assert_eq!(recovered.player_id, original.player_id);
-        assert!(
-            runtime
-                .reconnect(replacement_token, previous_token)
-                .is_err()
         );
     }
 
@@ -894,5 +425,26 @@ mod tests {
             "game-server-transport-recovery-{}-{nonce}.bin",
             std::process::id()
         ))
+    }
+    #[tokio::test]
+    async fn dropping_tick_owner_closes_the_snapshot_source() {
+        let (snapshots, mut published) = broadcast::channel(SNAPSHOT_CHANNEL_DEPTH);
+        let (shutdown, _) = broadcast::channel(1);
+        let state = ServerState {
+            runtime: Arc::new(Mutex::new(MatchRuntime::new(DemoSimulation::new(), 10))),
+            control: Arc::new(RejectControlService),
+            control_handlers: Arc::new(Semaphore::new(MAX_CONCURRENT_CONTROL_HANDLERS)),
+            snapshots,
+            shutdown,
+            admission_gate: None,
+        };
+        let ticks = spawn_tick_loop(state, 20);
+        published.recv().await.unwrap();
+        drop(ticks);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while published.recv().await.is_ok() {}
+        })
+        .await
+        .expect("cancelled server must release its tick task and runtime");
     }
 }

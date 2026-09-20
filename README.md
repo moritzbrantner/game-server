@@ -15,6 +15,8 @@ Reusable server-authoritative multiplayer runtime extracted from the proven `ser
 
 It does **not** own game-specific rules, matchmaking/accounts/rankings, or physics algorithms. Games supply deterministic simulation logic. Physics is delegated to `physics-engine` through an adapter boundary.
 
+Single-match and hosted listeners share one internal connection module for admission, welcome rollback, command ingestion, snapshot delivery, and reliable control. Hosted routing binds the match identity before entering that module. Server tasks own their connection and tick tasks; each connection owns its control exchanges, so canceling the owner also cancels pending work. See [the connection lifecycle decision](docs/adr/0001-shared-connection-lifecycle.md).
+
 ## Browser integration contract
 
 `browser` exposes the versioned browser-facing boundary without creating a second gameplay protocol. `BROWSER_PROTOCOL_CONTRACT` binds the route version to the existing command/snapshot protocol version, reliable-control format version, reconnect-token size, and payload ceilings so browser clients can pin one explicit compatibility surface.
@@ -38,6 +40,8 @@ For process-hosted matches, `serve_match_host*` owns one WebTransport listener a
 
 Games with private state must opt into `SnapshotScope::PlayerScoped` and implement `snapshot_for(player_id)`. The default projection fails closed instead of falling back to the canonical snapshot. In that mode the transport publishes only an update signal, then asks the authoritative runtime for the addressed player's projection before encoding a datagram. Canonical snapshot bytes therefore never enter the connection broadcast channel. The projected snapshot carries its own hash over the player-visible payload, while replay and recovery continue to verify the canonical full-state snapshot.
 
+Both shared and player-scoped delivery validate the current connection epoch under the runtime lock before sending. A disconnected or replaced lease cannot receive a snapshot through the connection module.
+
 This boundary is intended for hidden-information games such as card games. It keeps visibility policy in the supplied game simulation rather than duplicating game rules in WebTransport handlers.
 
 ## Reliable control
@@ -47,6 +51,8 @@ Realtime game commands and latest authoritative snapshots use WebTransport datag
 Single-match applications opt in with `serve_with_control` or `serve_with_control_and_shutdown` and provide a `ControlService`. Hosted applications use `serve_match_host_with_control*` and provide a `MatchControlService`, which receives the validated `MatchId` in addition to the authenticated player ID and connection epoch. That preserves fencing identity even when different matches both allocate player ID 1. Neither control service has access to `GameSimulation`; authoritative game mutation therefore remains on the deterministic command/tick path.
 
 Control handlers run off the async runtime. A server instance admits at most 64 handler executions at once, and that permit remains occupied until the synchronous handler actually exits even if its WebTransport exchange has already timed out. This prevents repeated transport timeouts from creating an unbounded tail of detached blocking work.
+
+Handler dispatch rechecks the connection epoch after waiting for capacity and after entering the blocking pool. Closing a connection cancels its pending exchanges; canceling an exchange also cancels handlers still queued in the blocking pool. A synchronous handler that has already started cannot be interrupted. It runs without holding the simulation lock and remains responsible for fencing delayed external side effects using its control context.
 
 The acceptance probes cover successful and rejected control exchanges, malformed, oversized, and trailing-byte fail-closed handling, stalled-stream timeout, the per-connection concurrency cap, continued realtime command/snapshot progress while a control stream is stalled, and match-scoped control routing through one hosted listener.
 
@@ -77,6 +83,8 @@ Set `GAME_SERVER_RECOVERY_PATH` to enable replay-backed graceful restart recover
 
 Recovery persistence is intentionally fail-closed: malformed evidence prevents startup, failed shutdown persistence resumes the live runtime, recovery I/O does not hold the runtime mutex, and the reliable welcome handshake is time-bounded so a peer cannot retain capacity indefinitely. This is graceful restart recovery rather than per-command crash journaling.
 
+Replay verification and recovery share one interpreter that enforces increasing player identities and per-player command sequences. Retired identities cannot be reused, commands require a live player, and recovery images must end with an authoritative checkpoint. These checks enforce runtime rules even when the supplied simulation would accept an impossible history. See [the replay authority decision](docs/adr/0002-replay-authority.md).
+
 For process-hosted matches, use `prepare_match_host_for_recovery` plus `serve_prepared_match_host_with_status_and_control_and_shutdown`. The demo server enables this path with `GAME_SERVER_MATCH_IDS` and `GAME_SERVER_RECOVERY_DIR`; `GAME_SERVER_RECOVERY_PATH` remains single-match only.
 
 A hosted recovery directory is a versioned bundle containing an exact sorted match manifest and one existing `RecoveryImage` per `MatchId`:
@@ -95,3 +103,7 @@ On graceful hosted shutdown, new admissions drain first. After the grace window 
 The hosted restart acceptance proves independent reconnect tokens, connection epochs, command watermarks, and simulation continuity across two matches. It also corrupts only one match image and verifies that startup rejects the complete bundle without consuming the healthy match or silently replacing the failed match with fresh authoritative state.
 
 See `ROADMAP.md` for the extraction plan and ownership boundaries.
+
+## Performance evidence
+
+The opt-in [benchmark suite](benchmarks/README.md) measures live commands, ticks, shared snapshot fan-out, replay encoding/verification, and recovery. Versioned before/after receipts retain raw samples and source/environment fingerprints. Ordinary tests remain independent of timing thresholds.

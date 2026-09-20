@@ -21,6 +21,8 @@ jobs:
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Test
         run: cargo test --locked --all-targets --all-features
+      - name: Test benchmark comparison rules
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s benchmarks -p 'test_*.py'
       - name: Release build
         run: cargo build --locked --release --all-features
       - name: Build WebTransport probes

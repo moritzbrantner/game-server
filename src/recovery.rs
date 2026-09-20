@@ -1,5 +1,5 @@
 use crate::protocol::{PlayerId, RECONNECT_TOKEN_BYTES};
-use crate::replay::{ReplayError, ReplayLog, ReplayRecord};
+use crate::replay::{ReplayError, ReplayLog, ReplayRecord, replay_into};
 use crate::session::{
     ReconnectToken, RecoverableSession, SessionRecoveryError, SessionRecoverySnapshot,
 };
@@ -39,6 +39,7 @@ pub enum RecoveryError {
         actual: Option<u64>,
     },
     ReplayPlayerSetMismatch,
+    MissingFinalCheckpoint,
     ReplayTickGapTooLarge {
         from_tick: u64,
         to_tick: u64,
@@ -76,6 +77,10 @@ impl fmt::Display for RecoveryError {
                 formatter,
                 "recovery replay final tick {:?} does not match image tick {expected}",
                 actual
+            ),
+            Self::MissingFinalCheckpoint => write!(
+                formatter,
+                "recovery replay must end with an authoritative checkpoint"
             ),
             Self::ReplayPlayerSetMismatch => {
                 write!(
@@ -319,70 +324,26 @@ impl RecoveryImage {
 
     pub(crate) fn restore_simulation<S: GameSimulation>(
         &self,
-        mut simulation: S,
+        simulation: S,
     ) -> Result<S, RecoveryError> {
-        let mut previous_tick = None;
-        for record in self.replay.records() {
-            let record_tick = record.tick();
-            if previous_tick.is_some_and(|previous| record_tick < previous) {
-                return Err(RecoveryError::Replay(ReplayError::NonMonotonicTick {
-                    previous: previous_tick.expect("checked previous recovery tick"),
-                    actual: record_tick,
-                }));
-            }
-            let simulation_tick = simulation.current_tick();
-            if record_tick < simulation_tick {
-                return Err(RecoveryError::ReplayStartsBeforeSimulation {
+        let (simulation, _) =
+            replay_into(simulation, &self.replay).map_err(|error| match error {
+                ReplayError::TickGapTooLarge {
+                    from_tick, to_tick, ..
+                } => RecoveryError::ReplayTickGapTooLarge { from_tick, to_tick },
+                ReplayError::ReplayStartsBeforeSimulation {
                     simulation_tick,
                     record_tick,
-                });
-            }
-            let gap = record_tick - simulation_tick;
-            if gap > MAX_REPLAY_TICK_GAP {
-                return Err(RecoveryError::ReplayTickGapTooLarge {
-                    from_tick: simulation_tick,
-                    to_tick: record_tick,
-                });
-            }
-            if gap == 1 {
-                simulation.advance_tick()?;
-            }
-
-            match record {
-                ReplayRecord::PlayerAdmitted { player_id, .. } => {
-                    simulation.add_player(*player_id)?;
+                } => RecoveryError::ReplayStartsBeforeSimulation {
+                    simulation_tick,
+                    record_tick,
+                },
+                ReplayError::MissingPlayerOnRemoval(player_id) => {
+                    RecoveryError::MissingPlayerOnRemoval(player_id)
                 }
-                ReplayRecord::CommandApplied {
-                    player_id,
-                    sequence,
-                    payload,
-                    ..
-                } => {
-                    simulation.apply_command(*player_id, *sequence, payload)?;
-                }
-                ReplayRecord::PlayerRemoved { player_id, .. } => {
-                    if !simulation.remove_player(*player_id) {
-                        return Err(RecoveryError::MissingPlayerOnRemoval(*player_id));
-                    }
-                }
-                ReplayRecord::Checkpoint { snapshot } => {
-                    let actual = simulation.snapshot()?;
-                    if actual.state_hash != snapshot.state_hash {
-                        return Err(RecoveryError::Replay(ReplayError::CheckpointMismatch {
-                            tick: snapshot.tick,
-                            expected_hash: snapshot.state_hash,
-                            actual_hash: actual.state_hash,
-                        }));
-                    }
-                    if actual.payload != snapshot.payload {
-                        return Err(RecoveryError::Replay(
-                            ReplayError::CheckpointPayloadMismatch(snapshot.tick),
-                        ));
-                    }
-                }
-            }
-            previous_tick = Some(record_tick);
-        }
+                ReplayError::Simulation(error) => RecoveryError::Simulation(error),
+                error => RecoveryError::Replay(error),
+            })?;
 
         if simulation.current_tick() != self.current_tick {
             return Err(RecoveryError::ReplayTickMismatch {
@@ -400,6 +361,13 @@ impl RecoveryImage {
                 expected: self.current_tick,
                 actual: final_tick,
             });
+        }
+
+        if !matches!(
+            self.replay.records().last(),
+            Some(ReplayRecord::Checkpoint { .. })
+        ) {
+            return Err(RecoveryError::MissingFinalCheckpoint);
         }
 
         let mut live_players = BTreeSet::new();
@@ -600,5 +568,26 @@ mod tests {
             "game-server-recovery-{}-{nonce}.bin",
             std::process::id()
         ))
+    }
+    #[test]
+    fn recovery_rejects_mutation_after_the_final_checkpoint() {
+        let mut image = image();
+        let mut encoded = image.encode().unwrap();
+        image.replay.append(ReplayRecord::CommandApplied {
+            tick: image.current_tick,
+            player_id: 1,
+            sequence: 2,
+            payload: encode_demo_command(-1, 0).unwrap().to_vec(),
+        });
+        // Preserve a structurally valid envelope around an unchecked replay tail.
+        let replay = image.replay.encode().unwrap();
+        encoded[27..31].copy_from_slice(&(replay.len() as u32).to_be_bytes());
+        encoded.truncate(HEADER_BYTES + SESSION_BYTES);
+        encoded.extend_from_slice(&replay);
+        assert!(
+            RecoveryImage::decode(&encoded).is_err(),
+            "recovery accepted state changes after its final integrity checkpoint"
+        );
+        assert!(image.encode().is_err());
     }
 }
