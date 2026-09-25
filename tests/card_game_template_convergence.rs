@@ -203,7 +203,7 @@ fn run_through_match_runtime(
     let simulation = ExternalSimulationAdapter::connect(bridge).expect("fixture must describe");
     let descriptor = simulation.descriptor();
 
-    assert_eq!(descriptor.versionless_tick_hz_for_test(), fixture.tick_hz);
+    assert_eq!(descriptor.tick_hz, fixture.tick_hz);
 
     let mut runtime = MatchRuntime::new_with_replay_capture(simulation, 10);
     assert_eq!(runtime.tick_hz(), fixture.tick_hz);
