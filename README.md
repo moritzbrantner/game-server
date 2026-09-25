@@ -44,6 +44,18 @@ Both shared and player-scoped delivery validate the current connection epoch und
 
 This boundary is intended for hidden-information games such as card games. It keeps visibility policy in the supplied game simulation rather than duplicating game rules in WebTransport handlers.
 
+## External simulation boundary
+
+`ExternalSimulationAdapter` lets a deterministic simulation implemented outside Rust participate in the existing `GameSimulation` authority boundary. The external side receives only simulation operations: describe, add/remove player, apply an already-sequenced command, advance exactly one tick, and produce canonical or player-scoped snapshots. It does not admit sessions, allocate player IDs, choose command ordering, schedule ticks, manage reconnects, or write replay/recovery evidence.
+
+The byte contract is versioned independently as `EXTERNAL_SIMULATION_PROTOCOL_VERSION`. Requests and responses carry an operation code and use bounded big-endian fields. Command and snapshot payload ceilings are the same as the normal game protocol; remote error payloads are capped at 1 KiB. Snapshot responses include their tick and state hash, which the Rust adapter verifies before exposing them to the runtime. `EXTERNAL_SIMULATION_PROTOCOL_CONTRACT` publishes the current version and bounds for bridge implementations.
+
+The adapter caches only immutable descriptor data and the runtime-observed tick. A successful external tick must advance by exactly one. Snapshot reads must report that same tick. Mismatched versions, operations, lengths, hashes, response shapes, or ticks fail closed.
+
+Existing Rust simulations keep the infallible `remove_player` compatibility method. Runtime, replay, and recovery now use `try_remove_player`, whose default delegates to `remove_player`; external simulations override it so bridge failures cannot be mistaken for a successful session expiry.
+
+See [the external simulation authority decision](docs/adr/0003-external-simulation-authority.md).
+
 ## Reliable control
 
 Realtime game commands and latest authoritative snapshots use WebTransport datagrams. Transactional/session control uses an independent versioned request/response frame over bidirectional WebTransport streams. Each payload is bounded to 4 KiB, each exchange is time-bounded to five seconds, and each connection can have at most four control exchanges in flight.
