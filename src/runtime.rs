@@ -270,7 +270,16 @@ impl<S: GameSimulation> MatchRuntime<S> {
         if self.frozen || !self.sessions.owns_connection(player_id, connection_epoch) {
             return Ok(false);
         }
-        if !self.simulation.try_remove_player(player_id)? {
+        let removed = match self.simulation.try_remove_player(player_id) {
+            Ok(removed) => removed,
+            Err(error) => {
+                let current_tick = self.current_tick();
+                self.sessions
+                    .disconnect(player_id, connection_epoch, current_tick);
+                return Err(error.into());
+            }
+        };
+        if !removed {
             return Ok(false);
         }
         if !self.sessions.remove_slot(player_id) {
