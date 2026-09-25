@@ -50,7 +50,7 @@ This boundary is intended for hidden-information games such as card games. It ke
 
 The byte contract is versioned independently as `EXTERNAL_SIMULATION_PROTOCOL_VERSION`. Requests and responses carry an operation code and use bounded big-endian fields. Command and snapshot payload ceilings are the same as the normal game protocol; remote error payloads are capped at 1 KiB. Snapshot responses include their tick and state hash, which the Rust adapter verifies before exposing them to the runtime. `EXTERNAL_SIMULATION_PROTOCOL_CONTRACT` publishes the current version and bounds for bridge implementations.
 
-The adapter caches only immutable descriptor data and the runtime-observed tick. A successful external tick must advance by exactly one. Snapshot reads must report that same tick. Mismatched versions, operations, lengths, hashes, response shapes, or ticks fail closed.
+The adapter caches only immutable descriptor data and the runtime-observed tick. Every advance request carries the exact target tick, so a bridge that applied a tick but lost its response can return that already-completed target on retry instead of advancing twice. A successful external tick must advance by exactly one from the runtime's last observed tick. Snapshot reads must report that same tick. Mismatched versions, operations, lengths, hashes, response shapes, or ticks fail closed.
 
 Existing Rust simulations keep the infallible `remove_player` compatibility method. Runtime, replay, and recovery now use `try_remove_player`, whose default delegates to `remove_player`; external simulations override it so bridge failures cannot be mistaken for a successful session expiry.
 
