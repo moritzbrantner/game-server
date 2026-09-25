@@ -214,6 +214,7 @@ fn rollback_failed_welcome<S: GameSimulation>(
     match admission {
         AdmissionRequest::New => runtime
             .abort_admission(lease.player_id, lease.connection_epoch)
+            .map_err(|error| error.to_string())?
             .then_some(())
             .ok_or_else(|| "failed to release incomplete new admission".to_owned()),
         AdmissionRequest::Reconnect(previous_token) => {
