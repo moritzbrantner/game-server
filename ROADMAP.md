@@ -81,9 +81,17 @@ The region/process-placement experiments in `server-lab` remain evidence for thi
 
 `GameSimulation::snapshot()` remains the canonical deterministic state used for replay and recovery. Hidden-information games opt into `SnapshotScope::PlayerScoped` and provide `snapshot_for(player_id)`; the transport then broadcasts only an update signal and encodes the authenticated player's projection per connection. Transport code therefore never becomes an authority for hand visibility or other game-specific secrecy rules.
 
-### Next slices
+### Slice G2 — deterministic external simulation adapter — completed
 
-- [ ] Add the deterministic external-simulation adapter boundary needed to host non-Rust game logic without copying rules into this repository.
+- [x] Add a versioned, bounded request/response contract for deterministic non-Rust simulation hosts.
+- [x] Adapt that contract into the existing `GameSimulation` seam without moving runtime authority into the bridge.
+- [x] Fail closed on malformed responses, tick drift, snapshot hash drift, bridge rejection, and fallible player removal.
+- [x] Prove replay reconstruction and player-scoped projection through an in-memory foreign-runtime fixture.
+
+The external adapter receives runtime-owned player IDs, accepted command sequences, and one-tick advance requests. It returns simulation acknowledgements and snapshots only. Admission, identity allocation, stale-command rejection, tick scheduling, replay capture, recovery, reconnect fencing, and snapshot publication remain in `game-server`. The protocol is transport-neutral: a consumer can back `ExternalSimulationBridge` with an embedded VM, FFI, or a bounded local process channel without changing the server authority model.
+
+### Next slice
+
 - [ ] Add a cross-repository fixture with `card-game-template` proving that local and server-hosted accepted moves converge to the same deterministic replay fingerprint.
 
 ## Deliberately out of scope
