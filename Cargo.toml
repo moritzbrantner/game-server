@@ -18,7 +18,7 @@ default = []
 physics = ["dep:physics-engine"]
 
 [dependencies]
-physics-engine = { git = "https://github.com/moritzbrantner/physics-engine.git", rev = "8ea513395ad6893e45da7d6fa983b6cd3949a4ac", optional = true }
+physics-engine = { git = "https://github.com/moritzbrantner/physics-engine.git", rev = "e75794af9ef0120dfa6a0559fb50d9939e8bc8ce", optional = true }
 ring = "0.17.14"
 tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 wtransport = { version = "0.7.2", default-features = false, features = ["ring"] }
