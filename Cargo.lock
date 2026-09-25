@@ -563,7 +563,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 [[package]]
 name = "physics-engine"
 version = "0.1.0"
-source = "git+https://github.com/moritzbrantner/physics-engine.git?rev=8ea513395ad6893e45da7d6fa983b6cd3949a4ac#8ea513395ad6893e45da7d6fa983b6cd3949a4ac"
+source = "git+https://github.com/moritzbrantner/physics-engine.git?rev=e75794af9ef0120dfa6a0559fb50d9939e8bc8ce#e75794af9ef0120dfa6a0559fb50d9939e8bc8ce"
 
 [[package]]
 name = "pin-project-lite"
