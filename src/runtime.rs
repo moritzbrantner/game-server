@@ -262,22 +262,26 @@ impl<S: GameSimulation> MatchRuntime<S> {
             .disconnect(player_id, connection_epoch, current_tick)
     }
 
-    pub(crate) fn abort_admission(&mut self, player_id: PlayerId, connection_epoch: u32) -> bool {
+    pub(crate) fn abort_admission(
+        &mut self,
+        player_id: PlayerId,
+        connection_epoch: u32,
+    ) -> Result<bool, RuntimeError> {
         if self.frozen || !self.sessions.owns_connection(player_id, connection_epoch) {
-            return false;
+            return Ok(false);
         }
-        if !self.simulation.remove_player(player_id) {
-            return false;
+        if !self.simulation.try_remove_player(player_id)? {
+            return Ok(false);
         }
         if !self.sessions.remove_slot(player_id) {
-            return false;
+            return Ok(false);
         }
         self.last_sequences.remove(&player_id);
         self.record(ReplayRecord::PlayerRemoved {
             tick: self.current_tick(),
             player_id,
         });
-        true
+        Ok(true)
     }
 
     pub(crate) fn validate_connection(
@@ -339,9 +343,15 @@ impl<S: GameSimulation> MatchRuntime<S> {
             return Err(RuntimeError::Frozen);
         }
         let current_tick = self.current_tick();
-        let expired = self.sessions.expire(current_tick);
+        let expired = self.sessions.expired_player_ids(current_tick);
         for player_id in expired {
-            self.simulation.remove_player(player_id);
+            if !self.simulation.try_remove_player(player_id)? {
+                return Err(SimulationError::new(format!(
+                    "simulation did not contain expired player {player_id}"
+                ))
+                .into());
+            }
+            self.sessions.remove_slot(player_id);
             self.last_sequences.remove(&player_id);
             self.record(ReplayRecord::PlayerRemoved {
                 tick: current_tick,
@@ -683,7 +693,11 @@ mod tests {
         let mut runtime = MatchRuntime::new_with_replay_capture(FakeSimulation::default(), 10);
         let lease = runtime.admit(token(1)).unwrap();
 
-        assert!(runtime.abort_admission(lease.player_id, lease.connection_epoch));
+        assert!(
+            runtime
+                .abort_admission(lease.player_id, lease.connection_epoch)
+                .unwrap()
+        );
         assert_eq!(runtime.slot_count(), 0);
         assert_eq!(runtime.active_count(), 0);
         assert!(runtime.simulation.players.is_empty());
