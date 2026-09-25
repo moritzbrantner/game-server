@@ -1,4 +1,6 @@
-use crate::protocol::{MAX_COMMAND_PAYLOAD_BYTES, MAX_SNAPSHOT_PAYLOAD_BYTES, PlayerId, snapshot_hash};
+use crate::protocol::{
+    MAX_COMMAND_PAYLOAD_BYTES, MAX_SNAPSHOT_PAYLOAD_BYTES, PlayerId, snapshot_hash,
+};
 use crate::simulation::{GameSimulation, SimulationError, SimulationSnapshot, SnapshotScope};
 use std::fmt;
 
@@ -166,15 +168,26 @@ impl ExternalSimulationError {
 impl fmt::Display for ExternalSimulationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Bridge(message) => write!(formatter, "external simulation bridge failed: {message}"),
+            Self::Bridge(message) => {
+                write!(formatter, "external simulation bridge failed: {message}")
+            }
             Self::UnsupportedVersion(version) => {
-                write!(formatter, "unsupported external simulation protocol version {version}")
+                write!(
+                    formatter,
+                    "unsupported external simulation protocol version {version}"
+                )
             }
             Self::UnknownOperation(operation) => {
-                write!(formatter, "unknown external simulation operation {operation}")
+                write!(
+                    formatter,
+                    "unknown external simulation operation {operation}"
+                )
             }
             Self::UnexpectedStatus(status) => {
-                write!(formatter, "unexpected external simulation response status {status}")
+                write!(
+                    formatter,
+                    "unexpected external simulation response status {status}"
+                )
             }
             Self::UnexpectedOperation { expected, actual } => write!(
                 formatter,
@@ -193,27 +206,41 @@ impl fmt::Display for ExternalSimulationError {
                 "external simulation payload size {actual} exceeds maximum {maximum}"
             ),
             Self::InvalidSequence => {
-                write!(formatter, "external simulation command sequence must be non-zero")
+                write!(
+                    formatter,
+                    "external simulation command sequence must be non-zero"
+                )
             }
             Self::InvalidSnapshotScope(scope) => {
-                write!(formatter, "invalid external simulation snapshot scope {scope}")
+                write!(
+                    formatter,
+                    "invalid external simulation snapshot scope {scope}"
+                )
             }
             Self::InvalidBoolean(value) => {
                 write!(formatter, "invalid external simulation boolean {value}")
             }
-            Self::InvalidUtf8 => write!(formatter, "external simulation error payload is not UTF-8"),
+            Self::InvalidUtf8 => {
+                write!(formatter, "external simulation error payload is not UTF-8")
+            }
             Self::InvalidStateHash { expected, actual } => write!(
                 formatter,
                 "external simulation snapshot hash mismatch: expected {expected:#018x}, got {actual:#018x}"
             ),
             Self::InvalidDescriptor(message) => {
-                write!(formatter, "invalid external simulation descriptor: {message}")
+                write!(
+                    formatter,
+                    "invalid external simulation descriptor: {message}"
+                )
             }
             Self::TickMismatch { expected, actual } => write!(
                 formatter,
                 "external simulation tick mismatch: expected {expected}, got {actual}"
             ),
-            Self::Remote(message) => write!(formatter, "external simulation rejected operation: {message}"),
+            Self::Remote(message) => write!(
+                formatter,
+                "external simulation rejected operation: {message}"
+            ),
         }
     }
 }
@@ -340,12 +367,10 @@ impl<B: ExternalSimulationBridge> GameSimulation for ExternalSimulationAdapter<B
             .exchange(ExternalSimulationRequest::RemovePlayer(player_id))
             .map_err(ExternalSimulationError::into_simulation_error)?;
         let ExternalSimulationResponse::PlayerRemoved(removed) = response else {
-            return Err(
-                ExternalSimulationError::UnexpectedResponse(
-                    ExternalSimulationOperation::RemovePlayer,
-                )
-                .into_simulation_error(),
-            );
+            return Err(ExternalSimulationError::UnexpectedResponse(
+                ExternalSimulationOperation::RemovePlayer,
+            )
+            .into_simulation_error());
         };
         Ok(removed)
     }
@@ -366,12 +391,10 @@ impl<B: ExternalSimulationBridge> GameSimulation for ExternalSimulationAdapter<B
         if response == ExternalSimulationResponse::Acknowledged {
             Ok(())
         } else {
-            Err(
-                ExternalSimulationError::UnexpectedResponse(
-                    ExternalSimulationOperation::ApplyCommand,
-                )
-                .into_simulation_error(),
+            Err(ExternalSimulationError::UnexpectedResponse(
+                ExternalSimulationOperation::ApplyCommand,
             )
+            .into_simulation_error())
         }
     }
 
@@ -384,12 +407,10 @@ impl<B: ExternalSimulationBridge> GameSimulation for ExternalSimulationAdapter<B
             .exchange(ExternalSimulationRequest::AdvanceTick)
             .map_err(ExternalSimulationError::into_simulation_error)?;
         let ExternalSimulationResponse::TickAdvanced(actual) = response else {
-            return Err(
-                ExternalSimulationError::UnexpectedResponse(
-                    ExternalSimulationOperation::AdvanceTick,
-                )
-                .into_simulation_error(),
-            );
+            return Err(ExternalSimulationError::UnexpectedResponse(
+                ExternalSimulationOperation::AdvanceTick,
+            )
+            .into_simulation_error());
         };
         if actual != expected {
             return Err(
@@ -511,33 +532,27 @@ pub fn decode_external_simulation_request(
                     actual: bytes.len(),
                 });
             }
-            let player_id = u32::from_be_bytes(
-                bytes[2..6]
-                    .try_into()
-                    .map_err(|_| ExternalSimulationError::IncorrectLength {
-                        expected: COMMAND_REQUEST_FIXED_BYTES,
-                        actual: bytes.len(),
-                    })?,
-            );
-            let sequence = u32::from_be_bytes(
-                bytes[6..10]
-                    .try_into()
-                    .map_err(|_| ExternalSimulationError::IncorrectLength {
-                        expected: COMMAND_REQUEST_FIXED_BYTES,
-                        actual: bytes.len(),
-                    })?,
-            );
+            let player_id = u32::from_be_bytes(bytes[2..6].try_into().map_err(|_| {
+                ExternalSimulationError::IncorrectLength {
+                    expected: COMMAND_REQUEST_FIXED_BYTES,
+                    actual: bytes.len(),
+                }
+            })?);
+            let sequence = u32::from_be_bytes(bytes[6..10].try_into().map_err(|_| {
+                ExternalSimulationError::IncorrectLength {
+                    expected: COMMAND_REQUEST_FIXED_BYTES,
+                    actual: bytes.len(),
+                }
+            })?);
             if sequence == 0 {
                 return Err(ExternalSimulationError::InvalidSequence);
             }
-            let payload_len = usize::from(u16::from_be_bytes(
-                bytes[10..12]
-                    .try_into()
-                    .map_err(|_| ExternalSimulationError::IncorrectLength {
-                        expected: COMMAND_REQUEST_FIXED_BYTES,
-                        actual: bytes.len(),
-                    })?,
-            ));
+            let payload_len = usize::from(u16::from_be_bytes(bytes[10..12].try_into().map_err(
+                |_| ExternalSimulationError::IncorrectLength {
+                    expected: COMMAND_REQUEST_FIXED_BYTES,
+                    actual: bytes.len(),
+                },
+            )?));
             if payload_len > MAX_COMMAND_PAYLOAD_BYTES {
                 return Err(ExternalSimulationError::PayloadTooLarge {
                     maximum: MAX_COMMAND_PAYLOAD_BYTES,
@@ -584,7 +599,10 @@ pub fn encode_external_simulation_response(
 
     output.push(STATUS_OK);
     match (operation, response) {
-        (ExternalSimulationOperation::Describe, ExternalSimulationResponse::Descriptor(descriptor)) => {
+        (
+            ExternalSimulationOperation::Describe,
+            ExternalSimulationResponse::Descriptor(descriptor),
+        ) => {
             validate_descriptor(*descriptor)?;
             output.extend_from_slice(&descriptor.tick_hz.to_be_bytes());
             output.extend_from_slice(&descriptor.max_players.to_be_bytes());
@@ -651,30 +669,24 @@ fn decode_success_response(
         ExternalSimulationOperation::Describe => {
             const LENGTH: usize = RESPONSE_HEADER_BYTES + 2 + 2 + 8 + 1;
             require_length(bytes, LENGTH)?;
-            let tick_hz = u16::from_be_bytes(
-                bytes[3..5]
-                    .try_into()
-                    .map_err(|_| ExternalSimulationError::IncorrectLength {
-                        expected: LENGTH,
-                        actual: bytes.len(),
-                    })?,
-            );
-            let max_players = u16::from_be_bytes(
-                bytes[5..7]
-                    .try_into()
-                    .map_err(|_| ExternalSimulationError::IncorrectLength {
-                        expected: LENGTH,
-                        actual: bytes.len(),
-                    })?,
-            );
-            let current_tick = u64::from_be_bytes(
-                bytes[7..15]
-                    .try_into()
-                    .map_err(|_| ExternalSimulationError::IncorrectLength {
-                        expected: LENGTH,
-                        actual: bytes.len(),
-                    })?,
-            );
+            let tick_hz = u16::from_be_bytes(bytes[3..5].try_into().map_err(|_| {
+                ExternalSimulationError::IncorrectLength {
+                    expected: LENGTH,
+                    actual: bytes.len(),
+                }
+            })?);
+            let max_players = u16::from_be_bytes(bytes[5..7].try_into().map_err(|_| {
+                ExternalSimulationError::IncorrectLength {
+                    expected: LENGTH,
+                    actual: bytes.len(),
+                }
+            })?);
+            let current_tick = u64::from_be_bytes(bytes[7..15].try_into().map_err(|_| {
+                ExternalSimulationError::IncorrectLength {
+                    expected: LENGTH,
+                    actual: bytes.len(),
+                }
+            })?);
             let descriptor = ExternalSimulationDescriptor {
                 tick_hz,
                 max_players,
@@ -700,14 +712,13 @@ fn decode_success_response(
         ExternalSimulationOperation::AdvanceTick => {
             const LENGTH: usize = RESPONSE_HEADER_BYTES + 8;
             require_length(bytes, LENGTH)?;
-            let tick = u64::from_be_bytes(
-                bytes[RESPONSE_HEADER_BYTES..LENGTH]
-                    .try_into()
-                    .map_err(|_| ExternalSimulationError::IncorrectLength {
+            let tick =
+                u64::from_be_bytes(bytes[RESPONSE_HEADER_BYTES..LENGTH].try_into().map_err(
+                    |_| ExternalSimulationError::IncorrectLength {
                         expected: LENGTH,
                         actual: bytes.len(),
-                    })?,
-            );
+                    },
+                )?);
             ExternalSimulationResponse::TickAdvanced(tick)
         }
         ExternalSimulationOperation::Snapshot | ExternalSimulationOperation::SnapshotFor => {
@@ -754,30 +765,24 @@ fn decode_snapshot_body(bytes: &[u8]) -> Result<SimulationSnapshot, ExternalSimu
             actual: bytes.len(),
         });
     }
-    let tick = u64::from_be_bytes(
-        bytes[3..11]
-            .try_into()
-            .map_err(|_| ExternalSimulationError::IncorrectLength {
-                expected: SNAPSHOT_RESPONSE_FIXED_BYTES,
-                actual: bytes.len(),
-            })?,
-    );
-    let state_hash = u64::from_be_bytes(
-        bytes[11..19]
-            .try_into()
-            .map_err(|_| ExternalSimulationError::IncorrectLength {
-                expected: SNAPSHOT_RESPONSE_FIXED_BYTES,
-                actual: bytes.len(),
-            })?,
-    );
-    let payload_len = usize::from(u16::from_be_bytes(
-        bytes[19..21]
-            .try_into()
-            .map_err(|_| ExternalSimulationError::IncorrectLength {
-                expected: SNAPSHOT_RESPONSE_FIXED_BYTES,
-                actual: bytes.len(),
-            })?,
-    ));
+    let tick = u64::from_be_bytes(bytes[3..11].try_into().map_err(|_| {
+        ExternalSimulationError::IncorrectLength {
+            expected: SNAPSHOT_RESPONSE_FIXED_BYTES,
+            actual: bytes.len(),
+        }
+    })?);
+    let state_hash = u64::from_be_bytes(bytes[11..19].try_into().map_err(|_| {
+        ExternalSimulationError::IncorrectLength {
+            expected: SNAPSHOT_RESPONSE_FIXED_BYTES,
+            actual: bytes.len(),
+        }
+    })?);
+    let payload_len = usize::from(u16::from_be_bytes(bytes[19..21].try_into().map_err(
+        |_| ExternalSimulationError::IncorrectLength {
+            expected: SNAPSHOT_RESPONSE_FIXED_BYTES,
+            actual: bytes.len(),
+        },
+    )?));
     if payload_len > MAX_SNAPSHOT_PAYLOAD_BYTES {
         return Err(ExternalSimulationError::PayloadTooLarge {
             maximum: MAX_SNAPSHOT_PAYLOAD_BYTES,
@@ -900,10 +905,7 @@ mod tests {
         }
 
         fn with_rejected_removal(self) -> Self {
-            self.state
-                .lock()
-                .expect("test bridge mutex")
-                .reject_removal = true;
+            self.state.lock().expect("test bridge mutex").reject_removal = true;
             self
         }
 
