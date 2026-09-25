@@ -242,8 +242,12 @@ impl<B: ExternalSimulationBridge> ExternalSimulationAdapter<B> {
                 actual: operation,
             });
         }
-        let ExternalSimulationResponse::Descriptor(descriptor) = response else {
-            return Err(ExternalSimulationError::UnexpectedResponse(operation));
+        let descriptor = match response {
+            ExternalSimulationResponse::Descriptor(descriptor) => descriptor,
+            ExternalSimulationResponse::Rejected(message) => {
+                return Err(ExternalSimulationError::Remote(message));
+            }
+            _ => return Err(ExternalSimulationError::UnexpectedResponse(operation)),
         };
         validate_descriptor(descriptor)?;
         Ok(Self {
@@ -567,10 +571,10 @@ pub fn encode_external_simulation_response(
     output.push(operation.code());
 
     if let ExternalSimulationResponse::Rejected(message) = response {
-        if message.as_bytes().len() > MAX_EXTERNAL_SIMULATION_ERROR_BYTES {
+        if message.len() > MAX_EXTERNAL_SIMULATION_ERROR_BYTES {
             return Err(ExternalSimulationError::PayloadTooLarge {
                 maximum: MAX_EXTERNAL_SIMULATION_ERROR_BYTES,
-                actual: message.as_bytes().len(),
+                actual: message.len(),
             });
         }
         output.push(STATUS_ERROR);
