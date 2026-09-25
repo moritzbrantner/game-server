@@ -91,7 +91,9 @@ pub enum ExternalSimulationRequest {
         sequence: u32,
         payload: Vec<u8>,
     },
-    AdvanceTick,
+    AdvanceTick {
+        target_tick: u64,
+    },
     Snapshot,
     SnapshotFor(PlayerId),
 }
@@ -103,7 +105,7 @@ impl ExternalSimulationRequest {
             Self::AddPlayer(_) => ExternalSimulationOperation::AddPlayer,
             Self::RemovePlayer(_) => ExternalSimulationOperation::RemovePlayer,
             Self::ApplyCommand { .. } => ExternalSimulationOperation::ApplyCommand,
-            Self::AdvanceTick => ExternalSimulationOperation::AdvanceTick,
+            Self::AdvanceTick { .. } => ExternalSimulationOperation::AdvanceTick,
             Self::Snapshot => ExternalSimulationOperation::Snapshot,
             Self::SnapshotFor(_) => ExternalSimulationOperation::SnapshotFor,
         }
@@ -404,7 +406,9 @@ impl<B: ExternalSimulationBridge> GameSimulation for ExternalSimulationAdapter<B
             .checked_add(1)
             .ok_or_else(|| SimulationError::new("external simulation tick exhausted u64"))?;
         let response = self
-            .exchange(ExternalSimulationRequest::AdvanceTick)
+            .exchange(ExternalSimulationRequest::AdvanceTick {
+                target_tick: expected,
+            })
             .map_err(ExternalSimulationError::into_simulation_error)?;
         let ExternalSimulationResponse::TickAdvanced(actual) = response else {
             return Err(ExternalSimulationError::UnexpectedResponse(
@@ -446,9 +450,10 @@ pub fn encode_external_simulation_request(
     output.push(EXTERNAL_SIMULATION_PROTOCOL_VERSION);
     output.push(request.operation().code());
     match request {
-        ExternalSimulationRequest::Describe
-        | ExternalSimulationRequest::AdvanceTick
-        | ExternalSimulationRequest::Snapshot => {}
+        ExternalSimulationRequest::Describe | ExternalSimulationRequest::Snapshot => {}
+        ExternalSimulationRequest::AdvanceTick { target_tick } => {
+            output.extend_from_slice(&target_tick.to_be_bytes());
+        }
         ExternalSimulationRequest::AddPlayer(player_id)
         | ExternalSimulationRequest::RemovePlayer(player_id)
         | ExternalSimulationRequest::SnapshotFor(player_id) => {
@@ -567,8 +572,17 @@ pub fn decode_external_simulation_request(
             })
         }
         ExternalSimulationOperation::AdvanceTick => {
-            require_length(bytes, REQUEST_HEADER_BYTES)?;
-            Ok(ExternalSimulationRequest::AdvanceTick)
+            const LENGTH: usize = REQUEST_HEADER_BYTES + 8;
+            require_length(bytes, LENGTH)?;
+            let target_tick = u64::from_be_bytes(
+                bytes[REQUEST_HEADER_BYTES..LENGTH]
+                    .try_into()
+                    .map_err(|_| ExternalSimulationError::IncorrectLength {
+                        expected: LENGTH,
+                        actual: bytes.len(),
+                    })?,
+            );
+            Ok(ExternalSimulationRequest::AdvanceTick { target_tick })
         }
         ExternalSimulationOperation::Snapshot => {
             require_length(bytes, REQUEST_HEADER_BYTES)?;
@@ -881,6 +895,7 @@ mod tests {
         players: BTreeMap<PlayerId, u8>,
         command_calls: usize,
         reject_removal: bool,
+        drop_next_advance_response: bool,
     }
 
     #[derive(Clone, Debug)]
@@ -909,8 +924,24 @@ mod tests {
             self
         }
 
+        fn with_dropped_advance_response(self) -> Self {
+            self.state
+                .lock()
+                .expect("test bridge mutex")
+                .drop_next_advance_response = true;
+            self
+        }
+
+        fn allow_removal(&self) {
+            self.state.lock().expect("test bridge mutex").reject_removal = false;
+        }
+
         fn command_calls(&self) -> usize {
             self.state.lock().expect("test bridge mutex").command_calls
+        }
+
+        fn foreign_tick(&self) -> u64 {
+            self.state.lock().expect("test bridge mutex").tick
         }
     }
 
@@ -922,6 +953,13 @@ mod tests {
                 .state
                 .lock()
                 .map_err(|_| ExternalSimulationError::bridge("test bridge mutex poisoned"))?;
+            let drop_advance_response = matches!(
+                &request,
+                ExternalSimulationRequest::AdvanceTick { .. }
+            ) && game.drop_next_advance_response;
+            if drop_advance_response {
+                game.drop_next_advance_response = false;
+            }
             let response = match request {
                 ExternalSimulationRequest::Describe => {
                     ExternalSimulationResponse::Descriptor(ExternalSimulationDescriptor {
@@ -966,15 +1004,18 @@ mod tests {
                         ),
                     }
                 }
-                ExternalSimulationRequest::AdvanceTick => {
-                    let Some(next) = game.tick.checked_add(1) else {
-                        return encode_external_simulation_response(
-                            operation,
-                            &ExternalSimulationResponse::Rejected("tick exhausted".to_owned()),
-                        );
-                    };
-                    game.tick = next;
-                    ExternalSimulationResponse::TickAdvanced(next)
+                ExternalSimulationRequest::AdvanceTick { target_tick } => {
+                    if game.tick == target_tick {
+                        ExternalSimulationResponse::TickAdvanced(target_tick)
+                    } else if game.tick.checked_add(1) == Some(target_tick) {
+                        game.tick = target_tick;
+                        ExternalSimulationResponse::TickAdvanced(target_tick)
+                    } else {
+                        ExternalSimulationResponse::Rejected(format!(
+                            "target tick {target_tick} cannot follow external tick {}",
+                            game.tick
+                        ))
+                    }
                 }
                 ExternalSimulationRequest::Snapshot => {
                     ExternalSimulationResponse::Snapshot(canonical_snapshot(&game))
@@ -994,6 +1035,11 @@ mod tests {
                     }
                 }
             };
+            if drop_advance_response {
+                return Err(ExternalSimulationError::bridge(
+                    "simulated lost advance response",
+                ));
+            }
             encode_external_simulation_response(operation, &response)
         }
     }
@@ -1017,6 +1063,13 @@ mod tests {
             })
             .unwrap(),
             vec![1, 4, 0, 0, 0, 1, 0, 0, 0, 2, 0, 1, 0xaa]
+        );
+        assert_eq!(
+            encode_external_simulation_request(&ExternalSimulationRequest::AdvanceTick {
+                target_tick: 7,
+            })
+            .unwrap(),
+            vec![1, 5, 0, 0, 0, 0, 0, 0, 0, 7]
         );
 
         let descriptor = ExternalSimulationResponse::Descriptor(ExternalSimulationDescriptor {
@@ -1067,6 +1120,23 @@ mod tests {
     }
 
     #[test]
+    fn ambiguous_advance_response_retries_the_same_target_tick() {
+        let bridge = LoopbackBridge::shared().with_dropped_advance_response();
+        let observer = bridge.clone();
+        let mut simulation = ExternalSimulationAdapter::connect(bridge).unwrap();
+
+        let error = simulation.advance_tick().unwrap_err();
+        assert!(error.to_string().contains("lost advance response"));
+        assert_eq!(simulation.current_tick(), 0);
+        assert_eq!(observer.foreign_tick(), 1);
+
+        simulation.advance_tick().unwrap();
+
+        assert_eq!(simulation.current_tick(), 1);
+        assert_eq!(observer.foreign_tick(), 1);
+    }
+
+    #[test]
     fn player_scoped_projection_stays_separate_from_canonical_snapshot() {
         let mut simulation =
             ExternalSimulationAdapter::connect(LoopbackBridge::player_scoped()).unwrap();
@@ -1108,6 +1178,30 @@ mod tests {
                 .iter()
                 .any(|record| matches!(record, crate::ReplayRecord::PlayerRemoved { .. }))
         );
+    }
+
+    #[test]
+    fn failed_admission_rollback_disconnects_until_removal_can_retry() {
+        let bridge = LoopbackBridge::shared().with_rejected_removal();
+        let observer = bridge.clone();
+        let simulation = ExternalSimulationAdapter::connect(bridge).unwrap();
+        let mut runtime = MatchRuntime::new_with_replay_capture(simulation, 0);
+        let lease = runtime
+            .admit(ReconnectToken([1; RECONNECT_TOKEN_BYTES]))
+            .unwrap();
+
+        let error = runtime
+            .abort_admission(lease.player_id, lease.connection_epoch)
+            .unwrap_err();
+        assert!(error.to_string().contains("removal unavailable"));
+        assert_eq!(runtime.active_count(), 0);
+        assert_eq!(runtime.slot_count(), 1);
+
+        observer.allow_removal();
+        runtime.advance_tick().unwrap();
+        runtime.advance_tick().unwrap();
+
+        assert_eq!(runtime.slot_count(), 0);
     }
 
     #[test]
