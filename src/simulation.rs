@@ -52,6 +52,11 @@ pub trait GameSimulation: Send + 'static {
     fn current_tick(&self) -> u64;
     fn add_player(&mut self, player_id: PlayerId) -> Result<(), SimulationError>;
     fn remove_player(&mut self, player_id: PlayerId) -> bool;
+
+    fn try_remove_player(&mut self, player_id: PlayerId) -> Result<bool, SimulationError> {
+        Ok(self.remove_player(player_id))
+    }
+
     fn apply_command(
         &mut self,
         player_id: PlayerId,

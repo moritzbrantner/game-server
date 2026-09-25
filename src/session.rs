@@ -369,14 +369,17 @@ impl SessionRegistry {
         true
     }
 
-    pub fn expire(&mut self, current_tick: u64) -> Vec<PlayerId> {
-        let expired = self
-            .players
+    pub fn expired_player_ids(&self, current_tick: u64) -> Vec<PlayerId> {
+        self.players
             .iter()
             .filter_map(|(&player_id, session)| {
                 (!session.connected && current_tick > session.expires_at_tick).then_some(player_id)
             })
-            .collect::<Vec<_>>();
+            .collect()
+    }
+
+    pub fn expire(&mut self, current_tick: u64) -> Vec<PlayerId> {
+        let expired = self.expired_player_ids(current_tick);
         for player_id in &expired {
             self.remove_slot(*player_id);
         }

@@ -381,7 +381,9 @@ pub(crate) fn replay_into<S: GameSimulation>(
                 *previous = *sequence;
             }
             ReplayRecord::PlayerRemoved { player_id, .. } => {
-                if sequences.remove(player_id).is_none() || !simulation.remove_player(*player_id) {
+                if sequences.remove(player_id).is_none()
+                    || !simulation.try_remove_player(*player_id)?
+                {
                     return Err(ReplayError::MissingPlayerOnRemoval(*player_id));
                 }
             }

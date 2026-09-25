@@ -1,6 +1,7 @@
 pub mod browser;
 mod connection;
 pub mod control;
+pub mod external_simulation;
 pub mod host;
 pub mod host_recovery;
 pub mod host_status;
@@ -27,6 +28,15 @@ pub use control::{
     MAX_CONTROL_PAYLOAD_BYTES, MatchControlService, RejectControlService,
     RejectMatchControlService, decode_control_request, decode_control_response,
     encode_control_request, encode_control_response,
+};
+pub use external_simulation::{
+    EXTERNAL_SIMULATION_PROTOCOL_CONTRACT, EXTERNAL_SIMULATION_PROTOCOL_VERSION,
+    ExternalSimulationAdapter, ExternalSimulationBridge, ExternalSimulationDescriptor,
+    ExternalSimulationError, ExternalSimulationOperation, ExternalSimulationProtocolContract,
+    ExternalSimulationRequest, ExternalSimulationResponse, MAX_EXTERNAL_SIMULATION_ERROR_BYTES,
+    MAX_EXTERNAL_SIMULATION_FRAME_BYTES, decode_external_simulation_request,
+    decode_external_simulation_response, encode_external_simulation_request,
+    encode_external_simulation_response,
 };
 pub use host::{
     HostError, HostStatus, MAX_MATCH_ID_BYTES, MatchHost, MatchId, MatchIdError, MatchStatus,
