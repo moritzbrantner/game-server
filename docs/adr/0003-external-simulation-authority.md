@@ -27,7 +27,7 @@ The external side may not allocate identities, admit sessions, reject stale sequ
 
 The protocol is bounded and transport-neutral. The bridge owns how bytes cross into another runtime. This repository does not add a Node, JavaScript, FFI, subprocess, or RPC dependency to the authoritative core.
 
-Every response is matched to the requested operation. Snapshot payloads carry their tick and deterministic state hash. The adapter rejects malformed frames, unknown versions, response-operation mismatches, invalid hashes, and tick drift. A successful advance must move from N to N + 1.
+Every response is matched to the requested operation. Snapshot payloads carry their tick and deterministic state hash. Advance requests carry the target tick N + 1, making retries idempotent when the external runtime commits the tick but the response is lost. The adapter rejects malformed frames, unknown versions, response-operation mismatches, invalid hashes, and tick drift. A successful advance must move from N to N + 1.
 
 GameSimulation retains remove_player for compatibility with existing Rust consumers and adds try_remove_player with a fallible default. Runtime expiry, failed-admission cleanup, and replay interpretation use the fallible method. Session expiry is inspected before mutation so a failed external removal does not discard the reconnect/session record.
 
