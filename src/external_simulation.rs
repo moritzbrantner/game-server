@@ -574,14 +574,13 @@ pub fn decode_external_simulation_request(
         ExternalSimulationOperation::AdvanceTick => {
             const LENGTH: usize = REQUEST_HEADER_BYTES + 8;
             require_length(bytes, LENGTH)?;
-            let target_tick = u64::from_be_bytes(
-                bytes[REQUEST_HEADER_BYTES..LENGTH]
-                    .try_into()
-                    .map_err(|_| ExternalSimulationError::IncorrectLength {
+            let target_tick =
+                u64::from_be_bytes(bytes[REQUEST_HEADER_BYTES..LENGTH].try_into().map_err(
+                    |_| ExternalSimulationError::IncorrectLength {
                         expected: LENGTH,
                         actual: bytes.len(),
-                    })?,
-            );
+                    },
+                )?);
             Ok(ExternalSimulationRequest::AdvanceTick { target_tick })
         }
         ExternalSimulationOperation::Snapshot => {
@@ -953,10 +952,9 @@ mod tests {
                 .state
                 .lock()
                 .map_err(|_| ExternalSimulationError::bridge("test bridge mutex poisoned"))?;
-            let drop_advance_response = matches!(
-                &request,
-                ExternalSimulationRequest::AdvanceTick { .. }
-            ) && game.drop_next_advance_response;
+            let drop_advance_response =
+                matches!(&request, ExternalSimulationRequest::AdvanceTick { .. })
+                    && game.drop_next_advance_response;
             if drop_advance_response {
                 game.drop_next_advance_response = false;
             }
