@@ -3,7 +3,8 @@ use crate::control::{
     MAX_CONTROL_PAYLOAD_BYTES, decode_control_request, encode_control_response,
 };
 use crate::protocol::{
-    RECONNECT_TOKEN_BYTES, SnapshotFrame, Welcome, decode_command, encode_snapshot, encode_welcome,
+    ProtocolError, RECONNECT_TOKEN_BYTES, SnapshotFrame, Welcome, decode_command, encode_snapshot,
+    encode_snapshot_fragments, encode_welcome,
 };
 use crate::runtime::{MatchRuntime, RuntimeError};
 use crate::session::{ReconnectToken, SessionLease};
@@ -318,11 +319,10 @@ async fn run_established_connection<S: GameSimulation>(
                                 return Ok(());
                             }
                         };
-                        if snapshot.len() > max_datagram_size {
+                        if send_snapshot(connection, &snapshot, max_datagram_size).is_err() {
                             close(connection, CLOSE_DATAGRAM, "snapshot exceeds negotiated datagram budget");
                             return Ok(());
                         }
-                        let _ = connection.send_datagram(snapshot.as_ref());
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {}
                     Err(broadcast::error::RecvError::Closed) => {
@@ -436,6 +436,24 @@ fn snapshot_for_connection<'a, S: GameSimulation>(
         )
         .map(Cow::Owned),
     }
+}
+
+/// Enqueues one encoded snapshot frame, fragmenting it when it exceeds the
+/// datagram budget. Fails without sending anything when the frame would need
+/// more than the maximum number of fragments.
+fn send_snapshot(
+    connection: &Connection,
+    frame: &[u8],
+    max_datagram_size: usize,
+) -> Result<(), ProtocolError> {
+    if frame.len() <= max_datagram_size {
+        let _ = connection.send_datagram(frame);
+        return Ok(());
+    }
+    for fragment in encode_snapshot_fragments(frame, max_datagram_size)? {
+        let _ = connection.send_datagram(fragment);
+    }
+    Ok(())
 }
 
 async fn dispatch_control<S: GameSimulation>(
@@ -838,6 +856,164 @@ mod tests {
         release.send(()).unwrap();
         let _released = capacity.acquire().await.unwrap();
     }
+
+    const LARGE_PROJECTION_BYTES: usize = 12_000;
+
+    fn large_projection(player_id: crate::PlayerId, tick: u64) -> Vec<u8> {
+        (0..LARGE_PROJECTION_BYTES)
+            .map(|index| (index as u64 ^ tick ^ u64::from(player_id)).to_le_bytes()[0])
+            .collect()
+    }
+
+    struct LargeProjectionSimulation {
+        tick: u64,
+    }
+
+    impl GameSimulation for LargeProjectionSimulation {
+        fn tick_hz(&self) -> u16 {
+            50
+        }
+        fn max_players(&self) -> usize {
+            1
+        }
+        fn current_tick(&self) -> u64 {
+            self.tick
+        }
+        fn add_player(
+            &mut self,
+            _player_id: crate::PlayerId,
+        ) -> Result<(), crate::SimulationError> {
+            Ok(())
+        }
+        fn remove_player(&mut self, _player_id: crate::PlayerId) -> bool {
+            true
+        }
+        fn apply_command(
+            &mut self,
+            _player_id: crate::PlayerId,
+            _sequence: u32,
+            _payload: &[u8],
+        ) -> Result<(), crate::SimulationError> {
+            Ok(())
+        }
+        fn advance_tick(&mut self) -> Result<(), crate::SimulationError> {
+            self.tick += 1;
+            Ok(())
+        }
+        fn snapshot_scope(&self) -> SnapshotScope {
+            SnapshotScope::PlayerScoped
+        }
+        fn snapshot(&self) -> Result<SimulationSnapshot, crate::SimulationError> {
+            Ok(SimulationSnapshot::new(self.tick, b"canonical".to_vec()))
+        }
+        fn snapshot_for(
+            &self,
+            player_id: crate::PlayerId,
+        ) -> Result<SimulationSnapshot, crate::SimulationError> {
+            Ok(SimulationSnapshot::new(
+                self.tick,
+                large_projection(player_id, self.tick),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_larger_than_the_datagram_budget_reaches_a_webtransport_client() {
+        use crate::control::RejectControlService;
+        use crate::protocol::{WELCOME_BYTES, decode_welcome};
+        use crate::reassembly::SnapshotReassembler;
+        use std::net::{Ipv4Addr, SocketAddr};
+        use wtransport::{ClientConfig, Endpoint, Identity, ServerConfig};
+
+        let identity = Identity::self_signed(["localhost", "127.0.0.1"]).unwrap();
+        let certificate_hash = identity.certificate_chain().as_slice()[0].hash();
+        let server = Endpoint::server(
+            ServerConfig::builder()
+                .with_bind_address(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+                .with_identity(identity)
+                .build(),
+        )
+        .unwrap();
+        let port = server.local_addr().unwrap().port();
+        let (snapshots, _) = broadcast::channel(SNAPSHOT_CHANNEL_DEPTH);
+        let (shutdown, _) = broadcast::channel(1);
+        let state = ConnectionState {
+            runtime: Arc::new(Mutex::new(MatchRuntime::new(
+                LargeProjectionSimulation { tick: 0 },
+                10,
+            ))),
+            control: Arc::new(RejectControlService),
+            control_handlers: Arc::new(Semaphore::new(1)),
+            snapshots,
+            admission_gate: None,
+            shutdown,
+        };
+        let mut server_tasks = JoinSet::new();
+        let connection_state = state.clone();
+        server_tasks.spawn(async move {
+            let request = server.accept().await.await.unwrap();
+            let connection = request.accept().await.unwrap();
+            handle_connection(connection, connection_state, AdmissionRequest::New)
+                .await
+                .unwrap();
+        });
+        server_tasks.spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_millis(20));
+            loop {
+                ticker.tick().await;
+                let snapshot = state.runtime.lock().await.advance_tick().unwrap();
+                let publication =
+                    snapshot_publication(SnapshotScope::PlayerScoped, snapshot).unwrap();
+                let _ = state.snapshots.send(publication);
+            }
+        });
+
+        let client = Endpoint::client(
+            ClientConfig::builder()
+                .with_bind_default()
+                .with_server_certificate_hashes([certificate_hash])
+                .build(),
+        )
+        .unwrap();
+        let (welcome, snapshot, budget, stats) =
+            tokio::time::timeout(Duration::from_secs(20), async {
+                let connection = client
+                    .connect(format!("https://127.0.0.1:{port}/game"))
+                    .await
+                    .unwrap();
+                let mut welcome_stream = connection.accept_uni().await.unwrap();
+                let mut welcome = [0_u8; WELCOME_BYTES];
+                welcome_stream.read_exact(&mut welcome).await.unwrap();
+                let welcome = decode_welcome(&welcome).unwrap();
+
+                let mut reassembler = SnapshotReassembler::new();
+                let snapshot = loop {
+                    let datagram = connection.receive_datagram().await.unwrap();
+                    if let Some(snapshot) = reassembler.accept(&datagram).unwrap() {
+                        break snapshot;
+                    }
+                };
+                let budget = connection.max_datagram_size().unwrap();
+                connection.close(VarInt::from_u32(0), b"done");
+                (welcome, snapshot, budget, reassembler.stats())
+            })
+            .await
+            .expect("a fragmented snapshot must reach the client");
+        server_tasks.shutdown().await;
+
+        assert!(
+            LARGE_PROJECTION_BYTES > 4 * budget,
+            "projection must exceed the datagram budget ({budget} bytes)"
+        );
+        assert_eq!(
+            snapshot.payload,
+            large_projection(welcome.player_id, snapshot.tick)
+        );
+        assert_eq!(stats.whole_snapshots, 0);
+        assert_eq!(stats.reassembled_snapshots, 1);
+        assert!(stats.buffered_fragments >= 5);
+    }
+
     #[test]
     fn shared_snapshot_fanout_reuses_payload_storage() {
         let payload = vec![42; 1024];
