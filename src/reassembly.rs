@@ -1,8 +1,8 @@
 //! Bounded client-side reassembly of fragmented snapshot datagrams.
 
 use crate::protocol::{
-    MAX_SNAPSHOT_FRAME_BYTES, ProtocolError, SnapshotDatagram, SnapshotFragment, SnapshotFrame,
-    decode_snapshot_datagram, decode_snapshot_owned,
+    MAX_SNAPSHOT_FRAGMENTS, MAX_SNAPSHOT_FRAME_BYTES, ProtocolError, SnapshotDatagram,
+    SnapshotFragment, SnapshotFrame, decode_snapshot_datagram, decode_snapshot_owned,
 };
 use std::collections::BTreeMap;
 
@@ -13,6 +13,14 @@ pub const SNAPSHOT_REASSEMBLY_MAX_PENDING: usize = 4;
 /// Two maximum-sized frames fit, so a newer maximum-sized snapshot can always
 /// displace an older one.
 pub const SNAPSHOT_REASSEMBLY_MAX_BUFFERED_BYTES: usize = 2 * MAX_SNAPSHOT_FRAME_BYTES;
+/// Datagrams an incomplete snapshot may go without storing a new fragment
+/// before it is dropped.
+///
+/// A server sends the fragments of one snapshot back to back, so this many
+/// datagrams carry the fragments of several maximum-sized snapshots. An
+/// incomplete snapshot that saw no progress in that window will not complete.
+pub const SNAPSHOT_REASSEMBLY_MAX_IDLE_DATAGRAMS: u64 =
+    (SNAPSHOT_REASSEMBLY_MAX_PENDING * MAX_SNAPSHOT_FRAGMENTS) as u64;
 
 /// Deterministic counters describing what a [`SnapshotReassembler`] did.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -32,6 +40,9 @@ pub struct SnapshotReassemblyStats {
     pub evicted_snapshots: u64,
     /// Incomplete snapshots dropped because a snapshot at the same or a newer tick was delivered.
     pub superseded_snapshots: u64,
+    /// Incomplete snapshots dropped because no fragment was stored for them during the last
+    /// [`SNAPSHOT_REASSEMBLY_MAX_IDLE_DATAGRAMS`] datagrams.
+    pub expired_snapshots: u64,
     /// Datagrams rejected as malformed or inconsistent, including a completed
     /// reassembly that fails snapshot verification.
     pub rejected_datagrams: u64,
@@ -42,6 +53,8 @@ struct PendingSnapshot {
     chunks: Vec<Option<Vec<u8>>>,
     received: usize,
     bytes: usize,
+    /// Value of the reassembler's datagram count when a fragment was last stored.
+    last_stored_at: u64,
 }
 
 /// Turns received snapshot datagrams back into verified [`SnapshotFrame`]s.
@@ -54,13 +67,17 @@ struct PendingSnapshot {
 /// Memory is bounded: at most [`SNAPSHOT_REASSEMBLY_MAX_PENDING`] incomplete
 /// snapshots and [`SNAPSHOT_REASSEMBLY_MAX_BUFFERED_BYTES`] chunk bytes are kept.
 /// When a bound is reached the oldest incomplete snapshot is dropped, so newer
-/// ticks win. Losing any fragment loses only that snapshot; a later snapshot
-/// replaces it.
+/// ticks win. An incomplete snapshot that stores no fragment during
+/// [`SNAPSHOT_REASSEMBLY_MAX_IDLE_DATAGRAMS`] datagrams is dropped too, so
+/// abandoned snapshots at any tick cannot occupy the bounds indefinitely.
+/// Losing any fragment loses only that snapshot; a later snapshot replaces it.
 #[derive(Debug, Default)]
 pub struct SnapshotReassembler {
     pending: BTreeMap<u64, PendingSnapshot>,
     buffered_bytes: usize,
     newest_tick: Option<u64>,
+    /// Datagrams passed to `accept`; the deterministic clock for idle expiry.
+    datagrams: u64,
     stats: SnapshotReassemblyStats,
 }
 
@@ -75,6 +92,8 @@ impl SnapshotReassembler {
     /// one, `Ok(None)` when the datagram was buffered or ignored, and an error
     /// when it is malformed or inconsistent. Errors leave the reassembler usable.
     pub fn accept(&mut self, datagram: &[u8]) -> Result<Option<SnapshotFrame>, ProtocolError> {
+        self.datagrams += 1;
+        self.expire_idle();
         let result = match decode_snapshot_datagram(datagram) {
             Ok(SnapshotDatagram::Snapshot(frame)) => Ok(self.accept_whole(frame)),
             Ok(SnapshotDatagram::Fragment(fragment)) => self.accept_fragment(fragment),
@@ -164,10 +183,12 @@ impl SnapshotReassembler {
             chunks: vec![None; count],
             received: 0,
             bytes: 0,
+            last_stored_at: 0,
         });
         pending.chunks[index] = Some(fragment.chunk.to_vec());
         pending.received += 1;
         pending.bytes += chunk_len;
+        pending.last_stored_at = self.datagrams;
         self.buffered_bytes += chunk_len;
         self.stats.buffered_fragments += 1;
         if pending.received < count {
@@ -203,6 +224,23 @@ impl SnapshotReassembler {
         }
         self.newest_tick = Some(frame.tick);
         frame
+    }
+
+    /// Drops incomplete snapshots that stored no fragment during the idle bound.
+    fn expire_idle(&mut self) {
+        let now = self.datagrams;
+        let mut expired_bytes = 0;
+        let mut expired = 0;
+        self.pending.retain(|_, pending| {
+            let idle = now - pending.last_stored_at > SNAPSHOT_REASSEMBLY_MAX_IDLE_DATAGRAMS;
+            if idle {
+                expired_bytes += pending.bytes;
+                expired += 1;
+            }
+            !idle
+        });
+        self.buffered_bytes -= expired_bytes;
+        self.stats.expired_snapshots += expired;
     }
 
     /// Evicts the oldest pending snapshot if it is older than `tick`.
@@ -526,6 +564,75 @@ mod tests {
             reassembler.stats().rejected_datagrams,
             malicious.len() as u64
         );
+    }
+
+    #[test]
+    fn abandoned_far_future_fragments_do_not_block_later_snapshots() {
+        let mut reassembler = SnapshotReassembler::new();
+        for offset in 0..SNAPSHOT_REASSEMBLY_MAX_PENDING as u64 {
+            assert_eq!(
+                reassembler
+                    .accept(&raw_fragment(u64::MAX - offset, 0, 2, &[0xaa]))
+                    .unwrap(),
+                None
+            );
+        }
+        assert_eq!(
+            reassembler.pending_snapshots(),
+            SNAPSHOT_REASSEMBLY_MAX_PENDING
+        );
+
+        let mut delivered = Vec::new();
+        for tick in 1..=100 {
+            for datagram in fragments(tick, 3_000, 1_100) {
+                if let Some(snapshot) = reassembler.accept(&datagram).unwrap() {
+                    delivered.push(snapshot.tick);
+                }
+                assert_bounded(&reassembler);
+            }
+        }
+
+        // The far-future snapshots never complete, so they expire after the
+        // idle bound and newer legitimate snapshots are delivered again.
+        assert_eq!(
+            reassembler.stats().expired_snapshots,
+            SNAPSHOT_REASSEMBLY_MAX_PENDING as u64
+        );
+        assert_eq!(reassembler.newest_tick(), Some(100));
+        assert_eq!(reassembler.pending_snapshots(), 0);
+        let blocked_ticks = SNAPSHOT_REASSEMBLY_MAX_IDLE_DATAGRAMS / 3 + 2;
+        assert!(
+            delivered.len() as u64 >= 100 - blocked_ticks,
+            "delivered {delivered:?}"
+        );
+    }
+
+    #[test]
+    fn an_incomplete_snapshot_expires_after_the_idle_datagram_bound() {
+        let datagrams = fragments(5, 3_000, 1_100);
+        assert_eq!(datagrams.len(), 3);
+        let mut reassembler = SnapshotReassembler::new();
+        reassembler.accept(&datagrams[0]).unwrap();
+
+        // Unrelated datagrams advance the idle count without touching tick 5.
+        for _ in 0..SNAPSHOT_REASSEMBLY_MAX_IDLE_DATAGRAMS - 1 {
+            assert!(reassembler.accept(&[]).is_err());
+        }
+        // A stored fragment resets the idle count.
+        assert_eq!(reassembler.accept(&datagrams[1]).unwrap(), None);
+        for _ in 0..SNAPSHOT_REASSEMBLY_MAX_IDLE_DATAGRAMS {
+            assert!(reassembler.accept(&[]).is_err());
+        }
+        assert_eq!(reassembler.pending_snapshots(), 1);
+        assert_eq!(reassembler.stats().expired_snapshots, 0);
+
+        assert!(reassembler.accept(&[]).is_err());
+        assert_eq!(reassembler.pending_snapshots(), 0);
+        assert_eq!(reassembler.buffered_bytes(), 0);
+        assert_eq!(reassembler.stats().expired_snapshots, 1);
+        // The last fragment alone now starts a new incomplete snapshot.
+        assert_eq!(reassembler.accept(&datagrams[2]).unwrap(), None);
+        assert_eq!(reassembler.pending_snapshots(), 1);
     }
 
     #[test]

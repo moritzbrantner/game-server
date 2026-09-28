@@ -69,8 +69,8 @@ pub use protocol::{
     encode_snapshot, encode_snapshot_fragments, encode_welcome, snapshot_hash,
 };
 pub use reassembly::{
-    SNAPSHOT_REASSEMBLY_MAX_BUFFERED_BYTES, SNAPSHOT_REASSEMBLY_MAX_PENDING, SnapshotReassembler,
-    SnapshotReassemblyStats,
+    SNAPSHOT_REASSEMBLY_MAX_BUFFERED_BYTES, SNAPSHOT_REASSEMBLY_MAX_IDLE_DATAGRAMS,
+    SNAPSHOT_REASSEMBLY_MAX_PENDING, SnapshotReassembler, SnapshotReassemblyStats,
 };
 pub use recovery::{
     MAX_RECOVERY_IMAGE_BYTES, RECOVERY_FORMAT_VERSION, RecoveryError, RecoveryImage,
