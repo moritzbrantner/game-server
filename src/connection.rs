@@ -4,7 +4,7 @@ use crate::control::{
 };
 use crate::protocol::{
     ProtocolError, RECONNECT_TOKEN_BYTES, SnapshotFrame, Welcome, decode_command, encode_snapshot,
-    encode_snapshot_fragments, encode_welcome,
+    encode_snapshot_fragments, encode_welcome, snapshot_frame_tick,
 };
 use crate::runtime::{MatchRuntime, RuntimeError};
 use crate::session::{ReconnectToken, SessionLease};
@@ -237,6 +237,7 @@ async fn run_established_connection<S: GameSimulation>(
     state: &ConnectionState<S>,
 ) -> Result<(), String> {
     let mut snapshots = state.snapshots.subscribe();
+    let mut snapshot_sender = SnapshotSender::default();
     let mut shutdown = state.shutdown.subscribe();
     let control_permits = Arc::new(Semaphore::new(MAX_CONCURRENT_CONTROL_STREAMS));
     let mut control_tasks = JoinSet::new();
@@ -316,7 +317,7 @@ async fn run_established_connection<S: GameSimulation>(
                                 return Ok(());
                             }
                         };
-                        match send_snapshot(connection, &snapshot) {
+                        match snapshot_sender.send(connection, &snapshot) {
                             Ok(_) => {}
                             Err(SnapshotSendError::DatagramsUnavailable) => {
                                 close(connection, CLOSE_DATAGRAM, "WebTransport datagrams are required");
@@ -476,6 +477,8 @@ enum SnapshotDelivery {
     /// after it was read. The rest of the snapshot was not sent; the next
     /// snapshot reads the budget again.
     Abandoned,
+    /// Nothing was sent: this connection already sent a frame for this tick or a newer one.
+    NotNewer,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -484,6 +487,38 @@ enum SnapshotSendError {
     DatagramsUnavailable,
     /// The frame cannot be carried within the fragment bound at the current budget.
     Unsendable(ProtocolError),
+}
+
+/// Snapshot delivery state of one connection.
+#[derive(Debug, Default)]
+struct SnapshotSender {
+    /// Tick of the newest frame this connection started to send.
+    newest_sent_tick: Option<u64>,
+}
+
+impl SnapshotSender {
+    /// Sends `frame` unless this connection already sent a frame for its tick
+    /// or a newer one.
+    ///
+    /// A player-scoped projection is built when the connection handles a
+    /// publication, not when the tick is published. A connection that falls
+    /// one publication behind therefore builds the current tick twice, with
+    /// different bytes when a command was applied in between. Fragments are
+    /// identified by tick, so sending both frames would mix their fragments
+    /// on the client. Clients drop a frame that is not newer anyway.
+    fn send(
+        &mut self,
+        path: &impl DatagramPath,
+        frame: &[u8],
+    ) -> Result<SnapshotDelivery, SnapshotSendError> {
+        let tick = snapshot_frame_tick(frame).map_err(SnapshotSendError::Unsendable)?;
+        if self.newest_sent_tick.is_some_and(|newest| tick <= newest) {
+            return Ok(SnapshotDelivery::NotNewer);
+        }
+        let delivery = send_snapshot(path, frame)?;
+        self.newest_sent_tick = Some(tick);
+        Ok(delivery)
+    }
 }
 
 /// Enqueues one encoded snapshot frame, fragmenting it when it exceeds the
@@ -1247,6 +1282,121 @@ mod tests {
                 ProtocolError::TooManyFragments { .. }
             ))
         ));
+        assert!(path.take_sent().is_empty());
+    }
+
+    /// Player-scoped simulation whose projection changes with every applied
+    /// command, without advancing the tick.
+    struct CommandEchoSimulation {
+        tick: u64,
+        applied_commands: u8,
+    }
+
+    impl GameSimulation for CommandEchoSimulation {
+        fn tick_hz(&self) -> u16 {
+            20
+        }
+        fn max_players(&self) -> usize {
+            1
+        }
+        fn current_tick(&self) -> u64 {
+            self.tick
+        }
+        fn add_player(
+            &mut self,
+            _player_id: crate::PlayerId,
+        ) -> Result<(), crate::SimulationError> {
+            Ok(())
+        }
+        fn remove_player(&mut self, _player_id: crate::PlayerId) -> bool {
+            true
+        }
+        fn apply_command(
+            &mut self,
+            _player_id: crate::PlayerId,
+            _sequence: u32,
+            _payload: &[u8],
+        ) -> Result<(), crate::SimulationError> {
+            self.applied_commands += 1;
+            Ok(())
+        }
+        fn advance_tick(&mut self) -> Result<(), crate::SimulationError> {
+            self.tick += 1;
+            Ok(())
+        }
+        fn snapshot_scope(&self) -> SnapshotScope {
+            SnapshotScope::PlayerScoped
+        }
+        fn snapshot(&self) -> Result<SimulationSnapshot, crate::SimulationError> {
+            Ok(SimulationSnapshot::new(self.tick, b"canonical".to_vec()))
+        }
+        fn snapshot_for(
+            &self,
+            _player_id: crate::PlayerId,
+        ) -> Result<SimulationSnapshot, crate::SimulationError> {
+            Ok(SimulationSnapshot::new(
+                self.tick,
+                vec![self.applied_commands; 3_000],
+            ))
+        }
+    }
+
+    #[test]
+    fn a_connection_sends_at_most_one_frame_per_tick() {
+        let mut runtime = MatchRuntime::new(
+            CommandEchoSimulation {
+                tick: 0,
+                applied_commands: 0,
+            },
+            10,
+        );
+        let lease = runtime
+            .admit(ReconnectToken([1; RECONNECT_TOKEN_BYTES]))
+            .unwrap();
+        let path = RecordingPath::new(1_100);
+        let mut sender = SnapshotSender::default();
+
+        // The connection is one publication behind: the runtime already
+        // advanced to tick 1 and published twice when the task catches up.
+        runtime.advance_tick().unwrap();
+        let publication = SnapshotPublication::PlayerScoped;
+        let first = snapshot_for_connection(&runtime, lease, &publication)
+            .unwrap()
+            .into_owned();
+        assert_eq!(sender.send(&path, &first), Ok(SnapshotDelivery::Fragmented));
+        // A command applied before the queued publication changes the projection
+        // without advancing the tick.
+        runtime
+            .submit_command(lease.player_id, lease.connection_epoch, 1, b"move")
+            .unwrap();
+        let changed = snapshot_for_connection(&runtime, lease, &publication)
+            .unwrap()
+            .into_owned();
+        assert_ne!(changed, first);
+        assert_eq!(
+            crate::decode_snapshot(&changed).unwrap().tick,
+            crate::decode_snapshot(&first).unwrap().tick
+        );
+        assert_eq!(sender.send(&path, &changed), Ok(SnapshotDelivery::NotNewer));
+
+        // Every fragment of tick 1 comes from one frame, so losing one fragment
+        // loses only that snapshot instead of corrupting a mixed reassembly.
+        let mut sent = path.take_sent();
+        assert_eq!(sent.len(), 3);
+        sent.remove(1);
+        assert!(reassemble(&sent).is_empty());
+
+        runtime.advance_tick().unwrap();
+        let next = snapshot_for_connection(&runtime, lease, &publication)
+            .unwrap()
+            .into_owned();
+        assert_eq!(sender.send(&path, &next), Ok(SnapshotDelivery::Fragmented));
+        assert_eq!(
+            reassemble(&path.take_sent()),
+            [crate::decode_snapshot(&next).unwrap()]
+        );
+        // An older frame is never sent after a newer one.
+        assert_eq!(sender.send(&path, &first), Ok(SnapshotDelivery::NotNewer));
         assert!(path.take_sent().is_empty());
     }
 

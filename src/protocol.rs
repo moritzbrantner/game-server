@@ -240,7 +240,7 @@ fn verify_snapshot_frame(bytes: &[u8]) -> Result<(u64, u64), ProtocolError> {
 }
 
 /// Checks the snapshot frame header and exact length, without the hash, and returns its tick.
-fn snapshot_frame_tick(bytes: &[u8]) -> Result<u64, ProtocolError> {
+pub(crate) fn snapshot_frame_tick(bytes: &[u8]) -> Result<u64, ProtocolError> {
     if bytes.len() < SNAPSHOT_HEADER_BYTES {
         return Err(ProtocolError::IncorrectLength {
             expected: SNAPSHOT_HEADER_BYTES,

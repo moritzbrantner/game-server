@@ -71,6 +71,9 @@ struct PendingSnapshot {
 /// [`SNAPSHOT_REASSEMBLY_MAX_IDLE_DATAGRAMS`] datagrams is dropped too, so
 /// abandoned snapshots at any tick cannot occupy the bounds indefinitely.
 /// Losing any fragment loses only that snapshot; a later snapshot replaces it.
+///
+/// Fragments are identified by tick. The server sends at most one frame per
+/// tick on a connection, so all fragments of one tick belong to one frame.
 #[derive(Debug, Default)]
 pub struct SnapshotReassembler {
     pending: BTreeMap<u64, PendingSnapshot>,
