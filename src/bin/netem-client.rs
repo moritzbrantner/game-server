@@ -75,10 +75,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let deadline = Instant::now() + Duration::from_millis(observe_ms);
-    let mut received_snapshots = 0_u64;
+    let mut received_datagrams = 0_u64;
     let mut accepted_snapshots = 0_u64;
-    let mut stale_snapshots = 0_u64;
-    let mut invalid_snapshots = 0_u64;
+    let mut rolled_back_snapshots = 0_u64;
     let mut first_tick = None;
     let mut last_tick = None;
     let mut final_applied_sequence = 0_u32;
@@ -92,17 +91,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
             Ok(Err(_)) => break,
             Err(_) => continue,
         };
-        received_snapshots += 1;
-        let snapshot = match reassembler.accept(datagram.as_ref()) {
-            Ok(Some(snapshot)) => snapshot,
-            Ok(None) => continue,
-            Err(_) => {
-                invalid_snapshots += 1;
-                continue;
-            }
+        received_datagrams += 1;
+        // Rejected datagrams are counted by the reassembler.
+        let Ok(Some(snapshot)) = reassembler.accept(datagram.as_ref()) else {
+            continue;
         };
+        // The reassembler must never deliver a snapshot older than one it already delivered.
         if last_tick.is_some_and(|tick| snapshot.tick <= tick) {
-            stale_snapshots += 1;
+            rolled_back_snapshots += 1;
             continue;
         }
         first_tick.get_or_insert(snapshot.tick);
@@ -121,21 +117,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
-    // The reassembler drops snapshots that are not newer than the last one it delivered.
-    stale_snapshots += reassembler.stats().stale_datagrams;
+    let stats = reassembler.stats();
     let progressed = match (first_tick, last_tick) {
         (Some(first), Some(last)) => last > first,
         _ => false,
     };
-    let expectations_hold = received_snapshots >= MIN_ACCEPTED_SNAPSHOTS
-        && accepted_snapshots >= MIN_ACCEPTED_SNAPSHOTS
-        && invalid_snapshots == 0
+    // Demo snapshots always fit one datagram, so they must arrive as unchanged
+    // whole snapshots that version-3 clients without fragment support decode.
+    let expectations_hold = accepted_snapshots >= MIN_ACCEPTED_SNAPSHOTS
+        && stats.rejected_datagrams == 0
+        && rolled_back_snapshots == 0
+        && stats.reassembled_snapshots == 0
         && progressed
         && final_applied_sequence == final_sequence;
     let rtt_ms = connection.rtt().as_secs_f64() * 1_000.0;
 
     println!(
-        "{{\"mode\":\"webtransport-netem-client\",\"connected\":true,\"connectMs\":{connect_ms:.3},\"rttMs\":{rtt_ms:.3},\"playerId\":{},\"connectionEpoch\":{},\"reconnectToken\":\"{}\",\"welcomeTick\":{},\"sentCommands\":{},\"firstSentSequence\":{},\"finalSentSequence\":{},\"finalAppliedSequence\":{},\"receivedSnapshots\":{},\"acceptedSnapshots\":{},\"staleSnapshots\":{},\"invalidSnapshots\":{},\"firstAcceptedTick\":{},\"lastAcceptedTick\":{},\"expectationsHold\":{}}}",
+        "{{\"mode\":\"webtransport-netem-client\",\"connected\":true,\"connectMs\":{connect_ms:.3},\"rttMs\":{rtt_ms:.3},\"playerId\":{},\"connectionEpoch\":{},\"reconnectToken\":\"{}\",\"welcomeTick\":{},\"sentCommands\":{},\"firstSentSequence\":{},\"finalSentSequence\":{},\"finalAppliedSequence\":{},\"receivedDatagrams\":{},\"acceptedSnapshots\":{},\"wholeSnapshots\":{},\"reassembledSnapshots\":{},\"rolledBackSnapshots\":{},\"staleDatagrams\":{},\"invalidDatagrams\":{},\"firstAcceptedTick\":{},\"lastAcceptedTick\":{},\"expectationsHold\":{}}}",
         welcome.player_id,
         welcome.connection_epoch,
         reconnect_token,
@@ -144,10 +142,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         start_sequence,
         final_sequence,
         final_applied_sequence,
-        received_snapshots,
+        received_datagrams,
         accepted_snapshots,
-        stale_snapshots,
-        invalid_snapshots,
+        stats.whole_snapshots,
+        stats.reassembled_snapshots,
+        rolled_back_snapshots,
+        stats.stale_datagrams,
+        stats.rejected_datagrams,
         optional_number(first_tick),
         optional_number(last_tick),
         expectations_hold,
