@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock, Semaphore, broadcast};
 use tokio::task::JoinSet;
+use wtransport::error::SendDatagramError;
 use wtransport::{Connection, RecvStream, SendStream, VarInt};
 
 const CLOSE_PROTOCOL: u32 = 1;
@@ -438,20 +439,32 @@ fn snapshot_for_connection<'a, S: GameSimulation>(
     }
 }
 
+/// The datagram operations snapshot delivery uses, so tests can model a path
+/// without a live connection.
+trait DatagramPath {
+    fn send_datagram(&self, datagram: &[u8]) -> Result<(), SendDatagramError>;
+}
+
+impl DatagramPath for Connection {
+    fn send_datagram(&self, datagram: &[u8]) -> Result<(), SendDatagramError> {
+        Connection::send_datagram(self, datagram)
+    }
+}
+
 /// Enqueues one encoded snapshot frame, fragmenting it when it exceeds the
 /// datagram budget. Fails without sending anything when the frame would need
 /// more than the maximum number of fragments.
 fn send_snapshot(
-    connection: &Connection,
+    path: &impl DatagramPath,
     frame: &[u8],
     max_datagram_size: usize,
 ) -> Result<(), ProtocolError> {
     if frame.len() <= max_datagram_size {
-        let _ = connection.send_datagram(frame);
+        let _ = path.send_datagram(frame);
         return Ok(());
     }
     for fragment in encode_snapshot_fragments(frame, max_datagram_size)? {
-        let _ = connection.send_datagram(fragment);
+        let _ = path.send_datagram(&fragment);
     }
     Ok(())
 }
@@ -1012,6 +1025,89 @@ mod tests {
         assert_eq!(stats.whole_snapshots, 0);
         assert_eq!(stats.reassembled_snapshots, 1);
         assert!(stats.buffered_fragments >= 5);
+    }
+
+    /// A datagram path that records what it enqueues and, like quinn, refuses
+    /// datagrams above its current budget.
+    struct RecordingPath {
+        budget: std::cell::Cell<Option<usize>>,
+        sent: std::cell::RefCell<Vec<Vec<u8>>>,
+    }
+
+    impl RecordingPath {
+        fn new(budget: usize) -> Self {
+            Self {
+                budget: std::cell::Cell::new(Some(budget)),
+                sent: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+
+        fn take_sent(&self) -> Vec<Vec<u8>> {
+            self.sent.take()
+        }
+    }
+
+    impl DatagramPath for RecordingPath {
+        fn send_datagram(&self, datagram: &[u8]) -> Result<(), SendDatagramError> {
+            match self.budget.get() {
+                None => Err(SendDatagramError::UnsupportedByPeer),
+                Some(budget) if datagram.len() > budget => Err(SendDatagramError::TooLarge),
+                Some(_) => {
+                    self.sent.borrow_mut().push(datagram.to_vec());
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    fn encoded_frame(tick: u64, payload_len: usize) -> Vec<u8> {
+        encode_simulation_snapshot(SimulationSnapshot::new(
+            tick,
+            (0..payload_len).map(|index| index as u8).collect(),
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_frame_at_the_datagram_budget_is_sent_as_one_unchanged_snapshot_datagram() {
+        let frame = encoded_frame(3, 1_000);
+        let path = RecordingPath::new(frame.len());
+
+        send_snapshot(&path, &frame, frame.len()).unwrap();
+
+        // Version-3 clients without fragment support decode this datagram as before.
+        let sent = path.take_sent();
+        assert_eq!(sent, std::slice::from_ref(&frame));
+        assert_eq!(
+            crate::decode_snapshot(&sent[0]).unwrap(),
+            crate::decode_snapshot(&frame).unwrap()
+        );
+        let mut reassembler = crate::SnapshotReassembler::new();
+        assert!(reassembler.accept(&sent[0]).unwrap().is_some());
+        assert_eq!(reassembler.stats().whole_snapshots, 1);
+        assert_eq!(reassembler.stats().reassembled_snapshots, 0);
+    }
+
+    #[test]
+    fn a_frame_one_byte_over_the_datagram_budget_is_fragmented() {
+        let frame = encoded_frame(3, 1_000);
+        let budget = frame.len() - 1;
+        let path = RecordingPath::new(budget);
+
+        send_snapshot(&path, &frame, budget).unwrap();
+
+        let sent = path.take_sent();
+        assert_eq!(sent.len(), 2);
+        assert!(sent.iter().all(|datagram| datagram.len() <= budget));
+        assert!(crate::decode_snapshot(&sent[0]).is_err());
+        let mut reassembler = crate::SnapshotReassembler::new();
+        assert_eq!(reassembler.accept(&sent[0]).unwrap(), None);
+        assert_eq!(
+            reassembler.accept(&sent[1]).unwrap().unwrap(),
+            crate::decode_snapshot(&frame).unwrap()
+        );
+        assert_eq!(reassembler.stats().whole_snapshots, 0);
+        assert_eq!(reassembler.stats().reassembled_snapshots, 1);
     }
 
     #[test]
