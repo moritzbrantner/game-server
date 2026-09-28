@@ -19,7 +19,7 @@ Single-match and hosted listeners share one internal connection module for admis
 
 ## Browser integration contract
 
-`browser` exposes the versioned browser-facing boundary without creating a second gameplay protocol. `BROWSER_PROTOCOL_CONTRACT` binds the route version to the existing command/snapshot protocol version, reliable-control format version, reconnect-token size, and payload ceilings so browser clients can pin one explicit compatibility surface.
+`browser` exposes the versioned browser-facing boundary without creating a second gameplay protocol. `BROWSER_PROTOCOL_CONTRACT` binds the route version to the existing command/snapshot protocol version, reliable-control format version, reconnect-token size, payload ceilings, and snapshot fragment bound so browser clients can pin one explicit compatibility surface.
 
 Use `BrowserRoutePrefix` plus a validated `MatchId` to address a match. With a `/game` base path and match ID `uno_01`, the canonical paths are:
 
@@ -43,6 +43,30 @@ Games with private state must opt into `SnapshotScope::PlayerScoped` and impleme
 Both shared and player-scoped delivery validate the current connection epoch under the runtime lock before sending. A disconnected or replaced lease cannot receive a snapshot through the connection module.
 
 This boundary is intended for hidden-information games such as card games. It keeps visibility policy in the supplied game simulation rather than duplicating game rules in WebTransport handlers.
+
+## Snapshot fragmentation
+
+A connection sends each encoded snapshot frame as one WebTransport datagram when it fits the datagram budget negotiated at admission. A larger frame is split into snapshot fragment datagrams instead of closing the connection. Concatenating the chunks of one tick in index order gives the exact bytes of the normal snapshot frame, so the reassembled frame is verified by `decode_snapshot`, including its state hash.
+
+Fragment datagrams use frame kind `4` within protocol version 3. Integers are big-endian:
+
+| Bytes | Field |
+| --- | --- |
+| 0 | Protocol version, `3` |
+| 1 | Frame kind, `4` |
+| 2..10 | Snapshot tick, `u64` |
+| 10 | Fragment index, below the fragment count |
+| 11 | Fragment count, `1..=64` |
+| 12..14 | Chunk length, `u16`, non-zero; the datagram length must match exactly |
+| 14.. | Chunk bytes |
+
+One snapshot uses at most `MAX_SNAPSHOT_FRAGMENTS` (64) fragments. Every fragment except the last carries a full chunk. Any datagram budget of at least `MIN_FRAGMENTED_DATAGRAM_BYTES` (1,039 bytes) carries the largest legal snapshot frame (65,555 bytes). WebTransport budgets derived from QUIC's 1,200-byte minimum packet size are normally above that bound. If a snapshot would still need more fragments, for example because a peer advertised a smaller datagram limit, the connection closes with the existing datagram-budget error instead of sending part of a snapshot.
+
+Rust clients pass every received datagram to `SnapshotReassembler::accept` and use one reassembler per connection. It returns whole snapshots directly and fragmented snapshots once every fragment has arrived and the frame verifies. Delivered ticks strictly increase. Stale datagrams, duplicate fragments, and fragments of superseded ticks are ignored. The reassembler keeps at most four incomplete snapshots and 131,110 chunk bytes; when either bound is reached, the oldest incomplete snapshot is dropped. Malformed or inconsistent datagrams return an error and leave the reassembler usable. `SnapshotReassemblyStats` exposes deterministic counters for each outcome. Clients that manage their own buffering can classify a datagram with `decode_snapshot_datagram`.
+
+Losing one fragment loses that snapshot only; the next snapshot replaces it. The chance of losing a snapshot grows with its fragment count, so games should still keep player-scoped projections compact. Fragmentation removes the size cliff; it does not make large snapshots free.
+
+The fragment kind is additive. Command, snapshot, and welcome frames are unchanged, and servers send fragments only for snapshots that previously closed the connection. Version-3 clients therefore keep working for snapshots within the budget. Browser clients that need larger snapshots implement the layout above; `BROWSER_PROTOCOL_CONTRACT.max_snapshot_fragments` publishes the bound. See [the snapshot fragmentation decision](docs/adr/0004-snapshot-fragmentation.md).
 
 ## External simulation boundary
 

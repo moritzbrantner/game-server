@@ -51,6 +51,15 @@ Replay capture is opt-in so ordinary matches do not accumulate unbounded evidenc
 
 Graceful recovery freezes authoritative mutation before producing a bounded recovery image, atomically persists verified replay plus reconnect-session state, and restores live slots as disconnected/reconnectable after restart. Recovery-file reads and writes are bounded, startup fails closed on malformed evidence, successfully restored images are consumed only after the WebTransport endpoint is ready, and failed persistence resumes the live runtime rather than exiting with undurable state. This remains graceful restart recovery, not arbitrary crash journaling; durable per-command persistence still requires an explicit storage-failure transaction policy.
 
+### Slice E3 — snapshot fragmentation — completed
+
+- [x] Split encoded snapshot frames larger than the negotiated datagram budget into bounded, versioned fragment datagrams instead of closing the connection.
+- [x] Fail closed when a snapshot would need more than 64 fragments.
+- [x] Provide a bounded, deterministic client-side reassembler that verifies the reassembled frame and never delivers an older tick after a newer one.
+- [x] Prove over a real loopback WebTransport session that a player-scoped snapshot several times the datagram budget reaches the client.
+
+Fragments carry the normal snapshot frame bytes, so the state hash still verifies each delivered snapshot. Losing one fragment loses only that snapshot; later snapshots replace it. See [the snapshot fragmentation decision](docs/adr/0004-snapshot-fragmentation.md).
+
 ## Milestone F — process hosting — completed core
 
 - [x] Host multiple matches per process with bounded match count and existing per-match player capacity.
