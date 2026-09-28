@@ -1,7 +1,8 @@
 use crate::control::{CONTROL_FORMAT_VERSION, MAX_CONTROL_PAYLOAD_BYTES};
 use crate::host::{MatchId, MatchIdError};
 use crate::protocol::{
-    MAX_COMMAND_PAYLOAD_BYTES, MAX_SNAPSHOT_PAYLOAD_BYTES, PROTOCOL_VERSION, RECONNECT_TOKEN_BYTES,
+    MAX_COMMAND_PAYLOAD_BYTES, MAX_SNAPSHOT_FRAGMENTS, MAX_SNAPSHOT_PAYLOAD_BYTES,
+    PROTOCOL_VERSION, RECONNECT_TOKEN_BYTES,
 };
 use crate::session::ReconnectToken;
 use std::error::Error;
@@ -19,6 +20,7 @@ pub struct BrowserProtocolContract {
     pub reconnect_token_bytes: usize,
     pub max_command_payload_bytes: usize,
     pub max_snapshot_payload_bytes: usize,
+    pub max_snapshot_fragments: usize,
     pub max_control_payload_bytes: usize,
 }
 
@@ -29,6 +31,7 @@ pub const BROWSER_PROTOCOL_CONTRACT: BrowserProtocolContract = BrowserProtocolCo
     reconnect_token_bytes: RECONNECT_TOKEN_BYTES,
     max_command_payload_bytes: MAX_COMMAND_PAYLOAD_BYTES,
     max_snapshot_payload_bytes: MAX_SNAPSHOT_PAYLOAD_BYTES,
+    max_snapshot_fragments: MAX_SNAPSHOT_FRAGMENTS,
     max_control_payload_bytes: MAX_CONTROL_PAYLOAD_BYTES,
 };
 
@@ -169,6 +172,10 @@ mod tests {
         assert_eq!(
             BROWSER_PROTOCOL_CONTRACT.reconnect_token_bytes,
             RECONNECT_TOKEN_BYTES
+        );
+        assert_eq!(
+            BROWSER_PROTOCOL_CONTRACT.max_snapshot_fragments,
+            MAX_SNAPSHOT_FRAGMENTS
         );
     }
 
