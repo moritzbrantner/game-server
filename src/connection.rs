@@ -87,17 +87,14 @@ pub(crate) async fn handle_connection<S: GameSimulation>(
     state: ConnectionState<S>,
     admission: AdmissionRequest,
 ) -> Result<(), String> {
-    let max_datagram_size = match connection.max_datagram_size() {
-        Some(max_datagram_size) => max_datagram_size,
-        None => {
-            close(
-                &connection,
-                CLOSE_DATAGRAM,
-                "WebTransport datagrams are required",
-            );
-            return Ok(());
-        }
-    };
+    if connection.max_datagram_size().is_none() {
+        close(
+            &connection,
+            CLOSE_DATAGRAM,
+            "WebTransport datagrams are required",
+        );
+        return Ok(());
+    }
 
     let replacement_token = generate_reconnect_token()?;
     // Keep hosted process drain atomic with new admission, without holding the
@@ -144,7 +141,7 @@ pub(crate) async fn handle_connection<S: GameSimulation>(
         return Ok(());
     }
 
-    let result = run_established_connection(&connection, lease, max_datagram_size, &state).await;
+    let result = run_established_connection(&connection, lease, &state).await;
     state
         .runtime
         .lock()
@@ -237,7 +234,6 @@ fn rollback_failed_welcome<S: GameSimulation>(
 async fn run_established_connection<S: GameSimulation>(
     connection: &Connection,
     lease: SessionLease,
-    max_datagram_size: usize,
     state: &ConnectionState<S>,
 ) -> Result<(), String> {
     let mut snapshots = state.snapshots.subscribe();
@@ -320,9 +316,20 @@ async fn run_established_connection<S: GameSimulation>(
                                 return Ok(());
                             }
                         };
-                        if send_snapshot(connection, &snapshot, max_datagram_size).is_err() {
-                            close(connection, CLOSE_DATAGRAM, "snapshot exceeds negotiated datagram budget");
-                            return Ok(());
+                        match send_snapshot(connection, &snapshot) {
+                            Ok(_) => {}
+                            Err(SnapshotSendError::DatagramsUnavailable) => {
+                                close(connection, CLOSE_DATAGRAM, "WebTransport datagrams are required");
+                                return Ok(());
+                            }
+                            Err(SnapshotSendError::Unsendable(error)) => {
+                                close(
+                                    connection,
+                                    CLOSE_DATAGRAM,
+                                    &format!("snapshot exceeds datagram budget: {error}"),
+                                );
+                                return Ok(());
+                            }
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {}
@@ -442,31 +449,68 @@ fn snapshot_for_connection<'a, S: GameSimulation>(
 /// The datagram operations snapshot delivery uses, so tests can model a path
 /// without a live connection.
 trait DatagramPath {
+    /// Current datagram budget, or `None` when the peer does not accept
+    /// datagrams. It follows the path MTU estimate, so it can shrink during a
+    /// connection, for example after black-hole detection or migration.
+    fn max_datagram_size(&self) -> Option<usize>;
     fn send_datagram(&self, datagram: &[u8]) -> Result<(), SendDatagramError>;
 }
 
 impl DatagramPath for Connection {
+    fn max_datagram_size(&self) -> Option<usize> {
+        Connection::max_datagram_size(self)
+    }
+
     fn send_datagram(&self, datagram: &[u8]) -> Result<(), SendDatagramError> {
         Connection::send_datagram(self, datagram)
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SnapshotDelivery {
+    /// The frame fit the budget and was enqueued as one snapshot datagram.
+    Whole,
+    /// The frame was split and every fragment was enqueued.
+    Fragmented,
+    /// The path refused a datagram, for example because its budget shrank
+    /// after it was read. The rest of the snapshot was not sent; the next
+    /// snapshot reads the budget again.
+    Abandoned,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum SnapshotSendError {
+    /// The peer no longer accepts datagrams.
+    DatagramsUnavailable,
+    /// The frame cannot be carried within the fragment bound at the current budget.
+    Unsendable(ProtocolError),
+}
+
 /// Enqueues one encoded snapshot frame, fragmenting it when it exceeds the
-/// datagram budget. Fails without sending anything when the frame would need
-/// more than the maximum number of fragments.
+/// path's current datagram budget. Fails without sending anything when the
+/// frame would need more than the maximum number of fragments.
 fn send_snapshot(
     path: &impl DatagramPath,
     frame: &[u8],
-    max_datagram_size: usize,
-) -> Result<(), ProtocolError> {
+) -> Result<SnapshotDelivery, SnapshotSendError> {
+    let max_datagram_size = path
+        .max_datagram_size()
+        .ok_or(SnapshotSendError::DatagramsUnavailable)?;
     if frame.len() <= max_datagram_size {
-        let _ = path.send_datagram(frame);
-        return Ok(());
+        return Ok(match path.send_datagram(frame) {
+            Ok(()) => SnapshotDelivery::Whole,
+            Err(_) => SnapshotDelivery::Abandoned,
+        });
     }
-    for fragment in encode_snapshot_fragments(frame, max_datagram_size)? {
-        let _ = path.send_datagram(&fragment);
+    let fragments = encode_snapshot_fragments(frame, max_datagram_size)
+        .map_err(SnapshotSendError::Unsendable)?;
+    for fragment in &fragments {
+        if path.send_datagram(fragment).is_err() {
+            // A snapshot missing any fragment cannot complete.
+            return Ok(SnapshotDelivery::Abandoned);
+        }
     }
-    Ok(())
+    Ok(SnapshotDelivery::Fragmented)
 }
 
 async fn dispatch_control<S: GameSimulation>(
@@ -1030,16 +1074,26 @@ mod tests {
     /// A datagram path that records what it enqueues and, like quinn, refuses
     /// datagrams above its current budget.
     struct RecordingPath {
-        budget: std::cell::Cell<Option<usize>>,
+        /// Budget returned by `max_datagram_size`.
+        reported: std::cell::Cell<Option<usize>>,
+        /// Budget enforced by `send_datagram`; differs from `reported` only to
+        /// model a budget that shrinks between reading it and sending.
+        enforced: std::cell::Cell<Option<usize>>,
         sent: std::cell::RefCell<Vec<Vec<u8>>>,
     }
 
     impl RecordingPath {
         fn new(budget: usize) -> Self {
             Self {
-                budget: std::cell::Cell::new(Some(budget)),
+                reported: std::cell::Cell::new(Some(budget)),
+                enforced: std::cell::Cell::new(Some(budget)),
                 sent: std::cell::RefCell::new(Vec::new()),
             }
+        }
+
+        fn set_budget(&self, budget: Option<usize>) {
+            self.reported.set(budget);
+            self.enforced.set(budget);
         }
 
         fn take_sent(&self) -> Vec<Vec<u8>> {
@@ -1048,8 +1102,12 @@ mod tests {
     }
 
     impl DatagramPath for RecordingPath {
+        fn max_datagram_size(&self) -> Option<usize> {
+            self.reported.get()
+        }
+
         fn send_datagram(&self, datagram: &[u8]) -> Result<(), SendDatagramError> {
-            match self.budget.get() {
+            match self.enforced.get() {
                 None => Err(SendDatagramError::UnsupportedByPeer),
                 Some(budget) if datagram.len() > budget => Err(SendDatagramError::TooLarge),
                 Some(_) => {
@@ -1073,7 +1131,7 @@ mod tests {
         let frame = encoded_frame(3, 1_000);
         let path = RecordingPath::new(frame.len());
 
-        send_snapshot(&path, &frame, frame.len()).unwrap();
+        assert_eq!(send_snapshot(&path, &frame), Ok(SnapshotDelivery::Whole));
 
         // Version-3 clients without fragment support decode this datagram as before.
         let sent = path.take_sent();
@@ -1094,7 +1152,10 @@ mod tests {
         let budget = frame.len() - 1;
         let path = RecordingPath::new(budget);
 
-        send_snapshot(&path, &frame, budget).unwrap();
+        assert_eq!(
+            send_snapshot(&path, &frame),
+            Ok(SnapshotDelivery::Fragmented)
+        );
 
         let sent = path.take_sent();
         assert_eq!(sent.len(), 2);
@@ -1108,6 +1169,85 @@ mod tests {
         );
         assert_eq!(reassembler.stats().whole_snapshots, 0);
         assert_eq!(reassembler.stats().reassembled_snapshots, 1);
+    }
+
+    fn reassemble(datagrams: &[Vec<u8>]) -> Vec<SnapshotFrame> {
+        let mut reassembler = crate::SnapshotReassembler::new();
+        datagrams
+            .iter()
+            .filter_map(|datagram| reassembler.accept(datagram).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn snapshot_fragments_follow_a_datagram_budget_that_shrinks_between_ticks() {
+        let path = RecordingPath::new(1_400);
+        let first = encoded_frame(1, 6_000);
+        assert_eq!(
+            send_snapshot(&path, &first),
+            Ok(SnapshotDelivery::Fragmented)
+        );
+        let sent = path.take_sent();
+        assert!(sent.iter().any(|datagram| datagram.len() > 1_150));
+        assert_eq!(reassemble(&sent), [crate::decode_snapshot(&first).unwrap()]);
+
+        // Black-hole detection or migration drops the path MTU after admission.
+        path.set_budget(Some(1_150));
+        let second = encoded_frame(2, 6_000);
+        assert_eq!(
+            send_snapshot(&path, &second),
+            Ok(SnapshotDelivery::Fragmented)
+        );
+        let sent = path.take_sent();
+        assert!(sent.iter().all(|datagram| datagram.len() <= 1_150));
+        assert_eq!(
+            reassemble(&sent),
+            [crate::decode_snapshot(&second).unwrap()]
+        );
+    }
+
+    #[test]
+    fn a_budget_that_shrinks_while_sending_abandons_the_rest_of_the_snapshot() {
+        let path = RecordingPath::new(1_400);
+        path.enforced.set(Some(1_150));
+
+        assert_eq!(
+            send_snapshot(&path, &encoded_frame(1, 6_000)),
+            Ok(SnapshotDelivery::Abandoned)
+        );
+        assert!(path.take_sent().is_empty());
+
+        // The next snapshot reads the smaller budget and arrives whole.
+        path.reported.set(Some(1_150));
+        let next = encoded_frame(2, 6_000);
+        assert_eq!(
+            send_snapshot(&path, &next),
+            Ok(SnapshotDelivery::Fragmented)
+        );
+        assert_eq!(
+            reassemble(&path.take_sent()),
+            [crate::decode_snapshot(&next).unwrap()]
+        );
+    }
+
+    #[test]
+    fn snapshots_fail_closed_without_datagrams_or_within_the_fragment_bound() {
+        let path = RecordingPath::new(1_200);
+        path.set_budget(None);
+        assert_eq!(
+            send_snapshot(&path, &encoded_frame(1, 10)),
+            Err(SnapshotSendError::DatagramsUnavailable)
+        );
+
+        let budget = crate::MIN_FRAGMENTED_DATAGRAM_BYTES - 1;
+        path.set_budget(Some(budget));
+        assert!(matches!(
+            send_snapshot(&path, &encoded_frame(2, crate::MAX_SNAPSHOT_PAYLOAD_BYTES)),
+            Err(SnapshotSendError::Unsendable(
+                ProtocolError::TooManyFragments { .. }
+            ))
+        ));
+        assert!(path.take_sent().is_empty());
     }
 
     #[test]

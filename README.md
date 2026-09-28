@@ -46,7 +46,7 @@ This boundary is intended for hidden-information games such as card games. It ke
 
 ## Snapshot fragmentation
 
-A connection sends each encoded snapshot frame as one WebTransport datagram when it fits the datagram budget negotiated at admission. A larger frame is split into snapshot fragment datagrams instead of closing the connection. Concatenating the chunks of one tick in index order gives the exact bytes of the normal snapshot frame, so the reassembled frame is verified by `decode_snapshot`, including its state hash.
+A connection sends each encoded snapshot frame as one WebTransport datagram when it fits the connection's current datagram budget. A larger frame is split into snapshot fragment datagrams instead of closing the connection. The budget is read again for every snapshot because it follows the QUIC path MTU estimate, which can shrink after admission, for example after black-hole detection or connection migration. If the path still refuses a fragment, the rest of that snapshot is not sent and the next snapshot uses the new budget. Concatenating the chunks of one tick in index order gives the exact bytes of the normal snapshot frame, so the reassembled frame is verified by `decode_snapshot`, including its state hash.
 
 Fragment datagrams use frame kind `4` within protocol version 3. Integers are big-endian:
 
