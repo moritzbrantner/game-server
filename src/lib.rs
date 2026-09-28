@@ -59,10 +59,13 @@ pub use host_transport::{
 #[cfg(feature = "physics")]
 pub use physics::{PINNED_PHYSICS_ENGINE_REVISION, PhysicsWorldAdapter};
 pub use protocol::{
-    COMMAND_HEADER_BYTES, CommandFrame, MAX_COMMAND_PAYLOAD_BYTES, MAX_SNAPSHOT_PAYLOAD_BYTES,
-    PROTOCOL_VERSION, PlayerId, ProtocolError, RECONNECT_TOKEN_BYTES, SNAPSHOT_HEADER_BYTES,
-    SnapshotFrame, WELCOME_BYTES, Welcome, decode_command, decode_snapshot, decode_welcome,
-    encode_command, encode_snapshot, encode_welcome, snapshot_hash,
+    COMMAND_HEADER_BYTES, CommandFrame, MAX_COMMAND_PAYLOAD_BYTES, MAX_SNAPSHOT_FRAGMENTS,
+    MAX_SNAPSHOT_FRAME_BYTES, MAX_SNAPSHOT_PAYLOAD_BYTES, MIN_FRAGMENTED_DATAGRAM_BYTES,
+    PROTOCOL_VERSION, PlayerId, ProtocolError, RECONNECT_TOKEN_BYTES,
+    SNAPSHOT_FRAGMENT_HEADER_BYTES, SNAPSHOT_HEADER_BYTES, SnapshotDatagram, SnapshotFragment,
+    SnapshotFrame, WELCOME_BYTES, Welcome, decode_command, decode_snapshot,
+    decode_snapshot_datagram, decode_snapshot_fragment, decode_welcome, encode_command,
+    encode_snapshot, encode_snapshot_fragments, encode_welcome, snapshot_hash,
 };
 pub use recovery::{
     MAX_RECOVERY_IMAGE_BYTES, RECOVERY_FORMAT_VERSION, RecoveryError, RecoveryImage,
