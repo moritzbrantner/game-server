@@ -9,6 +9,7 @@ pub mod host_transport;
 #[cfg(feature = "physics")]
 pub mod physics;
 pub mod protocol;
+pub mod reassembly;
 pub mod recovery;
 pub mod replay;
 pub mod runtime;
@@ -66,6 +67,10 @@ pub use protocol::{
     SnapshotFrame, WELCOME_BYTES, Welcome, decode_command, decode_snapshot,
     decode_snapshot_datagram, decode_snapshot_fragment, decode_welcome, encode_command,
     encode_snapshot, encode_snapshot_fragments, encode_welcome, snapshot_hash,
+};
+pub use reassembly::{
+    SNAPSHOT_REASSEMBLY_MAX_BUFFERED_BYTES, SNAPSHOT_REASSEMBLY_MAX_PENDING, SnapshotReassembler,
+    SnapshotReassemblyStats,
 };
 pub use recovery::{
     MAX_RECOVERY_IMAGE_BYTES, RECOVERY_FORMAT_VERSION, RecoveryError, RecoveryImage,

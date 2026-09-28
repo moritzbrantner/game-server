@@ -215,6 +215,17 @@ pub fn decode_snapshot(bytes: &[u8]) -> Result<SnapshotFrame, ProtocolError> {
     })
 }
 
+/// Decodes an owned snapshot frame, reusing its allocation for the payload.
+pub(crate) fn decode_snapshot_owned(mut bytes: Vec<u8>) -> Result<SnapshotFrame, ProtocolError> {
+    let (tick, state_hash) = verify_snapshot_frame(&bytes)?;
+    bytes.drain(..SNAPSHOT_HEADER_BYTES);
+    Ok(SnapshotFrame {
+        tick,
+        state_hash,
+        payload: bytes,
+    })
+}
+
 fn verify_snapshot_frame(bytes: &[u8]) -> Result<(u64, u64), ProtocolError> {
     let tick = snapshot_frame_tick(bytes)?;
     let state_hash = u64::from_be_bytes(bytes[10..18].try_into().expect("checked snapshot header"));
@@ -690,6 +701,22 @@ mod tests {
         ] {
             assert!(decode_snapshot_datagram(&invalid).is_err());
         }
+    }
+
+    #[test]
+    fn owned_snapshot_decode_matches_borrowed_decode() {
+        let frame = encoded_snapshot(11, 300);
+        assert_eq!(
+            decode_snapshot_owned(frame.clone()).unwrap(),
+            decode_snapshot(&frame).unwrap()
+        );
+        let mut corrupted = frame;
+        let last = corrupted.len() - 1;
+        corrupted[last] ^= 0xff;
+        assert!(matches!(
+            decode_snapshot_owned(corrupted),
+            Err(ProtocolError::InvalidStateHash { .. })
+        ));
     }
 
     #[test]
