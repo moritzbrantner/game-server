@@ -1,6 +1,6 @@
 use game_server::protocol::WELCOME_BYTES;
 use game_server::{
-    ReconnectToken, decode_demo_snapshot, decode_snapshot, decode_welcome, encode_command,
+    ReconnectToken, SnapshotReassembler, decode_demo_snapshot, decode_welcome, encode_command,
     encode_demo_command,
 };
 use std::env;
@@ -82,6 +82,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut first_tick = None;
     let mut last_tick = None;
     let mut final_applied_sequence = 0_u32;
+    let mut reassembler = SnapshotReassembler::new();
 
     while Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -92,8 +93,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
             Err(_) => continue,
         };
         received_snapshots += 1;
-        let snapshot = match decode_snapshot(datagram.as_ref()) {
-            Ok(snapshot) => snapshot,
+        let snapshot = match reassembler.accept(datagram.as_ref()) {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => continue,
             Err(_) => {
                 invalid_snapshots += 1;
                 continue;
@@ -119,6 +121,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
+    // The reassembler drops snapshots that are not newer than the last one it delivered.
+    stale_snapshots += reassembler.stats().stale_datagrams;
     let progressed = match (first_tick, last_tick) {
         (Some(first), Some(last)) => last > first,
         _ => false,
