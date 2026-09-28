@@ -10,7 +10,7 @@ The connection module sent each encoded snapshot frame as one WebTransport datag
 
 Keep snapshots on unreliable datagrams and split a frame that does not fit into fragment datagrams.
 
-- A frame that fits the budget is still sent unchanged as one datagram. The shared-snapshot fast path and existing frames are unchanged.
+- A frame that fits the budget is still sent unchanged as one datagram. For such frames the shared-snapshot fast path, one encode per tick and the same datagram for every connection, is unchanged. A shared frame above the budget is fragmented again in every connection task, from that connection's budget, while the task holds the runtime lock.
 - A larger frame is cut into chunks. Each fragment datagram carries protocol version `3`, frame kind `4`, the snapshot tick, the fragment index and count, the chunk length, and the chunk. Concatenating the chunks in index order yields the exact bytes of the normal snapshot frame. Clients verify the reassembled frame with `decode_snapshot`, including the state hash, so fragments add no second integrity scheme.
 - One snapshot uses at most 64 fragments. Any budget of at least 1,039 bytes carries the largest legal frame, 65,555 bytes, within that bound. A snapshot that would need more fragments closes the connection through the existing datagram-budget path before any of its fragments is sent.
 - The server reads the connection's datagram budget for every snapshot, because the QUIC path MTU estimate can shrink after admission (black-hole detection, migration). It computes fragments per connection from that budget and enqueues them synchronously under the runtime lock, like whole snapshots. If the path refuses a fragment anyway, the rest of that snapshot is skipped, since it could no longer complete.
@@ -28,7 +28,7 @@ The protocol version stays at `3`. The fragment kind is additive: the server onl
 
 ## Consequences
 
-Snapshots above the budget now reach clients. Losing any one fragment loses that snapshot, so the chance of losing a snapshot rises with its fragment count. Games should still bound their projections; fragmentation removes the size cliff but not the cost of large snapshots.
+Snapshots above the budget now reach clients. Losing any one fragment loses that snapshot, so the chance of losing a snapshot rises with its fragment count. Games should still bound their projections; fragmentation removes the size cliff but not the cost of large snapshots. A shared snapshot above the budget costs one fragmentation per connection per tick, a copy of the frame plus one allocation per fragment, under the runtime lock. The `shared_snapshot_fanout_64x1024b` benchmark covers only a frame within the budget. Computing fragments once per publication and budget is possible if a shared-scope game needs large snapshots.
 
 Rust clients must feed datagrams through `SnapshotReassembler` or `decode_snapshot_datagram`; the in-repository probes do. Browser clients that need snapshots above the budget must implement the fragment layout documented in the README. `BROWSER_PROTOCOL_CONTRACT.max_snapshot_fragments` publishes the bound.
 

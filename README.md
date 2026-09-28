@@ -36,7 +36,7 @@ For process-hosted matches, `serve_match_host*` owns one WebTransport listener a
 
 ## Snapshot visibility
 
-`GameSimulation::snapshot()` is the canonical authoritative snapshot used by replay and recovery. Simulations with fully shared state keep the default `SnapshotScope::Shared`; the transport encodes that snapshot once per tick and broadcasts the same datagram to every connection.
+`GameSimulation::snapshot()` is the canonical authoritative snapshot used by replay and recovery. Simulations with fully shared state keep the default `SnapshotScope::Shared`; the transport encodes that snapshot once per tick and, when the frame fits a connection's datagram budget, sends that same datagram to every connection. A shared frame above the budget is fragmented separately for each connection, from that connection's current budget, while its connection task holds the runtime lock. Connections can then receive different datagrams, and the copy and allocation cost grows with connection count and frame size (see [Snapshot fragmentation](#snapshot-fragmentation)).
 
 Games with private state must opt into `SnapshotScope::PlayerScoped` and implement `snapshot_for(player_id)`. The default projection fails closed instead of falling back to the canonical snapshot. In that mode the transport publishes only an update signal, then asks the authoritative runtime for the addressed player's projection before encoding a datagram. Canonical snapshot bytes therefore never enter the connection broadcast channel. The projected snapshot carries its own hash over the player-visible payload, while replay and recovery continue to verify the canonical full-state snapshot.
 
