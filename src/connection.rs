@@ -3,7 +3,8 @@ use crate::control::{
     MAX_CONTROL_PAYLOAD_BYTES, decode_control_request, encode_control_response,
 };
 use crate::protocol::{
-    RECONNECT_TOKEN_BYTES, SnapshotFrame, Welcome, decode_command, encode_snapshot, encode_welcome,
+    ProtocolError, RECONNECT_TOKEN_BYTES, SnapshotFrame, Welcome, decode_command, encode_snapshot,
+    encode_snapshot_fragments, encode_welcome, snapshot_frame_tick,
 };
 use crate::runtime::{MatchRuntime, RuntimeError};
 use crate::session::{ReconnectToken, SessionLease};
@@ -14,6 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock, Semaphore, broadcast};
 use tokio::task::JoinSet;
+use wtransport::error::SendDatagramError;
 use wtransport::{Connection, RecvStream, SendStream, VarInt};
 
 const CLOSE_PROTOCOL: u32 = 1;
@@ -85,17 +87,14 @@ pub(crate) async fn handle_connection<S: GameSimulation>(
     state: ConnectionState<S>,
     admission: AdmissionRequest,
 ) -> Result<(), String> {
-    let max_datagram_size = match connection.max_datagram_size() {
-        Some(max_datagram_size) => max_datagram_size,
-        None => {
-            close(
-                &connection,
-                CLOSE_DATAGRAM,
-                "WebTransport datagrams are required",
-            );
-            return Ok(());
-        }
-    };
+    if connection.max_datagram_size().is_none() {
+        close(
+            &connection,
+            CLOSE_DATAGRAM,
+            "WebTransport datagrams are required",
+        );
+        return Ok(());
+    }
 
     let replacement_token = generate_reconnect_token()?;
     // Keep hosted process drain atomic with new admission, without holding the
@@ -142,7 +141,7 @@ pub(crate) async fn handle_connection<S: GameSimulation>(
         return Ok(());
     }
 
-    let result = run_established_connection(&connection, lease, max_datagram_size, &state).await;
+    let result = run_established_connection(&connection, lease, &state).await;
     state
         .runtime
         .lock()
@@ -235,10 +234,10 @@ fn rollback_failed_welcome<S: GameSimulation>(
 async fn run_established_connection<S: GameSimulation>(
     connection: &Connection,
     lease: SessionLease,
-    max_datagram_size: usize,
     state: &ConnectionState<S>,
 ) -> Result<(), String> {
     let mut snapshots = state.snapshots.subscribe();
+    let mut snapshot_sender = SnapshotSender::default();
     let mut shutdown = state.shutdown.subscribe();
     let control_permits = Arc::new(Semaphore::new(MAX_CONCURRENT_CONTROL_STREAMS));
     let mut control_tasks = JoinSet::new();
@@ -318,11 +317,21 @@ async fn run_established_connection<S: GameSimulation>(
                                 return Ok(());
                             }
                         };
-                        if snapshot.len() > max_datagram_size {
-                            close(connection, CLOSE_DATAGRAM, "snapshot exceeds negotiated datagram budget");
-                            return Ok(());
+                        match snapshot_sender.send(connection, &snapshot) {
+                            Ok(_) => {}
+                            Err(SnapshotSendError::DatagramsUnavailable) => {
+                                close(connection, CLOSE_DATAGRAM, "WebTransport datagrams are required");
+                                return Ok(());
+                            }
+                            Err(SnapshotSendError::Unsendable(error)) => {
+                                close(
+                                    connection,
+                                    CLOSE_DATAGRAM,
+                                    &format!("snapshot exceeds datagram budget: {error}"),
+                                );
+                                return Ok(());
+                            }
                         }
-                        let _ = connection.send_datagram(snapshot.as_ref());
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {}
                     Err(broadcast::error::RecvError::Closed) => {
@@ -436,6 +445,107 @@ fn snapshot_for_connection<'a, S: GameSimulation>(
         )
         .map(Cow::Owned),
     }
+}
+
+/// The datagram operations snapshot delivery uses, so tests can model a path
+/// without a live connection.
+trait DatagramPath {
+    /// Current datagram budget, or `None` when the peer does not accept
+    /// datagrams. It follows the path MTU estimate, so it can shrink during a
+    /// connection, for example after black-hole detection or migration.
+    fn max_datagram_size(&self) -> Option<usize>;
+    fn send_datagram(&self, datagram: &[u8]) -> Result<(), SendDatagramError>;
+}
+
+impl DatagramPath for Connection {
+    fn max_datagram_size(&self) -> Option<usize> {
+        Connection::max_datagram_size(self)
+    }
+
+    fn send_datagram(&self, datagram: &[u8]) -> Result<(), SendDatagramError> {
+        Connection::send_datagram(self, datagram)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SnapshotDelivery {
+    /// The frame fit the budget and was enqueued as one snapshot datagram.
+    Whole,
+    /// The frame was split and every fragment was enqueued.
+    Fragmented,
+    /// The path refused a datagram, for example because its budget shrank
+    /// after it was read. The rest of the snapshot was not sent; the next
+    /// snapshot reads the budget again.
+    Abandoned,
+    /// Nothing was sent: this connection already sent a frame for this tick or a newer one.
+    NotNewer,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum SnapshotSendError {
+    /// The peer no longer accepts datagrams.
+    DatagramsUnavailable,
+    /// The frame cannot be carried within the fragment bound at the current budget.
+    Unsendable(ProtocolError),
+}
+
+/// Snapshot delivery state of one connection.
+#[derive(Debug, Default)]
+struct SnapshotSender {
+    /// Tick of the newest frame this connection started to send.
+    newest_sent_tick: Option<u64>,
+}
+
+impl SnapshotSender {
+    /// Sends `frame` unless this connection already sent a frame for its tick
+    /// or a newer one.
+    ///
+    /// A player-scoped projection is built when the connection handles a
+    /// publication, not when the tick is published. A connection that falls
+    /// one publication behind therefore builds the current tick twice, with
+    /// different bytes when a command was applied in between. Fragments are
+    /// identified by tick, so sending both frames would mix their fragments
+    /// on the client. Clients drop a frame that is not newer anyway.
+    fn send(
+        &mut self,
+        path: &impl DatagramPath,
+        frame: &[u8],
+    ) -> Result<SnapshotDelivery, SnapshotSendError> {
+        let tick = snapshot_frame_tick(frame).map_err(SnapshotSendError::Unsendable)?;
+        if self.newest_sent_tick.is_some_and(|newest| tick <= newest) {
+            return Ok(SnapshotDelivery::NotNewer);
+        }
+        let delivery = send_snapshot(path, frame)?;
+        self.newest_sent_tick = Some(tick);
+        Ok(delivery)
+    }
+}
+
+/// Enqueues one encoded snapshot frame, fragmenting it when it exceeds the
+/// path's current datagram budget. Fails without sending anything when the
+/// frame would need more than the maximum number of fragments.
+fn send_snapshot(
+    path: &impl DatagramPath,
+    frame: &[u8],
+) -> Result<SnapshotDelivery, SnapshotSendError> {
+    let max_datagram_size = path
+        .max_datagram_size()
+        .ok_or(SnapshotSendError::DatagramsUnavailable)?;
+    if frame.len() <= max_datagram_size {
+        return Ok(match path.send_datagram(frame) {
+            Ok(()) => SnapshotDelivery::Whole,
+            Err(_) => SnapshotDelivery::Abandoned,
+        });
+    }
+    let fragments = encode_snapshot_fragments(frame, max_datagram_size)
+        .map_err(SnapshotSendError::Unsendable)?;
+    for fragment in &fragments {
+        if path.send_datagram(fragment).is_err() {
+            // A snapshot missing any fragment cannot complete.
+            return Ok(SnapshotDelivery::Abandoned);
+        }
+    }
+    Ok(SnapshotDelivery::Fragmented)
 }
 
 async fn dispatch_control<S: GameSimulation>(
@@ -838,6 +948,458 @@ mod tests {
         release.send(()).unwrap();
         let _released = capacity.acquire().await.unwrap();
     }
+
+    const LARGE_PROJECTION_BYTES: usize = 12_000;
+
+    fn large_projection(player_id: crate::PlayerId, tick: u64) -> Vec<u8> {
+        (0..LARGE_PROJECTION_BYTES)
+            .map(|index| (index as u64 ^ tick ^ u64::from(player_id)).to_le_bytes()[0])
+            .collect()
+    }
+
+    struct LargeProjectionSimulation {
+        tick: u64,
+    }
+
+    impl GameSimulation for LargeProjectionSimulation {
+        fn tick_hz(&self) -> u16 {
+            50
+        }
+        fn max_players(&self) -> usize {
+            1
+        }
+        fn current_tick(&self) -> u64 {
+            self.tick
+        }
+        fn add_player(
+            &mut self,
+            _player_id: crate::PlayerId,
+        ) -> Result<(), crate::SimulationError> {
+            Ok(())
+        }
+        fn remove_player(&mut self, _player_id: crate::PlayerId) -> bool {
+            true
+        }
+        fn apply_command(
+            &mut self,
+            _player_id: crate::PlayerId,
+            _sequence: u32,
+            _payload: &[u8],
+        ) -> Result<(), crate::SimulationError> {
+            Ok(())
+        }
+        fn advance_tick(&mut self) -> Result<(), crate::SimulationError> {
+            self.tick += 1;
+            Ok(())
+        }
+        fn snapshot_scope(&self) -> SnapshotScope {
+            SnapshotScope::PlayerScoped
+        }
+        fn snapshot(&self) -> Result<SimulationSnapshot, crate::SimulationError> {
+            Ok(SimulationSnapshot::new(self.tick, b"canonical".to_vec()))
+        }
+        fn snapshot_for(
+            &self,
+            player_id: crate::PlayerId,
+        ) -> Result<SimulationSnapshot, crate::SimulationError> {
+            Ok(SimulationSnapshot::new(
+                self.tick,
+                large_projection(player_id, self.tick),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_larger_than_the_datagram_budget_reaches_a_webtransport_client() {
+        use crate::control::RejectControlService;
+        use crate::protocol::{WELCOME_BYTES, decode_welcome};
+        use crate::reassembly::SnapshotReassembler;
+        use std::net::{Ipv4Addr, SocketAddr};
+        use wtransport::{ClientConfig, Endpoint, Identity, ServerConfig};
+
+        let identity = Identity::self_signed(["localhost", "127.0.0.1"]).unwrap();
+        let certificate_hash = identity.certificate_chain().as_slice()[0].hash();
+        let server = Endpoint::server(
+            ServerConfig::builder()
+                .with_bind_address(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+                .with_identity(identity)
+                .build(),
+        )
+        .unwrap();
+        let port = server.local_addr().unwrap().port();
+        let (snapshots, _) = broadcast::channel(SNAPSHOT_CHANNEL_DEPTH);
+        let (shutdown, _) = broadcast::channel(1);
+        let state = ConnectionState {
+            runtime: Arc::new(Mutex::new(MatchRuntime::new(
+                LargeProjectionSimulation { tick: 0 },
+                10,
+            ))),
+            control: Arc::new(RejectControlService),
+            control_handlers: Arc::new(Semaphore::new(1)),
+            snapshots,
+            admission_gate: None,
+            shutdown,
+        };
+        let mut server_tasks = JoinSet::new();
+        let connection_state = state.clone();
+        server_tasks.spawn(async move {
+            let request = server.accept().await.await.unwrap();
+            let connection = request.accept().await.unwrap();
+            handle_connection(connection, connection_state, AdmissionRequest::New)
+                .await
+                .unwrap();
+        });
+        server_tasks.spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_millis(20));
+            loop {
+                ticker.tick().await;
+                let snapshot = state.runtime.lock().await.advance_tick().unwrap();
+                let publication =
+                    snapshot_publication(SnapshotScope::PlayerScoped, snapshot).unwrap();
+                let _ = state.snapshots.send(publication);
+            }
+        });
+
+        let client = Endpoint::client(
+            ClientConfig::builder()
+                .with_bind_default()
+                .with_server_certificate_hashes([certificate_hash])
+                .build(),
+        )
+        .unwrap();
+        let (welcome, snapshot, budget, stats) =
+            tokio::time::timeout(Duration::from_secs(20), async {
+                let connection = client
+                    .connect(format!("https://127.0.0.1:{port}/game"))
+                    .await
+                    .unwrap();
+                let mut welcome_stream = connection.accept_uni().await.unwrap();
+                let mut welcome = [0_u8; WELCOME_BYTES];
+                welcome_stream.read_exact(&mut welcome).await.unwrap();
+                let welcome = decode_welcome(&welcome).unwrap();
+
+                let mut reassembler = SnapshotReassembler::new();
+                let snapshot = loop {
+                    let datagram = connection.receive_datagram().await.unwrap();
+                    if let Some(snapshot) = reassembler.accept(&datagram).unwrap() {
+                        break snapshot;
+                    }
+                };
+                let budget = connection.max_datagram_size().unwrap();
+                connection.close(VarInt::from_u32(0), b"done");
+                (welcome, snapshot, budget, reassembler.stats())
+            })
+            .await
+            .expect("a fragmented snapshot must reach the client");
+        server_tasks.shutdown().await;
+
+        assert!(
+            LARGE_PROJECTION_BYTES > 4 * budget,
+            "projection must exceed the datagram budget ({budget} bytes)"
+        );
+        assert_eq!(
+            snapshot.payload,
+            large_projection(welcome.player_id, snapshot.tick)
+        );
+        assert_eq!(stats.whole_snapshots, 0);
+        assert_eq!(stats.reassembled_snapshots, 1);
+        assert!(stats.buffered_fragments >= 5);
+    }
+
+    /// A datagram path that records what it enqueues and, like quinn, refuses
+    /// datagrams above its current budget.
+    struct RecordingPath {
+        /// Budget returned by `max_datagram_size`.
+        reported: std::cell::Cell<Option<usize>>,
+        /// Budget enforced by `send_datagram`; differs from `reported` only to
+        /// model a budget that shrinks between reading it and sending.
+        enforced: std::cell::Cell<Option<usize>>,
+        sent: std::cell::RefCell<Vec<Vec<u8>>>,
+    }
+
+    impl RecordingPath {
+        fn new(budget: usize) -> Self {
+            Self {
+                reported: std::cell::Cell::new(Some(budget)),
+                enforced: std::cell::Cell::new(Some(budget)),
+                sent: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+
+        fn set_budget(&self, budget: Option<usize>) {
+            self.reported.set(budget);
+            self.enforced.set(budget);
+        }
+
+        fn take_sent(&self) -> Vec<Vec<u8>> {
+            self.sent.take()
+        }
+    }
+
+    impl DatagramPath for RecordingPath {
+        fn max_datagram_size(&self) -> Option<usize> {
+            self.reported.get()
+        }
+
+        fn send_datagram(&self, datagram: &[u8]) -> Result<(), SendDatagramError> {
+            match self.enforced.get() {
+                None => Err(SendDatagramError::UnsupportedByPeer),
+                Some(budget) if datagram.len() > budget => Err(SendDatagramError::TooLarge),
+                Some(_) => {
+                    self.sent.borrow_mut().push(datagram.to_vec());
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    fn encoded_frame(tick: u64, payload_len: usize) -> Vec<u8> {
+        encode_simulation_snapshot(SimulationSnapshot::new(
+            tick,
+            (0..payload_len).map(|index| index as u8).collect(),
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_frame_at_the_datagram_budget_is_sent_as_one_unchanged_snapshot_datagram() {
+        let frame = encoded_frame(3, 1_000);
+        let path = RecordingPath::new(frame.len());
+
+        assert_eq!(send_snapshot(&path, &frame), Ok(SnapshotDelivery::Whole));
+
+        // Version-3 clients without fragment support decode this datagram as before.
+        let sent = path.take_sent();
+        assert_eq!(sent, std::slice::from_ref(&frame));
+        assert_eq!(
+            crate::decode_snapshot(&sent[0]).unwrap(),
+            crate::decode_snapshot(&frame).unwrap()
+        );
+        let mut reassembler = crate::SnapshotReassembler::new();
+        assert!(reassembler.accept(&sent[0]).unwrap().is_some());
+        assert_eq!(reassembler.stats().whole_snapshots, 1);
+        assert_eq!(reassembler.stats().reassembled_snapshots, 0);
+    }
+
+    #[test]
+    fn a_frame_one_byte_over_the_datagram_budget_is_fragmented() {
+        let frame = encoded_frame(3, 1_000);
+        let budget = frame.len() - 1;
+        let path = RecordingPath::new(budget);
+
+        assert_eq!(
+            send_snapshot(&path, &frame),
+            Ok(SnapshotDelivery::Fragmented)
+        );
+
+        let sent = path.take_sent();
+        assert_eq!(sent.len(), 2);
+        assert!(sent.iter().all(|datagram| datagram.len() <= budget));
+        assert!(crate::decode_snapshot(&sent[0]).is_err());
+        let mut reassembler = crate::SnapshotReassembler::new();
+        assert_eq!(reassembler.accept(&sent[0]).unwrap(), None);
+        assert_eq!(
+            reassembler.accept(&sent[1]).unwrap().unwrap(),
+            crate::decode_snapshot(&frame).unwrap()
+        );
+        assert_eq!(reassembler.stats().whole_snapshots, 0);
+        assert_eq!(reassembler.stats().reassembled_snapshots, 1);
+    }
+
+    fn reassemble(datagrams: &[Vec<u8>]) -> Vec<SnapshotFrame> {
+        let mut reassembler = crate::SnapshotReassembler::new();
+        datagrams
+            .iter()
+            .filter_map(|datagram| reassembler.accept(datagram).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn snapshot_fragments_follow_a_datagram_budget_that_shrinks_between_ticks() {
+        let path = RecordingPath::new(1_400);
+        let first = encoded_frame(1, 6_000);
+        assert_eq!(
+            send_snapshot(&path, &first),
+            Ok(SnapshotDelivery::Fragmented)
+        );
+        let sent = path.take_sent();
+        assert!(sent.iter().any(|datagram| datagram.len() > 1_150));
+        assert_eq!(reassemble(&sent), [crate::decode_snapshot(&first).unwrap()]);
+
+        // Black-hole detection or migration drops the path MTU after admission.
+        path.set_budget(Some(1_150));
+        let second = encoded_frame(2, 6_000);
+        assert_eq!(
+            send_snapshot(&path, &second),
+            Ok(SnapshotDelivery::Fragmented)
+        );
+        let sent = path.take_sent();
+        assert!(sent.iter().all(|datagram| datagram.len() <= 1_150));
+        assert_eq!(
+            reassemble(&sent),
+            [crate::decode_snapshot(&second).unwrap()]
+        );
+    }
+
+    #[test]
+    fn a_budget_that_shrinks_while_sending_abandons_the_rest_of_the_snapshot() {
+        let path = RecordingPath::new(1_400);
+        path.enforced.set(Some(1_150));
+
+        assert_eq!(
+            send_snapshot(&path, &encoded_frame(1, 6_000)),
+            Ok(SnapshotDelivery::Abandoned)
+        );
+        assert!(path.take_sent().is_empty());
+
+        // The next snapshot reads the smaller budget and arrives whole.
+        path.reported.set(Some(1_150));
+        let next = encoded_frame(2, 6_000);
+        assert_eq!(
+            send_snapshot(&path, &next),
+            Ok(SnapshotDelivery::Fragmented)
+        );
+        assert_eq!(
+            reassemble(&path.take_sent()),
+            [crate::decode_snapshot(&next).unwrap()]
+        );
+    }
+
+    #[test]
+    fn snapshots_fail_closed_without_datagrams_or_within_the_fragment_bound() {
+        let path = RecordingPath::new(1_200);
+        path.set_budget(None);
+        assert_eq!(
+            send_snapshot(&path, &encoded_frame(1, 10)),
+            Err(SnapshotSendError::DatagramsUnavailable)
+        );
+
+        let budget = crate::MIN_FRAGMENTED_DATAGRAM_BYTES - 1;
+        path.set_budget(Some(budget));
+        assert!(matches!(
+            send_snapshot(&path, &encoded_frame(2, crate::MAX_SNAPSHOT_PAYLOAD_BYTES)),
+            Err(SnapshotSendError::Unsendable(
+                ProtocolError::TooManyFragments { .. }
+            ))
+        ));
+        assert!(path.take_sent().is_empty());
+    }
+
+    /// Player-scoped simulation whose projection changes with every applied
+    /// command, without advancing the tick.
+    struct CommandEchoSimulation {
+        tick: u64,
+        applied_commands: u8,
+    }
+
+    impl GameSimulation for CommandEchoSimulation {
+        fn tick_hz(&self) -> u16 {
+            20
+        }
+        fn max_players(&self) -> usize {
+            1
+        }
+        fn current_tick(&self) -> u64 {
+            self.tick
+        }
+        fn add_player(
+            &mut self,
+            _player_id: crate::PlayerId,
+        ) -> Result<(), crate::SimulationError> {
+            Ok(())
+        }
+        fn remove_player(&mut self, _player_id: crate::PlayerId) -> bool {
+            true
+        }
+        fn apply_command(
+            &mut self,
+            _player_id: crate::PlayerId,
+            _sequence: u32,
+            _payload: &[u8],
+        ) -> Result<(), crate::SimulationError> {
+            self.applied_commands += 1;
+            Ok(())
+        }
+        fn advance_tick(&mut self) -> Result<(), crate::SimulationError> {
+            self.tick += 1;
+            Ok(())
+        }
+        fn snapshot_scope(&self) -> SnapshotScope {
+            SnapshotScope::PlayerScoped
+        }
+        fn snapshot(&self) -> Result<SimulationSnapshot, crate::SimulationError> {
+            Ok(SimulationSnapshot::new(self.tick, b"canonical".to_vec()))
+        }
+        fn snapshot_for(
+            &self,
+            _player_id: crate::PlayerId,
+        ) -> Result<SimulationSnapshot, crate::SimulationError> {
+            Ok(SimulationSnapshot::new(
+                self.tick,
+                vec![self.applied_commands; 3_000],
+            ))
+        }
+    }
+
+    #[test]
+    fn a_connection_sends_at_most_one_frame_per_tick() {
+        let mut runtime = MatchRuntime::new(
+            CommandEchoSimulation {
+                tick: 0,
+                applied_commands: 0,
+            },
+            10,
+        );
+        let lease = runtime
+            .admit(ReconnectToken([1; RECONNECT_TOKEN_BYTES]))
+            .unwrap();
+        let path = RecordingPath::new(1_100);
+        let mut sender = SnapshotSender::default();
+
+        // The connection is one publication behind: the runtime already
+        // advanced to tick 1 and published twice when the task catches up.
+        runtime.advance_tick().unwrap();
+        let publication = SnapshotPublication::PlayerScoped;
+        let first = snapshot_for_connection(&runtime, lease, &publication)
+            .unwrap()
+            .into_owned();
+        assert_eq!(sender.send(&path, &first), Ok(SnapshotDelivery::Fragmented));
+        // A command applied before the queued publication changes the projection
+        // without advancing the tick.
+        runtime
+            .submit_command(lease.player_id, lease.connection_epoch, 1, b"move")
+            .unwrap();
+        let changed = snapshot_for_connection(&runtime, lease, &publication)
+            .unwrap()
+            .into_owned();
+        assert_ne!(changed, first);
+        assert_eq!(
+            crate::decode_snapshot(&changed).unwrap().tick,
+            crate::decode_snapshot(&first).unwrap().tick
+        );
+        assert_eq!(sender.send(&path, &changed), Ok(SnapshotDelivery::NotNewer));
+
+        // Every fragment of tick 1 comes from one frame, so losing one fragment
+        // loses only that snapshot instead of corrupting a mixed reassembly.
+        let mut sent = path.take_sent();
+        assert_eq!(sent.len(), 3);
+        sent.remove(1);
+        assert!(reassemble(&sent).is_empty());
+
+        runtime.advance_tick().unwrap();
+        let next = snapshot_for_connection(&runtime, lease, &publication)
+            .unwrap()
+            .into_owned();
+        assert_eq!(sender.send(&path, &next), Ok(SnapshotDelivery::Fragmented));
+        assert_eq!(
+            reassemble(&path.take_sent()),
+            [crate::decode_snapshot(&next).unwrap()]
+        );
+        // An older frame is never sent after a newer one.
+        assert_eq!(sender.send(&path, &first), Ok(SnapshotDelivery::NotNewer));
+        assert!(path.take_sent().is_empty());
+    }
+
     #[test]
     fn shared_snapshot_fanout_reuses_payload_storage() {
         let payload = vec![42; 1024];

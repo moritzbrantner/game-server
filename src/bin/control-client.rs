@@ -1,7 +1,7 @@
 use game_server::protocol::WELCOME_BYTES;
 use game_server::{
-    CONTROL_FORMAT_VERSION, CONTROL_HEADER_BYTES, MAX_CONTROL_PAYLOAD_BYTES,
-    decode_control_response, decode_demo_snapshot, decode_snapshot, decode_welcome, encode_command,
+    CONTROL_FORMAT_VERSION, CONTROL_HEADER_BYTES, MAX_CONTROL_PAYLOAD_BYTES, SnapshotReassembler,
+    decode_control_response, decode_demo_snapshot, decode_welcome, encode_command,
     encode_control_request, encode_demo_command,
 };
 use std::env;
@@ -182,6 +182,7 @@ async fn observe_datagram_progress(
     let mut first_tick = None;
     let mut last_tick = None;
     let mut applied = false;
+    let mut reassembler = SnapshotReassembler::new();
     while Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(Instant::now());
         let wait = remaining.min(Duration::from_millis(250));
@@ -190,9 +191,9 @@ async fn observe_datagram_progress(
             Ok(Err(_)) => return Ok(false),
             Err(_) => continue,
         };
-        let snapshot = match decode_snapshot(datagram.as_ref()) {
-            Ok(snapshot) => snapshot,
-            Err(_) => continue,
+        let snapshot = match reassembler.accept(datagram.as_ref()) {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) | Err(_) => continue,
         };
         first_tick.get_or_insert(snapshot.tick);
         last_tick = Some(snapshot.tick);
