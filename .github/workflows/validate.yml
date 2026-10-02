@@ -42,7 +42,7 @@ jobs:
           bash recovery/hosted-restart-experiment.sh 2>&1 | tee hosted-restart.log
       - name: Upload hosted recovery failure diagnostics
         if: failure() && steps.hosted-restart.outcome == 'failure'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: hosted-restart-failure
           path: hosted-restart.log
