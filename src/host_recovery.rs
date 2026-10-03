@@ -1,4 +1,4 @@
-use crate::{GameSimulation, MatchHost, MatchId, MatchRuntime, RecoveryImage};
+use crate::{GameSimulation, LiveMatchHost, MatchHost, MatchId, MatchRuntime, RecoveryImage};
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::ffi::OsString;
@@ -24,6 +24,17 @@ pub struct MatchHostRecoveryConfig {
 pub struct PreparedMatchHost<S: GameSimulation> {
     pub(crate) host: MatchHost<S>,
     pub(crate) recovery: MatchHostRecoveryPlan,
+}
+
+/// Prepared dynamic host. The management handle can be retained before serving begins.
+pub struct PreparedLiveMatchHost<S: GameSimulation> {
+    pub(crate) host: LiveMatchHost<S>,
+    pub(crate) recovery: MatchHostRecoveryPlan,
+}
+impl<S: GameSimulation> PreparedLiveMatchHost<S> {
+    pub fn host(&self) -> LiveMatchHost<S> {
+        self.host.clone()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -71,7 +82,13 @@ pub async fn prepare_match_host_for_recovery<S: GameSimulation>(
     config: MatchHostRecoveryConfig,
 ) -> Result<PreparedMatchHost<S>, MatchHostRecoveryError> {
     spawn_blocking(move || {
-        prepare_match_host_for_recovery_sync(matches, max_matches, reconnect_grace_ticks, config)
+        prepare_match_host_for_recovery_sync(
+            matches,
+            max_matches,
+            reconnect_grace_ticks,
+            config,
+            false,
+        )
     })
     .await
     .map_err(|error| {
@@ -79,13 +96,101 @@ pub async fn prepare_match_host_for_recovery<S: GameSimulation>(
     })?
 }
 
+/// Restore the bounded manifest match set through a consumer-owned simulation factory.
+/// Fresh IDs are used only when no recovery bundle exists; retired IDs are never recreated.
+/// The factory runs on a blocking worker and must reproduce each simulation's rules/configuration.
+pub async fn prepare_live_match_host_for_recovery<S, F, E>(
+    fresh_ids: Vec<MatchId>,
+    mut factory: F,
+    max_matches: usize,
+    reconnect_grace_ticks: u64,
+    config: MatchHostRecoveryConfig,
+) -> Result<PreparedLiveMatchHost<S>, MatchHostRecoveryError>
+where
+    S: GameSimulation,
+    F: FnMut(&MatchId) -> Result<S, E> + Send + 'static,
+    E: fmt::Display,
+{
+    spawn_blocking(move || {
+        MatchHost::<S>::new(max_matches)
+            .map_err(|error| MatchHostRecoveryError::Host(error.to_string()))?;
+        ensure_no_incomplete_consumption(&config.directory)?;
+        let ids = match fs::metadata(&config.directory) {
+            Ok(metadata) if metadata.is_dir() => read_manifest_ids(&config.directory, max_matches)?,
+            Ok(_) => {
+                return Err(MatchHostRecoveryError::Io(
+                    "recovery path is not a directory".to_owned(),
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => fresh_ids,
+            Err(error) => return Err(io_error(error)),
+        };
+        if ids.len() > max_matches {
+            return Err(MatchHostRecoveryError::Host(
+                "match set exceeds host capacity".to_owned(),
+            ));
+        }
+        let mut unique = BTreeSet::new();
+        let mut matches = Vec::with_capacity(ids.len());
+        for id in ids {
+            if !unique.insert(id.clone()) {
+                return Err(MatchHostRecoveryError::DuplicateMatch(id));
+            }
+            let simulation = factory(&id).map_err(|error| MatchHostRecoveryError::Match {
+                id: id.clone(),
+                error: error.to_string(),
+            })?;
+            matches.push((id, simulation));
+        }
+        let prepared = prepare_match_host_for_recovery_sync(
+            matches,
+            max_matches,
+            reconnect_grace_ticks,
+            config,
+            true,
+        )?;
+        Ok(PreparedLiveMatchHost {
+            host: LiveMatchHost::new(prepared.host),
+            recovery: prepared.recovery,
+        })
+    })
+    .await
+    .map_err(|error| {
+        MatchHostRecoveryError::Io(format!("live recovery preparation task failed: {error}"))
+    })?
+}
+
+fn read_manifest_ids(
+    directory: &Path,
+    max_matches: usize,
+) -> Result<Vec<MatchId>, MatchHostRecoveryError> {
+    let manifest = read_manifest(directory)?;
+    let mut ids = Vec::new();
+    for value in manifest.lines().skip(1) {
+        if ids.len() == max_matches {
+            return Err(MatchHostRecoveryError::Manifest(
+                "recovered match set exceeds host capacity".to_owned(),
+            ));
+        }
+        ids.push(
+            MatchId::new(value)
+                .map_err(|error| MatchHostRecoveryError::Manifest(error.to_string()))?,
+        );
+    }
+    let expected = ids.iter().cloned().collect();
+    validate_manifest(&manifest, &expected)?;
+    validate_bundle_entries(directory, &expected)?;
+    Ok(ids)
+}
+
 fn prepare_match_host_for_recovery_sync<S: GameSimulation>(
     matches: Vec<(MatchId, S)>,
     max_matches: usize,
     reconnect_grace_ticks: u64,
     config: MatchHostRecoveryConfig,
+    allow_empty: bool,
 ) -> Result<PreparedMatchHost<S>, MatchHostRecoveryError> {
-    if matches.is_empty() {
+    if matches.is_empty() && !allow_empty {
         return Err(MatchHostRecoveryError::EmptyMatchSet);
     }
 
@@ -205,15 +310,7 @@ fn read_recovery_bundle(
     directory: &Path,
     expected_ids: &BTreeSet<MatchId>,
 ) -> Result<BTreeMap<MatchId, RecoveryImage>, MatchHostRecoveryError> {
-    let manifest_path = directory.join(MANIFEST_FILE_NAME);
-    let metadata = fs::metadata(&manifest_path).map_err(io_error)?;
-    let manifest_len = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
-    if manifest_len > MAX_MANIFEST_BYTES {
-        return Err(MatchHostRecoveryError::Manifest(format!(
-            "manifest size {manifest_len} exceeds limit {MAX_MANIFEST_BYTES}"
-        )));
-    }
-    let manifest = fs::read_to_string(&manifest_path).map_err(io_error)?;
+    let manifest = read_manifest(directory)?;
     validate_manifest(&manifest, expected_ids)?;
     validate_bundle_entries(directory, expected_ids)?;
 
@@ -229,6 +326,18 @@ fn read_recovery_bundle(
             Ok((id.clone(), image))
         })
         .collect()
+}
+
+fn read_manifest(directory: &Path) -> Result<String, MatchHostRecoveryError> {
+    let manifest_path = directory.join(MANIFEST_FILE_NAME);
+    let metadata = fs::metadata(&manifest_path).map_err(io_error)?;
+    let manifest_len = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
+    if manifest_len > MAX_MANIFEST_BYTES {
+        return Err(MatchHostRecoveryError::Manifest(format!(
+            "manifest size {manifest_len} exceeds limit {MAX_MANIFEST_BYTES}"
+        )));
+    }
+    fs::read_to_string(&manifest_path).map_err(io_error)
 }
 
 fn validate_manifest(
@@ -353,6 +462,118 @@ fn io_error(error: std::io::Error) -> MatchHostRecoveryError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::test_support::TestDirectory;
+    use crate::{DemoSimulation, RECONNECT_TOKEN_BYTES, ReconnectToken};
+
+    fn factory(_: &MatchId) -> Result<DemoSimulation, std::convert::Infallible> {
+        Ok(DemoSimulation::new())
+    }
+    #[tokio::test]
+    async fn live_recovery_uses_manifest_ids_and_restores_sessions_without_recreating_retired_ids()
+    {
+        let directory = TestDirectory::new();
+        let bundle = directory.path().join("recovery");
+        let id = MatchId::new("created-at-runtime").unwrap();
+        let token = ReconnectToken([7; RECONNECT_TOKEN_BYTES]);
+        let mut runtime = MatchRuntime::new_with_replay_capture(DemoSimulation::new(), 100);
+        let lease = runtime.admit(token).unwrap();
+        runtime.advance_tick().unwrap();
+        runtime.freeze_for_recovery();
+        write_recovery_bundle(
+            &bundle,
+            &BTreeMap::from([(id.clone(), runtime.recovery_image().unwrap())]),
+        )
+        .unwrap();
+        let prepared = prepare_live_match_host_for_recovery(
+            vec![MatchId::new("retired-default").unwrap()],
+            factory,
+            2,
+            100,
+            MatchHostRecoveryConfig {
+                directory: bundle.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(prepared.recovery.consume_on_start);
+        assert!(
+            bundle.exists(),
+            "preparation must not consume before transport binds"
+        );
+        let statuses = prepared.host.statuses().await;
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].id, id);
+        assert_eq!(statuses[0].current_tick, 1);
+        assert_eq!(statuses[0].active_players, 0);
+        assert_eq!(statuses[0].occupied_player_slots, 1);
+        let hosted = prepared.host.get(&id).unwrap();
+        let restored = hosted
+            .runtime
+            .lock()
+            .await
+            .reconnect(token, ReconnectToken([8; RECONNECT_TOKEN_BYTES]))
+            .unwrap();
+        assert_eq!(restored.player_id, lease.player_id);
+        assert!(restored.connection_epoch > lease.connection_epoch);
+    }
+    #[tokio::test]
+    async fn live_recovery_accepts_empty_bundles_and_preserves_empty_membership() {
+        let directory = TestDirectory::new();
+        let bundle = directory.path().join("recovery");
+        let fresh = prepare_live_match_host_for_recovery(
+            Vec::new(),
+            factory,
+            1,
+            100,
+            MatchHostRecoveryConfig {
+                directory: bundle.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(fresh.host.statuses().await.is_empty());
+        assert!(!fresh.recovery.consume_on_start);
+        write_recovery_bundle(&bundle, &BTreeMap::new()).unwrap();
+        let recovered = prepare_live_match_host_for_recovery(
+            vec![MatchId::new("retired").unwrap()],
+            factory,
+            1,
+            100,
+            MatchHostRecoveryConfig { directory: bundle },
+        )
+        .await
+        .unwrap();
+        assert!(recovered.host.statuses().await.is_empty());
+        assert!(recovered.recovery.consume_on_start);
+    }
+    #[tokio::test]
+    async fn live_recovery_rejects_corrupt_or_over_capacity_membership_before_factory_calls() {
+        let directory = TestDirectory::new();
+        let bundle = directory.path().join("recovery");
+        std::fs::create_dir(&bundle).unwrap();
+        for manifest in [
+            "GSHR 1\nalpha\nbeta\n",
+            "GSHR 1\nalpha\nalpha\n",
+            "GSHR 2\n",
+            "GSHR 1\n../escape\n",
+        ] {
+            std::fs::write(bundle.join("manifest"), manifest).unwrap();
+            let result = prepare_live_match_host_for_recovery(
+                Vec::new(),
+                |_: &MatchId| -> Result<DemoSimulation, std::convert::Infallible> {
+                    panic!("invalid manifest must be rejected before invoking factory")
+                },
+                1,
+                100,
+                MatchHostRecoveryConfig {
+                    directory: bundle.clone(),
+                },
+            )
+            .await;
+            assert!(matches!(result, Err(MatchHostRecoveryError::Manifest(_))));
+        }
+    }
 
     fn ids() -> BTreeSet<MatchId> {
         ["alpha", "beta"]
