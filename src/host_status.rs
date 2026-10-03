@@ -1,9 +1,9 @@
+use crate::LiveMatchHost;
 use crate::MatchControlService;
 use crate::host::{MatchHost, MatchId};
-use crate::host_recovery::{MatchHostRecoveryPlan, PreparedMatchHost};
+use crate::host_recovery::{MatchHostRecoveryPlan, PreparedLiveMatchHost, PreparedMatchHost};
 use crate::host_transport::{
-    MatchHostTransportError, MatchHostWebTransportConfig,
-    serve_match_host_with_control_and_shutdown_notifying_ready,
+    MatchHostTransportError, MatchHostWebTransportConfig, serve_live_host_inner,
 };
 use crate::simulation::GameSimulation;
 use std::error::Error;
@@ -15,7 +15,16 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, mpsc, oneshot};
-use tokio::task::JoinHandle;
+use tokio::task::{AbortHandle, JoinHandle, JoinSet};
+
+struct AuxiliaryTasks(Vec<AbortHandle>);
+impl Drop for AuxiliaryTasks {
+    fn drop(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
+    }
+}
 
 pub const HOST_STATUS_CONTRACT_VERSION: u16 = 1;
 pub const DEFAULT_HOST_STATUS_PORT: u16 = 8080;
@@ -91,13 +100,28 @@ struct StatusState {
     process: ProcessFacts,
     serving: AtomicBool,
     draining: AtomicBool,
+    accepts_placement: bool,
 }
 
 impl StatusState {
-    fn from_host<S: GameSimulation>(host: &MatchHost<S>) -> Self {
-        let process = host.status();
-        let matches = host
+    fn starting(max_matches: usize, accepts_placement: bool) -> Self {
+        Self {
+            process: ProcessFacts {
+                hosted_matches: 0,
+                max_matches,
+                player_capacity: 0,
+                matches: Vec::new(),
+            },
+            serving: AtomicBool::new(false),
+            draining: AtomicBool::new(false),
+            accepts_placement,
+        }
+    }
+
+    async fn snapshot<S: GameSimulation>(&self, host: &LiveMatchHost<S>) -> Self {
+        let matches: Vec<_> = host
             .statuses()
+            .await
             .into_iter()
             .map(|status| MatchFacts {
                 id: status.id,
@@ -108,13 +132,14 @@ impl StatusState {
             .collect();
         Self {
             process: ProcessFacts {
-                hosted_matches: process.hosted_matches,
-                max_matches: process.max_matches,
-                player_capacity: process.player_capacity,
+                hosted_matches: matches.len(),
+                max_matches: host.max_matches(),
+                player_capacity: matches.iter().map(|facts| facts.max_players).sum(),
                 matches,
             },
-            serving: AtomicBool::new(false),
-            draining: AtomicBool::new(process.draining),
+            serving: AtomicBool::new(self.serving() && host.is_serving()),
+            draining: AtomicBool::new(self.process_draining() || host.is_draining().await),
+            accepts_placement: self.accepts_placement,
         }
     }
 
@@ -150,12 +175,14 @@ impl StatusState {
     }
 
     fn process_ready(&self) -> bool {
-        !self.process_draining()
-            && self
-                .process
-                .matches
-                .iter()
-                .any(|facts| self.match_ready(facts))
+        self.serving()
+            && !self.process_draining()
+            && ((self.accepts_placement && self.process.hosted_matches == 0)
+                || self
+                    .process
+                    .matches
+                    .iter()
+                    .any(|facts| self.match_ready(facts)))
     }
 
     fn process_status_json(&self) -> String {
@@ -203,12 +230,13 @@ where
     C: MatchControlService,
 {
     serve_match_host_with_status_control_shutdown_inner(
-        host,
+        LiveMatchHost::new(host),
         control,
         transport_config,
         status_config,
         shutdown_requests,
         None,
+        false,
     )
     .await
 }
@@ -226,23 +254,73 @@ where
 {
     let PreparedMatchHost { host, recovery } = prepared;
     serve_match_host_with_status_control_shutdown_inner(
-        host,
+        LiveMatchHost::new(host),
         control,
         transport_config,
         status_config,
         shutdown_requests,
         Some(recovery),
+        false,
+    )
+    .await
+}
+
+/// Serve a host whose trusted application can place and retire matches while running.
+/// An empty live host is ready once transport is listening; capacity remains a separate fact.
+pub async fn serve_live_match_host_with_status_and_control_and_shutdown<S, C>(
+    host: LiveMatchHost<S>,
+    control: C,
+    transport_config: MatchHostWebTransportConfig,
+    status_config: MatchHostStatusConfig,
+    shutdown_requests: mpsc::Receiver<()>,
+) -> Result<(), HostStatusServerError>
+where
+    S: GameSimulation,
+    C: MatchControlService,
+{
+    serve_match_host_with_status_control_shutdown_inner(
+        host,
+        control,
+        transport_config,
+        status_config,
+        shutdown_requests,
+        None,
+        true,
+    )
+    .await
+}
+
+pub async fn serve_prepared_live_match_host_with_status_and_control_and_shutdown<S, C>(
+    prepared: PreparedLiveMatchHost<S>,
+    control: C,
+    transport_config: MatchHostWebTransportConfig,
+    status_config: MatchHostStatusConfig,
+    shutdown_requests: mpsc::Receiver<()>,
+) -> Result<(), HostStatusServerError>
+where
+    S: GameSimulation,
+    C: MatchControlService,
+{
+    serve_match_host_with_status_control_shutdown_inner(
+        prepared.host,
+        control,
+        transport_config,
+        status_config,
+        shutdown_requests,
+        Some(prepared.recovery),
+        true,
     )
     .await
 }
 
 async fn serve_match_host_with_status_control_shutdown_inner<S, C>(
-    host: MatchHost<S>,
+    host: LiveMatchHost<S>,
     control: C,
     transport_config: MatchHostWebTransportConfig,
     status_config: MatchHostStatusConfig,
     mut shutdown_requests: mpsc::Receiver<()>,
     recovery: Option<MatchHostRecoveryPlan>,
+    allow_empty: bool,
 ) -> Result<(), HostStatusServerError>
 where
     S: GameSimulation,
@@ -251,7 +329,7 @@ where
     let listener = TcpListener::bind(("0.0.0.0", status_config.port))
         .await
         .map_err(|error| HostStatusServerError::Bind(error.to_string()))?;
-    let state = Arc::new(StatusState::from_host(&host));
+    let state = Arc::new(StatusState::starting(host.max_matches(), allow_empty));
     let (transport_shutdown_sender, transport_shutdown_receiver) = mpsc::channel(4);
     let (status_stop_sender, status_stop_receiver) = mpsc::channel(1);
     let (transport_ready_sender, transport_ready_receiver) = oneshot::channel();
@@ -276,15 +354,22 @@ where
     let mut status_task = tokio::spawn(serve_status_listener(
         listener,
         Arc::clone(&state),
+        host.clone(),
         status_stop_receiver,
     ));
-    let transport = serve_match_host_with_control_and_shutdown_notifying_ready(
+    let _auxiliary = AuxiliaryTasks(vec![
+        shutdown_forwarder.abort_handle(),
+        readiness_task.abort_handle(),
+        status_task.abort_handle(),
+    ]);
+    let transport = serve_live_host_inner(
         host,
         control,
         transport_config,
         transport_shutdown_receiver,
         Some(transport_ready_sender),
         recovery,
+        allow_empty,
     );
     tokio::pin!(transport);
 
@@ -323,15 +408,18 @@ async fn join_status_task(
         .map_err(|error| HostStatusServerError::Task(error.to_string()))?
 }
 
-async fn serve_status_listener(
+async fn serve_status_listener<S: GameSimulation>(
     listener: TcpListener,
     state: Arc<StatusState>,
+    host: LiveMatchHost<S>,
     mut stop: mpsc::Receiver<()>,
 ) -> Result<(), HostStatusServerError> {
     let connections = Arc::new(Semaphore::new(MAX_CONCURRENT_STATUS_CONNECTIONS));
+    let mut requests = JoinSet::new();
     loop {
         tokio::select! {
             _ = stop.recv() => return Ok(()),
+            _ = requests.join_next(), if !requests.is_empty() => {},
             accepted = listener.accept() => {
                 let (stream, _) = accepted
                     .map_err(|error| HostStatusServerError::Serve(error.to_string()))?;
@@ -339,9 +427,10 @@ async fn serve_status_listener(
                     continue;
                 };
                 let state = Arc::clone(&state);
-                tokio::spawn(async move {
+                let host = host.clone();
+                requests.spawn(async move {
                     let _permit = permit;
-                    if let Err(error) = handle_status_connection(stream, &state).await {
+                    if let Err(error) = handle_status_connection(stream, &state, &host).await {
                         eprintln!("host status request failed: {error}");
                     }
                 });
@@ -350,9 +439,10 @@ async fn serve_status_listener(
     }
 }
 
-async fn handle_status_connection(
+async fn handle_status_connection<S: GameSimulation>(
     mut stream: TcpStream,
     state: &StatusState,
+    host: &LiveMatchHost<S>,
 ) -> Result<(), io::Error> {
     let request = match tokio::time::timeout(
         REQUEST_HEADER_TIMEOUT,
@@ -394,7 +484,8 @@ async fn handle_status_connection(
         }
     };
 
-    let response = route_request(&request, state);
+    let snapshot = state.snapshot(host).await;
+    let response = route_request(&request, &snapshot);
     write_response(
         &mut stream,
         response.status,
@@ -579,6 +670,247 @@ async fn write_response(
 mod tests {
     use super::*;
 
+    use crate::test_support::TestDirectory;
+    use crate::{
+        BrowserRoutePrefix, DemoSimulation, MatchHostRecoveryConfig, MatchRuntime,
+        RejectMatchControlService, WELCOME_BYTES, decode_welcome,
+        prepare_live_match_host_for_recovery,
+    };
+    use wtransport::{ClientConfig, Endpoint, Identity};
+
+    async fn http(port: u16, path: &str) -> String {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        stream
+            .write_all(format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        response
+    }
+    async fn welcome(connection: &wtransport::Connection) -> crate::Welcome {
+        let mut stream = connection.accept_uni().await.unwrap();
+        let mut bytes = [0; WELCOME_BYTES];
+        stream.read_exact(&mut bytes).await.unwrap();
+        decode_welcome(&bytes).unwrap()
+    }
+    fn factory(_: &MatchId) -> Result<DemoSimulation, std::convert::Infallible> {
+        Ok(DemoSimulation::new())
+    }
+
+    #[tokio::test]
+    async fn live_transport_status_retirement_and_manifest_recovery_work_without_process_reconfiguration()
+     {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let directory = TestDirectory::new();
+            let identity = Identity::self_signed(["localhost", "127.0.0.1"]).unwrap();
+            let hash = identity.certificate_chain().as_slice()[0].hash();
+            let cert = directory.path().join("cert.pem");
+            let key = directory.path().join("key.pem");
+            identity
+                .certificate_chain()
+                .store_pemfile(&cert)
+                .await
+                .unwrap();
+            identity
+                .private_key()
+                .store_secret_pemfile(&key)
+                .await
+                .unwrap();
+            let udp = std::net::UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+            let port = udp.local_addr().unwrap().port();
+            drop(udp);
+            let tcp = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let status_port = tcp.local_addr().unwrap().port();
+            drop(tcp);
+            let prefix = BrowserRoutePrefix::new("/game").unwrap();
+            let config = MatchHostWebTransportConfig {
+                port,
+                certificate_pem: cert,
+                private_key_pem: key,
+                route_prefix: prefix.clone(),
+                drain_grace: Duration::ZERO,
+            };
+            let recovery = MatchHostRecoveryConfig {
+                directory: directory.path().join("recovery"),
+            };
+            let prepared = prepare_live_match_host_for_recovery(
+                Vec::new(),
+                factory,
+                2,
+                1000,
+                recovery.clone(),
+            )
+            .await
+            .unwrap();
+            let host = prepared.host();
+            let (shutdown, receiver) = mpsc::channel(1);
+            let mut tasks = JoinSet::new();
+            let first_config = config.clone();
+            tasks.spawn(async move {
+                serve_prepared_live_match_host_with_status_and_control_and_shutdown(
+                    prepared,
+                    RejectMatchControlService,
+                    first_config,
+                    MatchHostStatusConfig { port: status_port },
+                    receiver,
+                )
+                .await
+            });
+            while !host.is_serving() {
+                tokio::task::yield_now().await;
+            }
+            while !http(status_port, "/readyz")
+                .await
+                .starts_with("HTTP/1.1 200")
+            {
+                tokio::task::yield_now().await;
+            }
+            let status = http(status_port, "/status").await;
+            assert!(status.contains("\"hostedMatches\":0"));
+            assert!(status.contains("\"remainingMatches\":2"));
+            let client = Endpoint::client(
+                ClientConfig::builder()
+                    .with_bind_default()
+                    .with_server_certificate_hashes([hash])
+                    .build(),
+            )
+            .unwrap();
+            let alpha = MatchId::new("created-alpha").unwrap();
+            let beta = MatchId::new("created-beta").unwrap();
+            let url = |path: String| format!("https://127.0.0.1:{port}{path}");
+            assert!(
+                client
+                    .connect(url(prefix.match_path(&alpha)))
+                    .await
+                    .is_err()
+            );
+            host.place(
+                alpha.clone(),
+                MatchRuntime::new_with_replay_capture(DemoSimulation::new(), 1000),
+            )
+            .await
+            .unwrap();
+            host.place(
+                beta.clone(),
+                MatchRuntime::new_with_replay_capture(DemoSimulation::new(), 1000),
+            )
+            .await
+            .unwrap();
+            let status = http(status_port, "/status").await;
+            assert!(status.contains("\"hostedMatches\":2"));
+            assert!(status.contains("\"remainingMatches\":0"));
+            assert!(
+                http(status_port, "/readyz")
+                    .await
+                    .starts_with("HTTP/1.1 200")
+            );
+            let alpha_connection = client
+                .connect(url(prefix.match_path(&alpha)))
+                .await
+                .unwrap();
+            let alpha_welcome = welcome(&alpha_connection).await;
+            let beta_connection = client.connect(url(prefix.match_path(&beta))).await.unwrap();
+            let beta_welcome = welcome(&beta_connection).await;
+            alpha_connection.receive_datagram().await.unwrap();
+            beta_connection.receive_datagram().await.unwrap();
+            host.retire(&beta).await.unwrap();
+            beta_connection.closed().await;
+            assert!(
+                http(status_port, "/matches/created-beta/status")
+                    .await
+                    .starts_with("HTTP/1.1 404")
+            );
+            assert!(client.connect(url(prefix.match_path(&beta))).await.is_err());
+            assert!(
+                client
+                    .connect(url(prefix.reconnect_path(
+                        &beta,
+                        crate::ReconnectToken(beta_welcome.reconnect_token)
+                    )))
+                    .await
+                    .is_err()
+            );
+            // The unrelated live match keeps publishing after retirement.
+            alpha_connection.receive_datagram().await.unwrap();
+            host.place(
+                beta.clone(),
+                MatchRuntime::new_with_replay_capture(DemoSimulation::new(), 1000),
+            )
+            .await
+            .unwrap();
+            if let Ok(stale) = client
+                .connect(url(prefix.reconnect_path(
+                    &beta,
+                    crate::ReconnectToken(beta_welcome.reconnect_token),
+                )))
+                .await
+            {
+                assert!(
+                    stale.accept_uni().await.is_err(),
+                    "reused ID must reject the previous runtime's token"
+                );
+            }
+            let replacement = client.connect(url(prefix.match_path(&beta))).await.unwrap();
+            welcome(&replacement).await;
+            host.retire(&beta).await.unwrap();
+            replacement.closed().await;
+            shutdown.send(()).await.unwrap();
+            tasks.join_next().await.unwrap().unwrap().unwrap();
+            alpha_connection.closed().await;
+            assert!(!host.is_serving());
+            assert!(recovery.directory.join("manifest").exists());
+            let prepared = prepare_live_match_host_for_recovery(
+                Vec::new(),
+                factory,
+                2,
+                1000,
+                recovery.clone(),
+            )
+            .await
+            .unwrap();
+            let recovered = prepared.host();
+            assert_eq!(recovered.statuses().await.len(), 1);
+            assert_eq!(recovered.statuses().await[0].id, alpha);
+            let (shutdown, receiver) = mpsc::channel(1);
+            tasks.spawn(async move {
+                serve_prepared_live_match_host_with_status_and_control_and_shutdown(
+                    prepared,
+                    RejectMatchControlService,
+                    config,
+                    MatchHostStatusConfig { port: status_port },
+                    receiver,
+                )
+                .await
+            });
+            while !recovered.is_serving() {
+                tokio::select! {
+                    result = tasks.join_next() => panic!("restarted server exited before readiness: {result:?}"),
+                    _ = tokio::task::yield_now() => {},
+                }
+            }
+            assert!(
+                !recovery.directory.exists(),
+                "bound startup must consume recovery before serving"
+            );
+            let restored = client
+                .connect(url(prefix.reconnect_path(
+                    &alpha,
+                    crate::ReconnectToken(alpha_welcome.reconnect_token),
+                )))
+                .await
+                .unwrap();
+            let restored_welcome = welcome(&restored).await;
+            assert_eq!(restored_welcome.player_id, alpha_welcome.player_id);
+            assert!(restored_welcome.connection_epoch > alpha_welcome.connection_epoch);
+            assert!(client.connect(url(prefix.match_path(&beta))).await.is_err());
+            shutdown.send(()).await.unwrap();
+            tasks.join_next().await.unwrap().unwrap().unwrap();
+        })
+        .await
+        .expect("live placement, retirement and recovery must finish on loopback");
+    }
+
     fn state() -> StatusState {
         StatusState {
             process: ProcessFacts {
@@ -602,6 +934,7 @@ mod tests {
             },
             serving: AtomicBool::new(true),
             draining: AtomicBool::new(false),
+            accepts_placement: false,
         }
     }
 

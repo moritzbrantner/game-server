@@ -1,7 +1,6 @@
 use crate::browser::{BrowserAdmission, BrowserRoutePrefix};
 use crate::connection::{
-    AdmissionRequest, ConnectionState, MAX_CONCURRENT_CONTROL_HANDLERS, SNAPSHOT_CHANNEL_DEPTH,
-    SnapshotPublication, handle_connection, snapshot_publication,
+    AdmissionRequest, ConnectionState, MAX_CONCURRENT_CONTROL_HANDLERS, handle_connection,
 };
 use crate::control::{
     ControlContext, ControlService, ControlServiceError, MatchControlService,
@@ -9,8 +8,8 @@ use crate::control::{
 };
 use crate::host::{MatchHost, MatchId};
 use crate::host_recovery::{MatchHostRecoveryPlan, consume_recovery_bundle, write_recovery_bundle};
+use crate::live_host::LiveMatchHost;
 use crate::recovery::RecoveryImage;
-use crate::runtime::{MatchRuntime, RuntimeError};
 use crate::simulation::GameSimulation;
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -18,9 +17,8 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Mutex, RwLock, Semaphore, broadcast, mpsc, oneshot};
+use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::task::{JoinSet, spawn_blocking};
-use tokio::time::MissedTickBehavior;
 use wtransport::{Endpoint, Identity, ServerConfig};
 
 #[derive(Clone, Debug)]
@@ -38,6 +36,7 @@ pub enum MatchHostTransportError {
     Endpoint(String),
     Recovery(String),
     EmptyHost,
+    HostAlreadyStarted,
     HostAlreadyDraining,
     InvalidTickRate(MatchId),
     PlayerCapacityTooLarge { match_id: MatchId, capacity: usize },
@@ -49,6 +48,9 @@ impl fmt::Display for MatchHostTransportError {
             Self::Identity(error) => write!(formatter, "TLS identity error: {error}"),
             Self::Endpoint(error) => write!(formatter, "WebTransport endpoint error: {error}"),
             Self::Recovery(error) => write!(formatter, "host recovery error: {error}"),
+            Self::HostAlreadyStarted => {
+                write!(formatter, "match host transport has already started")
+            }
             Self::EmptyHost => write!(formatter, "match host must contain at least one match"),
             Self::HostAlreadyDraining => {
                 write!(
@@ -72,63 +74,40 @@ impl fmt::Display for MatchHostTransportError {
 
 impl Error for MatchHostTransportError {}
 
-struct HostedMatch<S> {
-    runtime: Arc<Mutex<MatchRuntime<S>>>,
-    snapshots: broadcast::Sender<SnapshotPublication>,
-}
-
 struct HostedServerState<S> {
-    matches: Arc<BTreeMap<MatchId, HostedMatch<S>>>,
-    admission_gate: Arc<RwLock<bool>>,
+    host: LiveMatchHost<S>,
     control: Arc<dyn MatchControlService>,
     control_handlers: Arc<Semaphore>,
-    shutdown: broadcast::Sender<()>,
 }
-
 impl<S> Clone for HostedServerState<S> {
     fn clone(&self) -> Self {
         Self {
-            matches: Arc::clone(&self.matches),
-            admission_gate: Arc::clone(&self.admission_gate),
+            host: self.host.clone(),
             control: Arc::clone(&self.control),
             control_handlers: Arc::clone(&self.control_handlers),
-            shutdown: self.shutdown.clone(),
         }
     }
 }
-
 impl<S: GameSimulation> HostedServerState<S> {
-    async fn with_runtime_mut<R>(
-        &self,
-        match_id: &MatchId,
-        operation: impl FnOnce(&mut MatchRuntime<S>) -> R,
-    ) -> Option<R> {
-        let hosted = self.matches.get(match_id)?;
-        let mut runtime = hosted.runtime.lock().await;
-        Some(operation(&mut runtime))
-    }
-
-    fn connection_state(&self, match_id: &MatchId) -> Option<ConnectionState<S>> {
-        let hosted = self.matches.get(match_id)?;
+    fn connection_state(&self, id: &MatchId) -> Option<ConnectionState<S>> {
+        let hosted = self.host.get(id)?;
         Some(ConnectionState {
             runtime: Arc::clone(&hosted.runtime),
             control: Arc::new(HostedControl {
-                match_id: match_id.clone(),
+                match_id: id.clone(),
                 service: Arc::clone(&self.control),
             }),
             control_handlers: Arc::clone(&self.control_handlers),
             snapshots: hosted.snapshots.clone(),
-            shutdown: self.shutdown.clone(),
-            admission_gate: Some(Arc::clone(&self.admission_gate)),
+            shutdown: hosted.shutdown.clone(),
+            admission_gate: Some(self.host.admission_gate()),
         })
     }
-
-    async fn begin_process_drain(&self) {
-        let mut draining = self.admission_gate.write().await;
-        *draining = true;
-        for hosted in self.matches.values() {
-            hosted.runtime.lock().await.begin_drain();
-        }
+}
+struct ServingOwner<S: GameSimulation>(LiveMatchHost<S>);
+impl<S: GameSimulation> Drop for ServingOwner<S> {
+    fn drop(&mut self) {
+        self.0.close();
     }
 }
 
@@ -216,7 +195,7 @@ pub(crate) async fn serve_match_host_with_control_and_shutdown_notifying_ready<S
     host: MatchHost<S>,
     control: C,
     config: MatchHostWebTransportConfig,
-    mut shutdown_requests: mpsc::Receiver<()>,
+    shutdown_requests: mpsc::Receiver<()>,
     ready: Option<oneshot::Sender<()>>,
     recovery: Option<MatchHostRecoveryPlan>,
 ) -> Result<(), MatchHostTransportError>
@@ -224,7 +203,63 @@ where
     S: GameSimulation,
     C: MatchControlService,
 {
-    let match_tick_rates = validate_host(&host)?;
+    serve_live_host_inner(
+        LiveMatchHost::new(host),
+        control,
+        config,
+        shutdown_requests,
+        ready,
+        recovery,
+        false,
+    )
+    .await
+}
+
+/// Serves a live management capability; empty hosts can accept placement once readiness is established.
+pub async fn serve_live_match_host_with_control_and_shutdown<
+    S: GameSimulation,
+    C: MatchControlService,
+>(
+    host: LiveMatchHost<S>,
+    control: C,
+    config: MatchHostWebTransportConfig,
+    shutdown: mpsc::Receiver<()>,
+) -> Result<(), MatchHostTransportError> {
+    serve_live_host_inner(host, control, config, shutdown, None, None, true).await
+}
+
+pub(crate) async fn serve_live_host_inner<S: GameSimulation, C: MatchControlService>(
+    host: LiveMatchHost<S>,
+    control: C,
+    config: MatchHostWebTransportConfig,
+    mut shutdown_requests: mpsc::Receiver<()>,
+    ready: Option<oneshot::Sender<()>>,
+    recovery: Option<MatchHostRecoveryPlan>,
+    allow_empty: bool,
+) -> Result<(), MatchHostTransportError> {
+    let entries = host.entries();
+    if entries.is_empty() && !allow_empty {
+        return Err(MatchHostTransportError::EmptyHost);
+    }
+    if host.is_draining().await {
+        return Err(MatchHostTransportError::HostAlreadyDraining);
+    }
+    for (id, hosted) in &entries {
+        let runtime = hosted.runtime.lock().await;
+        if runtime.tick_hz() == 0 {
+            return Err(MatchHostTransportError::InvalidTickRate(id.clone()));
+        }
+        if runtime.max_players() > usize::from(u16::MAX) {
+            return Err(MatchHostTransportError::PlayerCapacityTooLarge {
+                match_id: id.clone(),
+                capacity: runtime.max_players(),
+            });
+        }
+    }
+    drop(entries);
+    host.claim()
+        .map_err(|_| MatchHostTransportError::HostAlreadyStarted)?;
+    let _owner = ServingOwner(host.clone());
     let identity = Identity::load_pemfiles(&config.certificate_pem, &config.private_key_pem)
         .await
         .map_err(|error| MatchHostTransportError::Identity(error.to_string()))?;
@@ -271,15 +306,12 @@ where
         }
     }
 
-    let (shutdown, _) = broadcast::channel::<()>(1);
     let state = HostedServerState {
-        matches: Arc::new(isolate_hosted_runtimes(host)),
-        admission_gate: Arc::new(RwLock::new(false)),
+        host,
         control: Arc::new(control),
         control_handlers: Arc::new(Semaphore::new(MAX_CONCURRENT_CONTROL_HANDLERS)),
-        shutdown,
     };
-    let mut tick_tasks = spawn_tick_loops(state.clone(), &match_tick_rates);
+    state.host.start().await;
     let route_prefix = config.route_prefix.clone();
     if let Some(ready) = ready {
         let _ = ready.send(());
@@ -298,7 +330,7 @@ where
                 }
             };
             let route = match route_prefix.parse(request.path()) {
-                Ok(Some(route)) if state.matches.contains_key(&route.match_id) => route,
+                Ok(Some(route)) if state.host.get(&route.match_id).is_some() => route,
                 Ok(Some(_)) | Ok(None) | Err(_) => {
                     let _ = request.not_found().await;
                     return;
@@ -339,7 +371,7 @@ where
                     continue;
                 };
 
-                state.begin_process_drain().await;
+                state.host.begin_drain().await;
                 let drain_deadline = tokio::time::sleep(config.drain_grace);
                 tokio::pin!(drain_deadline);
                 loop {
@@ -363,9 +395,10 @@ where
                     continue;
                 }
 
-                let _ = state.shutdown.send(());
-                tick_tasks.shutdown().await;
+                state.host.stop().await;
+                endpoint.close(wtransport::VarInt::from_u32(0), b"server shutting down");
                 connections.shutdown().await;
+                endpoint.wait_idle().await;
                 return Ok(());
             }
         }
@@ -377,7 +410,7 @@ async fn persist_host_recovery<S: GameSimulation>(
     directory: &Path,
 ) -> Result<(), String> {
     let mut images = BTreeMap::<MatchId, RecoveryImage>::new();
-    for (id, hosted) in state.matches.iter() {
+    for (id, hosted) in state.host.entries() {
         let image = {
             let mut runtime = hosted.runtime.lock().await;
             runtime.freeze_for_recovery();
@@ -420,186 +453,69 @@ async fn persist_host_recovery<S: GameSimulation>(
 }
 
 async fn resume_host_after_failed_recovery<S: GameSimulation>(state: &HostedServerState<S>) {
-    for hosted in state.matches.values() {
+    for (_, hosted) in state.host.entries() {
         hosted.runtime.lock().await.resume_after_failed_recovery();
     }
-}
-
-fn validate_host<S: GameSimulation>(
-    host: &MatchHost<S>,
-) -> Result<Vec<(MatchId, u16)>, MatchHostTransportError> {
-    if host.is_empty() {
-        return Err(MatchHostTransportError::EmptyHost);
-    }
-    if host.is_draining() {
-        return Err(MatchHostTransportError::HostAlreadyDraining);
-    }
-
-    host.statuses()
-        .into_iter()
-        .map(|status| {
-            let runtime = host
-                .runtime(&status.id)
-                .expect("host status must reference an existing runtime");
-            let tick_hz = runtime.tick_hz();
-            if tick_hz == 0 {
-                return Err(MatchHostTransportError::InvalidTickRate(status.id));
-            }
-            if runtime.max_players() > usize::from(u16::MAX) {
-                return Err(MatchHostTransportError::PlayerCapacityTooLarge {
-                    match_id: status.id,
-                    capacity: runtime.max_players(),
-                });
-            }
-            Ok((status.id, tick_hz))
-        })
-        .collect()
-}
-
-fn isolate_hosted_runtimes<S: GameSimulation>(
-    host: MatchHost<S>,
-) -> BTreeMap<MatchId, HostedMatch<S>> {
-    host.into_runtimes()
-        .into_iter()
-        .map(|(match_id, runtime)| {
-            let (snapshots, _) = broadcast::channel::<SnapshotPublication>(SNAPSHOT_CHANNEL_DEPTH);
-            (
-                match_id,
-                HostedMatch {
-                    runtime: Arc::new(Mutex::new(runtime)),
-                    snapshots,
-                },
-            )
-        })
-        .collect()
-}
-
-fn spawn_tick_loops<S: GameSimulation>(
-    state: HostedServerState<S>,
-    match_tick_rates: &[(MatchId, u16)],
-) -> JoinSet<()> {
-    let mut tasks = JoinSet::new();
-    for (match_id, tick_hz) in match_tick_rates {
-        let state = state.clone();
-        let match_id = match_id.clone();
-        let tick_hz = *tick_hz;
-        let snapshots = state
-            .matches
-            .get(&match_id)
-            .expect("validated match must have a snapshot channel")
-            .snapshots
-            .clone();
-        tasks.spawn(async move {
-            let mut ticker =
-                tokio::time::interval(Duration::from_micros(1_000_000_u64 / u64::from(tick_hz)));
-            ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-            loop {
-                ticker.tick().await;
-                let (scope, snapshot) = match state
-                    .with_runtime_mut(&match_id, |runtime| {
-                        runtime.advance_tick().map(|snapshot| {
-                            let scope = runtime.snapshot_scope();
-                            (scope, snapshot)
-                        })
-                    })
-                    .await
-                {
-                    Some(Ok(result)) => result,
-                    Some(Err(RuntimeError::Frozen)) => continue,
-                    Some(Err(error)) => {
-                        eprintln!("authoritative tick failed for match {match_id}: {error}");
-                        continue;
-                    }
-                    None => return,
-                };
-                match snapshot_publication(scope, snapshot) {
-                    Ok(publication) => {
-                        let _ = snapshots.send(publication);
-                    }
-                    Err(error) => {
-                        eprintln!("snapshot encoding failed for match {match_id}: {error}")
-                    }
-                }
-            }
-        });
-    }
-    tasks
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{DEFAULT_RECONNECT_GRACE_TICKS, DemoSimulation};
+    use crate::{DEFAULT_RECONNECT_GRACE_TICKS, DemoSimulation, MatchRuntime};
 
-    fn host_with(ids: &[&str]) -> MatchHost<DemoSimulation> {
-        let mut host = MatchHost::new(ids.len()).unwrap();
-        for value in ids {
-            host.insert(
-                MatchId::new(*value).unwrap(),
+    fn config() -> MatchHostWebTransportConfig {
+        MatchHostWebTransportConfig {
+            port: 0,
+            certificate_pem: PathBuf::from("unused-cert.pem"),
+            private_key_pem: PathBuf::from("unused-key.pem"),
+            route_prefix: BrowserRoutePrefix::new("/matches").unwrap(),
+            drain_grace: Duration::ZERO,
+        }
+    }
+    #[tokio::test]
+    async fn static_empty_or_pre_draining_hosts_fail_closed_before_binding() {
+        let empty = MatchHost::<DemoSimulation>::new(1).unwrap();
+        let (_, shutdown) = mpsc::channel(1);
+        assert_eq!(
+            serve_match_host_with_shutdown(empty, config(), shutdown).await,
+            Err(MatchHostTransportError::EmptyHost)
+        );
+        let mut draining = MatchHost::new(1).unwrap();
+        draining
+            .insert(
+                MatchId::new("alpha").unwrap(),
                 MatchRuntime::new(DemoSimulation::new(), DEFAULT_RECONNECT_GRACE_TICKS),
             )
             .unwrap();
-        }
-        host
-    }
-
-    #[test]
-    fn host_validation_binds_one_tick_loop_per_match() {
-        let host = host_with(&["alpha", "beta"]);
-        let tick_rates = validate_host(&host).unwrap();
-        assert_eq!(tick_rates.len(), 2);
-        assert_eq!(tick_rates[0].0.as_str(), "alpha");
-        assert_eq!(tick_rates[1].0.as_str(), "beta");
-        assert!(tick_rates.iter().all(|(_, tick_hz)| *tick_hz > 0));
-    }
-
-    #[test]
-    fn hosted_runtimes_have_independent_locks() {
-        let matches = isolate_hosted_runtimes(host_with(&["alpha", "beta"]));
-        let alpha = matches.get(&MatchId::new("alpha").unwrap()).unwrap();
-        let beta = matches.get(&MatchId::new("beta").unwrap()).unwrap();
-
-        let _alpha_guard = alpha.runtime.try_lock().unwrap();
-        let _beta_guard = beta.runtime.try_lock().unwrap();
-    }
-
-    #[test]
-    fn empty_or_pre_draining_hosts_fail_closed() {
-        let empty = MatchHost::<DemoSimulation>::new(1).unwrap();
-        assert_eq!(
-            validate_host(&empty),
-            Err(MatchHostTransportError::EmptyHost)
-        );
-
-        let mut draining = host_with(&["alpha"]);
         draining.begin_drain();
+        let (_, shutdown) = mpsc::channel(1);
         assert_eq!(
-            validate_host(&draining),
+            serve_match_host_with_shutdown(draining, config(), shutdown).await,
             Err(MatchHostTransportError::HostAlreadyDraining)
         );
     }
+
     #[tokio::test]
     async fn dropping_host_tick_owner_closes_every_snapshot_source() {
-        let host = host_with(&["alpha", "beta"]);
-        let rates = validate_host(&host).unwrap();
-        let matches = isolate_hosted_runtimes(host);
-        let mut publications: Vec<_> = matches
-            .values()
-            .map(|hosted| hosted.snapshots.subscribe())
-            .collect();
-        let (shutdown, _) = broadcast::channel(1);
-        let state = HostedServerState {
-            matches: Arc::new(matches),
-            admission_gate: Arc::new(RwLock::new(false)),
-            control: Arc::new(RejectMatchControlService),
-            control_handlers: Arc::new(Semaphore::new(MAX_CONCURRENT_CONTROL_HANDLERS)),
-            shutdown,
-        };
-        let ticks = spawn_tick_loops(state, &rates);
+        let host = LiveMatchHost::new(MatchHost::new(2).unwrap());
+        host.claim().unwrap();
+        host.start().await;
+        let owner = ServingOwner(host.clone());
+        let mut publications = Vec::new();
+        for name in ["alpha", "beta"] {
+            let id = MatchId::new(name).unwrap();
+            host.place(
+                id.clone(),
+                MatchRuntime::new(DemoSimulation::new(), DEFAULT_RECONNECT_GRACE_TICKS),
+            )
+            .await
+            .unwrap();
+            publications.push(host.get(&id).unwrap().snapshots.subscribe());
+        }
         for published in &mut publications {
             published.recv().await.unwrap();
         }
-        drop(ticks);
+        drop(owner);
         tokio::time::timeout(Duration::from_secs(1), async {
             for published in &mut publications {
                 while published.recv().await.is_ok() {}
@@ -607,5 +523,16 @@ mod tests {
         })
         .await
         .expect("cancelled host must release every tick task and runtime");
+        assert!(host.statuses().await.is_empty());
+        assert_eq!(
+            host.place(
+                MatchId::new("gamma").unwrap(),
+                MatchRuntime::new(DemoSimulation::new(), DEFAULT_RECONNECT_GRACE_TICKS)
+            )
+            .await
+            .unwrap_err()
+            .error(),
+            &crate::LiveHostError::NotServing
+        );
     }
 }

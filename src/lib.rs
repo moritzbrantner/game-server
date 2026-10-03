@@ -6,6 +6,7 @@ pub mod host;
 pub mod host_recovery;
 pub mod host_status;
 pub mod host_transport;
+pub mod live_host;
 #[cfg(feature = "physics")]
 pub mod physics;
 pub mod protocol;
@@ -45,15 +46,19 @@ pub use host::{
 };
 pub use host_recovery::{
     HOST_RECOVERY_BUNDLE_VERSION, MatchHostRecoveryConfig, MatchHostRecoveryError,
-    PreparedMatchHost, prepare_match_host_for_recovery,
+    PreparedLiveMatchHost, PreparedMatchHost, prepare_live_match_host_for_recovery,
+    prepare_match_host_for_recovery,
 };
 pub use host_status::{
     DEFAULT_HOST_STATUS_PORT, HOST_STATUS_CONTRACT_VERSION, HostStatusServerError,
-    MatchHostStatusConfig, serve_match_host_with_status_and_control_and_shutdown,
+    MatchHostStatusConfig, serve_live_match_host_with_status_and_control_and_shutdown,
+    serve_match_host_with_status_and_control_and_shutdown,
+    serve_prepared_live_match_host_with_status_and_control_and_shutdown,
     serve_prepared_match_host_with_status_and_control_and_shutdown,
 };
 pub use host_transport::{
-    MatchHostTransportError, MatchHostWebTransportConfig, serve_match_host,
+    MatchHostTransportError, MatchHostWebTransportConfig,
+    serve_live_match_host_with_control_and_shutdown, serve_match_host,
     serve_match_host_with_control, serve_match_host_with_control_and_shutdown,
     serve_match_host_with_shutdown,
 };
@@ -95,3 +100,8 @@ pub use world::{
 
 #[cfg(test)]
 mod benchmarks;
+
+pub use live_host::{LiveHostError, LiveMatchHost, LivePlacementFailure};
+
+#[cfg(test)]
+mod test_support;

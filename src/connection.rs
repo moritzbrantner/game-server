@@ -96,6 +96,8 @@ pub(crate) async fn handle_connection<S: GameSimulation>(
         return Ok(());
     }
 
+    // Subscribe before admission: retirement can occur while the welcome stream is opening.
+    let mut shutdown = state.shutdown.subscribe();
     let replacement_token = generate_reconnect_token()?;
     // Keep hosted process drain atomic with new admission, without holding the
     // gate during the welcome handshake or established connection.
@@ -129,7 +131,7 @@ pub(crate) async fn handle_connection<S: GameSimulation>(
         }
     };
 
-    if let Err(error) = send_welcome(&connection, lease, &state).await {
+    if let Err(error) = send_welcome(&connection, lease, &state, &mut shutdown).await {
         let cleanup = {
             let mut runtime = state.runtime.lock().await;
             rollback_failed_welcome(&mut runtime, admission, lease)
@@ -141,7 +143,7 @@ pub(crate) async fn handle_connection<S: GameSimulation>(
         return Ok(());
     }
 
-    let result = run_established_connection(&connection, lease, &state).await;
+    let result = run_established_connection(&connection, lease, &state, &mut shutdown).await;
     state
         .runtime
         .lock()
@@ -154,6 +156,7 @@ async fn send_welcome<S: GameSimulation>(
     connection: &Connection,
     lease: SessionLease,
     state: &ConnectionState<S>,
+    shutdown: &mut broadcast::Receiver<()>,
 ) -> Result<(), String> {
     let (tick_hz, max_players, current_tick) = {
         let runtime = state.runtime.lock().await;
@@ -197,6 +200,7 @@ async fn send_welcome<S: GameSimulation>(
                 Err(_) => Err("welcome handshake timed out".to_owned()),
             }
         }
+        _ = shutdown.recv() => Err("server stopped before welcome completed".to_owned()),
         _ = connection.closed() => Err("connection closed before welcome completed".to_owned()),
     }
 }
@@ -235,10 +239,10 @@ async fn run_established_connection<S: GameSimulation>(
     connection: &Connection,
     lease: SessionLease,
     state: &ConnectionState<S>,
+    shutdown: &mut broadcast::Receiver<()>,
 ) -> Result<(), String> {
     let mut snapshots = state.snapshots.subscribe();
     let mut snapshot_sender = SnapshotSender::default();
-    let mut shutdown = state.shutdown.subscribe();
     let control_permits = Arc::new(Semaphore::new(MAX_CONCURRENT_CONTROL_STREAMS));
     let mut control_tasks = JoinSet::new();
     loop {
