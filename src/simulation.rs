@@ -1,17 +1,48 @@
 use crate::PlayerId;
-use crate::protocol::snapshot_hash;
+use crate::protocol::{MAX_COMMAND_REJECTION_PAYLOAD_BYTES, ProtocolError, snapshot_hash};
 use std::fmt;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct SimulationError {
     message: String,
+    rejection: Option<Vec<u8>>,
 }
 
 impl SimulationError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            rejection: None,
         }
+    }
+}
+
+impl SimulationError {
+    /// A recoverable private rejection. The simulation must leave canonical state unchanged.
+    /// Diagnostics deliberately omit the payload; runtime sequence/replay admission still fails.
+    pub fn command_rejected(payload: Vec<u8>) -> Result<Self, ProtocolError> {
+        if payload.len() > MAX_COMMAND_REJECTION_PAYLOAD_BYTES {
+            return Err(ProtocolError::PayloadTooLarge {
+                maximum: MAX_COMMAND_REJECTION_PAYLOAD_BYTES,
+                actual: payload.len(),
+            });
+        }
+        Ok(Self {
+            message: "command rejected".into(),
+            rejection: Some(payload),
+        })
+    }
+    pub fn command_rejection(&self) -> Option<&[u8]> {
+        self.rejection.as_deref()
+    }
+}
+impl fmt::Debug for SimulationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SimulationError")
+            .field("message", &self.message)
+            .field("recoverable", &self.rejection.is_some())
+            .finish()
     }
 }
 
@@ -109,6 +140,21 @@ pub trait GameSimulation: Send + 'static {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recoverable_command_errors_bound_private_payloads_and_omit_them_from_diagnostics() {
+        let error = SimulationError::command_rejected(b"private-reason".to_vec()).unwrap();
+        assert_eq!(
+            error.command_rejection(),
+            Some(b"private-reason".as_slice())
+        );
+        assert!(!format!("{error:?} {error}").contains("private-reason"));
+        assert!(SimulationError::new("fatal").command_rejection().is_none());
+        assert!(
+            SimulationError::command_rejected(vec![0; MAX_COMMAND_REJECTION_PAYLOAD_BYTES + 1])
+                .is_err()
+        );
+    }
 
     #[derive(Default)]
     struct PlayerScopedWithoutProjection {

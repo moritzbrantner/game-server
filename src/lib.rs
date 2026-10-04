@@ -65,13 +65,15 @@ pub use host_transport::{
 #[cfg(feature = "physics")]
 pub use physics::{PINNED_PHYSICS_ENGINE_REVISION, PhysicsWorldAdapter};
 pub use protocol::{
-    COMMAND_HEADER_BYTES, CommandFrame, MAX_COMMAND_PAYLOAD_BYTES, MAX_SNAPSHOT_FRAGMENTS,
+    COMMAND_HEADER_BYTES, COMMAND_REJECTION_HEADER_BYTES, CommandFrame, CommandRejectionFrame,
+    MAX_COMMAND_PAYLOAD_BYTES, MAX_COMMAND_REJECTION_PAYLOAD_BYTES, MAX_SNAPSHOT_FRAGMENTS,
     MAX_SNAPSHOT_FRAME_BYTES, MAX_SNAPSHOT_PAYLOAD_BYTES, MIN_FRAGMENTED_DATAGRAM_BYTES,
     PROTOCOL_VERSION, PlayerId, ProtocolError, RECONNECT_TOKEN_BYTES,
     SNAPSHOT_FRAGMENT_HEADER_BYTES, SNAPSHOT_HEADER_BYTES, SnapshotDatagram, SnapshotFragment,
-    SnapshotFrame, WELCOME_BYTES, Welcome, decode_command, decode_snapshot,
-    decode_snapshot_datagram, decode_snapshot_fragment, decode_welcome, encode_command,
-    encode_snapshot, encode_snapshot_fragments, encode_welcome, snapshot_hash,
+    SnapshotFrame, WELCOME_BYTES, Welcome, decode_command, decode_command_rejection,
+    decode_snapshot, decode_snapshot_datagram, decode_snapshot_fragment, decode_welcome,
+    encode_command, encode_command_rejection, encode_snapshot, encode_snapshot_fragments,
+    encode_welcome, snapshot_hash,
 };
 pub use reassembly::{
     SNAPSHOT_REASSEMBLY_MAX_BUFFERED_BYTES, SNAPSHOT_REASSEMBLY_MAX_IDLE_DATAGRAMS,

@@ -3,8 +3,9 @@ use crate::control::{
     MAX_CONTROL_PAYLOAD_BYTES, decode_control_request, encode_control_response,
 };
 use crate::protocol::{
-    ProtocolError, RECONNECT_TOKEN_BYTES, SnapshotFrame, Welcome, decode_command, encode_snapshot,
-    encode_snapshot_fragments, encode_welcome, snapshot_frame_tick,
+    ProtocolError, RECONNECT_TOKEN_BYTES, SnapshotFrame, Welcome, decode_command,
+    encode_command_rejection, encode_snapshot, encode_snapshot_fragments, encode_welcome,
+    snapshot_frame_tick,
 };
 use crate::runtime::{MatchRuntime, RuntimeError};
 use crate::session::{ReconnectToken, SessionLease};
@@ -251,13 +252,19 @@ async fn run_established_connection<S: GameSimulation>(
                 match datagram {
                     Ok(datagram) => match decode_command(datagram.as_ref()) {
                         Ok(command) => {
-                            match state.runtime.lock().await.submit_command(
-                                lease.player_id,
-                                lease.connection_epoch,
-                                command.sequence,
-                                &command.payload,
-                            ) {
+                            let outcome = {
+                                let mut runtime = state.runtime.lock().await;
+                                runtime.submit_command(lease.player_id, lease.connection_epoch, command.sequence, &command.payload)
+                            };
+                            match outcome {
                                 Ok(_) | Err(RuntimeError::Frozen) => {}
+                                Err(RuntimeError::Simulation(error)) if error.command_rejection().is_some() => {
+                                    let payload = error.command_rejection().expect("recoverable rejection was matched");
+                                    if send_command_rejection(connection, command.sequence, payload, shutdown).await.is_err() {
+                                        close(connection, CLOSE_PROTOCOL, "command rejection delivery failed");
+                                        return Ok(());
+                                    }
+                                }
                                 Err(error) => {
                                     close(connection, CLOSE_PROTOCOL, &error.to_string());
                                     return Ok(());
@@ -350,6 +357,34 @@ async fn run_established_connection<S: GameSimulation>(
             }
             _ = connection.closed() => return Ok(()),
         }
+    }
+}
+
+async fn send_command_rejection(
+    connection: &Connection,
+    sequence: u32,
+    payload: &[u8],
+    shutdown: &mut broadcast::Receiver<()>,
+) -> Result<(), String> {
+    let frame = encode_command_rejection(sequence, payload).map_err(|error| error.to_string())?;
+    let delivery = async {
+        let opening = connection
+            .open_uni()
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut stream = opening.await.map_err(|error| error.to_string())?;
+        stream
+            .write_all(&frame)
+            .await
+            .map_err(|error| error.to_string())?;
+        stream.finish().await.map_err(|error| error.to_string())?;
+        Ok(())
+    };
+    // One rejection is in flight per connection; a non-reading client cannot retain work indefinitely.
+    tokio::select! {
+        result = tokio::time::timeout(Duration::from_secs(2), delivery) => result.map_err(|_| "command rejection delivery timed out".to_owned())?,
+        _ = shutdown.recv() => Err("server stopped during command rejection".to_owned()),
+        _ = connection.closed() => Err("connection ended during command rejection".to_owned()),
     }
 }
 
@@ -1011,6 +1046,210 @@ mod tests {
                 large_projection(player_id, self.tick),
             ))
         }
+    }
+
+    struct RejectingSimulation(DemoSimulation);
+    impl GameSimulation for RejectingSimulation {
+        fn tick_hz(&self) -> u16 {
+            self.0.tick_hz()
+        }
+        fn max_players(&self) -> usize {
+            self.0.max_players()
+        }
+        fn current_tick(&self) -> u64 {
+            self.0.current_tick()
+        }
+        fn add_player(&mut self, player: crate::PlayerId) -> Result<(), crate::SimulationError> {
+            self.0.add_player(player)
+        }
+        fn remove_player(&mut self, player: crate::PlayerId) -> bool {
+            self.0.remove_player(player)
+        }
+        fn advance_tick(&mut self) -> Result<(), crate::SimulationError> {
+            self.0.advance_tick()
+        }
+        fn snapshot(&self) -> Result<SimulationSnapshot, crate::SimulationError> {
+            self.0.snapshot()
+        }
+        fn apply_command(
+            &mut self,
+            player: crate::PlayerId,
+            sequence: u32,
+            payload: &[u8],
+        ) -> Result<(), crate::SimulationError> {
+            if payload == b"invalid" {
+                Err(crate::SimulationError::command_rejected(b"private-reason".to_vec()).unwrap())
+            } else if payload == b"fatal" {
+                Err(crate::SimulationError::new("fatal command"))
+            } else {
+                self.0.apply_command(player, sequence, payload)
+            }
+        }
+    }
+    #[tokio::test]
+    async fn rejected_commands_reply_only_to_the_requesting_connection_without_consuming_sequence_or_replay()
+     {
+        use crate::{
+            WELCOME_BYTES, decode_command_rejection, decode_welcome, encode_command,
+            encode_demo_command, verify_replay,
+        };
+        use std::net::{Ipv4Addr, SocketAddr};
+        use wtransport::{ClientConfig, Endpoint, Identity, ServerConfig};
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let identity = Identity::self_signed(["localhost", "127.0.0.1"]).unwrap();
+            let hash = identity.certificate_chain().as_slice()[0].hash();
+            let endpoint = Endpoint::server(
+                ServerConfig::builder()
+                    .with_bind_address(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+                    .with_identity(identity)
+                    .build(),
+            )
+            .unwrap();
+            let port = endpoint.local_addr().unwrap().port();
+            let (snapshots, _) = broadcast::channel(1);
+            let (shutdown, _) = broadcast::channel(1);
+            let state = ConnectionState {
+                runtime: Arc::new(Mutex::new(MatchRuntime::new_with_replay_capture(
+                    RejectingSimulation(DemoSimulation::new()),
+                    10,
+                ))),
+                control: Arc::new(crate::RejectControlService),
+                control_handlers: Arc::new(Semaphore::new(1)),
+                snapshots,
+                shutdown,
+                admission_gate: None,
+            };
+            let mut tasks = JoinSet::new();
+            let accepting = state.clone();
+            tasks.spawn(async move {
+                let mut handlers = JoinSet::new();
+                loop {
+                    let request = endpoint.accept().await.await.unwrap();
+                    let connection = request.accept().await.unwrap();
+                    let state = accepting.clone();
+                    handlers.spawn(async move {
+                        handle_connection(connection, state, AdmissionRequest::New)
+                            .await
+                            .unwrap();
+                    });
+                }
+            });
+            let client = Endpoint::client(
+                ClientConfig::builder()
+                    .with_bind_default()
+                    .with_server_certificate_hashes([hash])
+                    .build(),
+            )
+            .unwrap();
+            let first = client
+                .connect(format!("https://127.0.0.1:{port}/game"))
+                .await
+                .unwrap();
+            let mut welcome = [0; WELCOME_BYTES];
+            first
+                .accept_uni()
+                .await
+                .unwrap()
+                .read_exact(&mut welcome)
+                .await
+                .unwrap();
+            let first_lease = decode_welcome(&welcome).unwrap();
+            let second = client
+                .connect(format!("https://127.0.0.1:{port}/game"))
+                .await
+                .unwrap();
+            second
+                .accept_uni()
+                .await
+                .unwrap()
+                .read_exact(&mut welcome)
+                .await
+                .unwrap();
+            let before = state.runtime.lock().await.snapshot().unwrap();
+            let before_records = state
+                .runtime
+                .lock()
+                .await
+                .replay_log()
+                .unwrap()
+                .records()
+                .len();
+            first
+                .send_datagram(encode_command(1, b"invalid").unwrap())
+                .unwrap();
+            let mut stream = first.accept_uni().await.unwrap();
+            let mut frame = [0; 22];
+            stream.read_exact(&mut frame).await.unwrap();
+            assert_eq!(
+                decode_command_rejection(&frame).unwrap(),
+                crate::CommandRejectionFrame {
+                    sequence: 1,
+                    payload: b"private-reason".to_vec()
+                }
+            );
+            assert_eq!(stream.read(&mut [0]).await.unwrap(), None);
+            assert_eq!(state.runtime.lock().await.snapshot().unwrap(), before);
+            assert_eq!(
+                state
+                    .runtime
+                    .lock()
+                    .await
+                    .replay_log()
+                    .unwrap()
+                    .records()
+                    .len(),
+                before_records
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), second.accept_uni())
+                    .await
+                    .is_err()
+            );
+            first
+                .send_datagram(encode_command(1, &encode_demo_command(1, 0).unwrap()).unwrap())
+                .unwrap();
+            loop {
+                if state
+                    .runtime
+                    .lock()
+                    .await
+                    .replay_log()
+                    .unwrap()
+                    .records()
+                    .len()
+                    > before_records
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            {
+                let mut runtime = state.runtime.lock().await;
+                runtime.advance_tick().unwrap();
+                assert_eq!(
+                    verify_replay(
+                        RejectingSimulation(DemoSimulation::new()),
+                        runtime.replay_log().unwrap()
+                    )
+                    .unwrap()
+                    .final_snapshot,
+                    runtime.snapshot().unwrap()
+                );
+                assert!(
+                    runtime
+                        .validate_connection(first_lease.player_id, first_lease.connection_epoch)
+                        .is_ok()
+                );
+            }
+            first
+                .send_datagram(encode_command(2, b"fatal").unwrap())
+                .unwrap();
+            first.closed().await;
+            second.close(VarInt::from_u32(0), b"done");
+            tasks.shutdown().await;
+        })
+        .await
+        .expect("private rejection must complete without disconnecting a valid sender");
     }
 
     #[tokio::test]
