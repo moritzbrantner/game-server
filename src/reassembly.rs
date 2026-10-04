@@ -5,6 +5,7 @@ use crate::protocol::{
     SnapshotFragment, SnapshotFrame, decode_snapshot_datagram, decode_snapshot_owned,
 };
 use std::collections::BTreeMap;
+use std::fmt;
 
 /// Incomplete snapshots kept at once; the oldest is evicted for a newer one.
 pub const SNAPSHOT_REASSEMBLY_MAX_PENDING: usize = 4;
@@ -48,13 +49,21 @@ pub struct SnapshotReassemblyStats {
     pub rejected_datagrams: u64,
 }
 
-#[derive(Debug)]
 struct PendingSnapshot {
     chunks: Vec<Option<Vec<u8>>>,
     received: usize,
     bytes: usize,
     /// Value of the reassembler's datagram count when a fragment was last stored.
     last_stored_at: u64,
+}
+impl fmt::Debug for PendingSnapshot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PendingSnapshot")
+            .field("received", &self.received)
+            .field("bytes", &self.bytes)
+            .field("last_stored_at", &self.last_stored_at)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Turns received snapshot datagrams back into verified [`SnapshotFrame`]s.

@@ -113,6 +113,22 @@ fn opaque_payloads_and_credentials_are_redacted_at_nested_diagnostic_boundaries(
     }
     assert_eq!(ReconnectToken::decode_hex(&token.encode_hex()), Some(token));
     assert_eq!(snapshot.payload, secret);
+    let mut reassembler = game_server::SnapshotReassembler::new();
+    let payload = secret.repeat(100);
+    let frame = SnapshotFrame {
+        tick: 7,
+        state_hash: game_server::snapshot_hash(7, &payload),
+        payload,
+    };
+    let fragments = game_server::encode_snapshot_fragments(
+        &game_server::encode_snapshot(&frame).unwrap(),
+        game_server::MIN_FRAGMENTED_DATAGRAM_BYTES,
+    )
+    .unwrap();
+    assert!(fragments.len() > 1);
+    assert!(reassembler.accept(&fragments[0]).unwrap().is_none());
+    let contents = format!("{secret:?}");
+    assert!(!format!("{reassembler:?}").contains(&contents[1..contents.len() - 1]));
 }
 
 #[test]
