@@ -19,12 +19,12 @@ pub struct ControlContext {
     pub connection_epoch: u32,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct ControlRequest {
     pub payload: Vec<u8>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct ControlResponse {
     pub accepted: bool,
     pub payload: Vec<u8>,
@@ -210,6 +210,23 @@ fn decode_frame(bytes: &[u8]) -> Result<(u8, Vec<u8>), ControlWireError> {
         return Err(ControlWireError::TrailingBytes(bytes.len() - expected_len));
     }
     Ok((kind, bytes[CONTROL_HEADER_BYTES..].to_vec()))
+}
+
+impl fmt::Debug for ControlRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ControlRequest")
+            .field("payload_bytes", &self.payload.len())
+            .finish()
+    }
+}
+
+impl fmt::Debug for ControlResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ControlResponse")
+            .field("accepted", &self.accepted)
+            .field("payload_bytes", &self.payload.len())
+            .finish()
+    }
 }
 
 #[cfg(test)]

@@ -5,7 +5,7 @@ use std::fmt;
 pub const DEFAULT_MAX_PLAYERS: usize = 16;
 pub const DEFAULT_RECONNECT_GRACE_TICKS: u64 = 20 * 30;
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ReconnectToken(pub [u8; RECONNECT_TOKEN_BYTES]);
 
 impl ReconnectToken {
@@ -399,6 +399,12 @@ fn decode_hex_nibble(value: u8) -> Option<u8> {
         b'a'..=b'f' => Some(value - b'a' + 10),
         b'A'..=b'F' => Some(value - b'A' + 10),
         _ => None,
+    }
+}
+
+impl fmt::Debug for ReconnectToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ReconnectToken([redacted])")
     }
 }
 

@@ -24,7 +24,7 @@ const CHECKPOINT_FIXED_BODY_BYTES: usize = 8 + 4;
 const MAX_REPLAY_BODY_BYTES: usize = CHECKPOINT_FIXED_BODY_BYTES + MAX_SNAPSHOT_PAYLOAD_BYTES;
 const MAX_VERIFIER_TICK_GAP: u64 = 1;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub enum ReplayRecord {
     PlayerAdmitted {
         tick: u64,
@@ -653,6 +653,43 @@ fn require_body_length(kind: u8, body: &[u8], expected: usize) -> Result<(), Rep
         });
     }
     Ok(())
+}
+
+impl fmt::Debug for ReplayRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CommandApplied {
+                tick,
+                player_id,
+                sequence,
+                payload,
+            } => f
+                .debug_struct("CommandApplied")
+                .field("tick", tick)
+                .field("player_id", player_id)
+                .field("sequence", sequence)
+                .field("payload_bytes", &payload.len())
+                .finish(),
+            Self::PlayerAdmitted { tick, player_id } => f
+                .debug_struct("PlayerAdmitted")
+                .field("tick", tick)
+                .field("player_id", player_id)
+                .finish(),
+            Self::PlayerRemoved { tick, player_id } => f
+                .debug_struct("PlayerRemoved")
+                .field("tick", tick)
+                .field("player_id", player_id)
+                .finish(),
+            Self::Checkpoint { snapshot } => f
+                .debug_struct("Checkpoint")
+                .field("snapshot", snapshot)
+                .finish(),
+            Self::DigestCheckpoint { tick, .. } => f
+                .debug_struct("DigestCheckpoint")
+                .field("tick", tick)
+                .finish_non_exhaustive(),
+        }
+    }
 }
 
 #[cfg(test)]
