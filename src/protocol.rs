@@ -31,26 +31,26 @@ const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
 pub type PlayerId = u32;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct CommandFrame {
     pub sequence: u32,
     pub payload: Vec<u8>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct CommandRejectionFrame {
     pub sequence: u32,
     pub payload: Vec<u8>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SnapshotFrame {
     pub tick: u64,
     pub state_hash: u64,
     pub payload: Vec<u8>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Welcome {
     pub player_id: PlayerId,
     pub tick_hz: u16,
@@ -65,7 +65,7 @@ pub struct Welcome {
 ///
 /// Concatenating the chunks of fragments `0..count` for one tick yields the
 /// exact bytes of a normal encoded snapshot frame.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct SnapshotFragment<'a> {
     pub tick: u64,
     pub index: u8,
@@ -456,6 +456,59 @@ fn fnv_update(mut hash: u64, bytes: &[u8]) -> u64 {
         hash = hash.wrapping_mul(FNV_PRIME);
     }
     hash
+}
+
+impl fmt::Debug for CommandFrame {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CommandFrame")
+            .field("sequence", &self.sequence)
+            .field("payload_bytes", &self.payload.len())
+            .finish()
+    }
+}
+
+impl fmt::Debug for CommandRejectionFrame {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CommandRejectionFrame")
+            .field("sequence", &self.sequence)
+            .field("payload_bytes", &self.payload.len())
+            .finish()
+    }
+}
+
+impl fmt::Debug for SnapshotFrame {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SnapshotFrame")
+            .field("tick", &self.tick)
+            .field("state_hash", &self.state_hash)
+            .field("payload_bytes", &self.payload.len())
+            .finish()
+    }
+}
+
+impl fmt::Debug for Welcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Welcome")
+            .field("player_id", &self.player_id)
+            .field("tick_hz", &self.tick_hz)
+            .field("max_players", &self.max_players)
+            .field("current_tick", &self.current_tick)
+            .field("connection_epoch", &self.connection_epoch)
+            .field("reconnect_grace_ticks", &self.reconnect_grace_ticks)
+            .field("reconnect_token", &"[redacted]")
+            .finish()
+    }
+}
+
+impl fmt::Debug for SnapshotFragment<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SnapshotFragment")
+            .field("tick", &self.tick)
+            .field("index", &self.index)
+            .field("count", &self.count)
+            .field("chunk_bytes", &self.chunk.len())
+            .finish()
+    }
 }
 
 #[cfg(test)]

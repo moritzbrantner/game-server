@@ -54,7 +54,7 @@ impl fmt::Display for SimulationError {
 
 impl std::error::Error for SimulationError {}
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct SimulationSnapshot {
     pub tick: u64,
     pub state_hash: u64,
@@ -134,6 +134,16 @@ pub trait GameSimulation: Send + 'static {
         _context: PlayerSnapshotContext<'_>,
     ) -> Result<SimulationSnapshot, SimulationError> {
         self.snapshot_for(player_id)
+    }
+}
+
+impl fmt::Debug for SimulationSnapshot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SimulationSnapshot")
+            .field("tick", &self.tick)
+            .field("state_hash", &self.state_hash)
+            .field("payload_bytes", &self.payload.len())
+            .finish()
     }
 }
 
