@@ -46,6 +46,20 @@ pub enum SnapshotScope {
     PlayerScoped,
 }
 
+/// Runtime-owned facts for a player-facing projection, borrowed under its lock.
+/// No credentials, epochs, or mutable session access cross this boundary.
+#[derive(Clone, Copy)]
+pub struct PlayerSnapshotContext<'a> {
+    pub(crate) sessions: &'a crate::session::SessionRegistry,
+}
+
+impl PlayerSnapshotContext<'_> {
+    /// Missing and grace-disconnected identities are both offline.
+    pub fn is_connected(&self, player_id: PlayerId) -> bool {
+        self.sessions.is_connected(player_id)
+    }
+}
+
 pub trait GameSimulation: Send + 'static {
     fn tick_hz(&self) -> u16;
     fn max_players(&self) -> usize;
@@ -75,6 +89,15 @@ pub trait GameSimulation: Send + 'static {
         Err(SimulationError::new(
             "player-scoped snapshots require an explicit per-player projection",
         ))
+    }
+    /// Presentation-only context; canonical replay snapshots remain independent.
+    /// Implementations retain responsibility for recipient validation and private-state scoping.
+    fn snapshot_for_with_context(
+        &self,
+        player_id: PlayerId,
+        _context: PlayerSnapshotContext<'_>,
+    ) -> Result<SimulationSnapshot, SimulationError> {
+        self.snapshot_for(player_id)
     }
 }
 

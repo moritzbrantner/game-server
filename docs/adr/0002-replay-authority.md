@@ -29,3 +29,9 @@ Version-two logs can retain a SHA-256 digest instead of the full canonical paylo
 The runtime selects digest checkpoints when the canonical payload exceeds 20 bytes, where the 45-byte digest record is smaller than a full checkpoint. Recovery always appends a full final checkpoint. Logs containing only existing record kinds continue to encode as version one, preserving the fixed byte fixture; the decoder accepts both versions and rejects digest records under version one.
 
 Tick history now grows by at most 45 encoded bytes per tick, independent of canonical payload size. This bounds six hours at 20 Hz to 19,440,000 tick-record bytes, plus commands, session events, and the full final checkpoint. History still grows with match duration and authoritative events; consumers must enforce their own match lifetime. The existing recovery image size limit remains enforced.
+
+## Runtime presence in player projections
+
+`GameSimulation::snapshot_for_with_context` receives a borrowed `PlayerSnapshotContext` under the runtime lock. Its only query is whether a player currently owns a connected session. Grace-disconnected and missing identities are offline. The context exposes neither tokens nor epochs and permits no mutation. The default delegates to the existing player-scoped projection, preserving existing consumers and its fail-closed default.
+
+This context is presentation evidence, excluded from canonical snapshots and replay. After recovery all restored slots are disconnected until successfully reconnected; projections query that current authority rather than replaying past connection state. Game adapters continue to validate recipients and scope private payloads.
