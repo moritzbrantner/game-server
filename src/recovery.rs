@@ -379,7 +379,9 @@ impl RecoveryImage {
                 ReplayRecord::PlayerRemoved { player_id, .. } => {
                     live_players.remove(player_id);
                 }
-                ReplayRecord::CommandApplied { .. } | ReplayRecord::Checkpoint { .. } => {}
+                ReplayRecord::CommandApplied { .. }
+                | ReplayRecord::Checkpoint { .. }
+                | ReplayRecord::DigestCheckpoint { .. } => {}
             }
         }
         let session_players = self

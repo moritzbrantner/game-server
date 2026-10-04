@@ -5,7 +5,8 @@ use crate::simulation::{GameSimulation, SimulationError, SimulationSnapshot};
 use std::collections::BTreeMap;
 use std::fmt;
 
-pub const REPLAY_FORMAT_VERSION: u8 = 1;
+pub const REPLAY_FORMAT_VERSION: u8 = 2;
+const LEGACY_REPLAY_FORMAT_VERSION: u8 = 1;
 const REPLAY_MAGIC: &[u8; 4] = b"GSRP";
 const REPLAY_HEADER_BYTES: usize = REPLAY_MAGIC.len() + 1;
 const RECORD_HEADER_BYTES: usize = 1 + 8 + 4;
@@ -13,6 +14,10 @@ const ADMISSION_KIND: u8 = 1;
 const COMMAND_KIND: u8 = 2;
 const REMOVAL_KIND: u8 = 3;
 const CHECKPOINT_KIND: u8 = 4;
+const DIGEST_CHECKPOINT_KIND: u8 = 5;
+const DIGEST_BODY_BYTES: usize = 32;
+pub(crate) const FULL_CHECKPOINT_PAYLOAD_THRESHOLD: usize =
+    DIGEST_BODY_BYTES - CHECKPOINT_FIXED_BODY_BYTES;
 const PLAYER_BODY_BYTES: usize = 4;
 const COMMAND_FIXED_BODY_BYTES: usize = 4 + 4 + 4;
 const CHECKPOINT_FIXED_BODY_BYTES: usize = 8 + 4;
@@ -38,6 +43,10 @@ pub enum ReplayRecord {
     Checkpoint {
         snapshot: SimulationSnapshot,
     },
+    DigestCheckpoint {
+        tick: u64,
+        digest: [u8; 32],
+    },
 }
 
 impl ReplayRecord {
@@ -45,7 +54,8 @@ impl ReplayRecord {
         match self {
             Self::PlayerAdmitted { tick, .. }
             | Self::CommandApplied { tick, .. }
-            | Self::PlayerRemoved { tick, .. } => *tick,
+            | Self::PlayerRemoved { tick, .. }
+            | Self::DigestCheckpoint { tick, .. } => *tick,
             Self::Checkpoint { snapshot } => snapshot.tick,
         }
     }
@@ -64,7 +74,17 @@ impl ReplayLog {
     pub fn encode(&self) -> Result<Vec<u8>, ReplayError> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(REPLAY_MAGIC);
-        bytes.push(REPLAY_FORMAT_VERSION);
+        bytes.push(
+            if self
+                .records
+                .iter()
+                .any(|record| matches!(record, ReplayRecord::DigestCheckpoint { .. }))
+            {
+                REPLAY_FORMAT_VERSION
+            } else {
+                LEGACY_REPLAY_FORMAT_VERSION
+            },
+        );
         for record in &self.records {
             encode_record(record, &mut bytes)?;
         }
@@ -79,7 +99,7 @@ impl ReplayLog {
             return Err(ReplayError::InvalidMagic);
         }
         let version = bytes[REPLAY_MAGIC.len()];
-        if version != REPLAY_FORMAT_VERSION {
+        if version != REPLAY_FORMAT_VERSION && version != LEGACY_REPLAY_FORMAT_VERSION {
             return Err(ReplayError::UnsupportedVersion(version));
         }
 
@@ -92,6 +112,9 @@ impl ReplayLog {
                 return Err(ReplayError::Truncated);
             }
             let kind = bytes[offset];
+            if version == LEGACY_REPLAY_FORMAT_VERSION && kind == DIGEST_CHECKPOINT_KIND {
+                return Err(ReplayError::UnknownRecordKind(kind));
+            }
             let tick = u64::from_be_bytes(
                 bytes[offset + 1..offset + 9]
                     .try_into()
@@ -195,6 +218,7 @@ pub enum ReplayError {
         actual_hash: u64,
     },
     CheckpointPayloadMismatch(u64),
+    CheckpointDigestMismatch(u64),
     Simulation(SimulationError),
 }
 
@@ -282,6 +306,9 @@ impl fmt::Display for ReplayError {
             ),
             Self::CheckpointPayloadMismatch(tick) => {
                 write!(formatter, "replay payload diverged at checkpoint {tick}")
+            }
+            Self::CheckpointDigestMismatch(tick) => {
+                write!(formatter, "replay digest diverged at checkpoint {tick}")
             }
             Self::Simulation(error) => write!(formatter, "replay simulation failed: {error}"),
         }
@@ -387,6 +414,13 @@ pub(crate) fn replay_into<S: GameSimulation>(
                     return Err(ReplayError::MissingPlayerOnRemoval(*player_id));
                 }
             }
+            ReplayRecord::DigestCheckpoint { tick, digest } => {
+                let actual = simulation.snapshot()?;
+                if canonical_digest(&actual) != *digest {
+                    return Err(ReplayError::CheckpointDigestMismatch(*tick));
+                }
+                checkpoints_verified += 1;
+            }
             ReplayRecord::Checkpoint { snapshot } => {
                 let actual = simulation.snapshot()?;
                 if actual.state_hash != snapshot.state_hash {
@@ -408,8 +442,23 @@ pub(crate) fn replay_into<S: GameSimulation>(
     Ok((simulation, checkpoints_verified))
 }
 
+pub(crate) fn canonical_digest(snapshot: &SimulationSnapshot) -> [u8; 32] {
+    let mut context = ring::digest::Context::new(&ring::digest::SHA256);
+    context.update(b"game-server/replay-checkpoint/v2\0");
+    context.update(&snapshot.tick.to_be_bytes());
+    context.update(&snapshot.state_hash.to_be_bytes());
+    context.update(&(snapshot.payload.len() as u64).to_be_bytes());
+    context.update(&snapshot.payload);
+    context
+        .finish()
+        .as_ref()
+        .try_into()
+        .expect("SHA256 has 32 bytes")
+}
+
 fn record_body_len(record: &ReplayRecord) -> Result<usize, ReplayError> {
     match record {
+        ReplayRecord::DigestCheckpoint { .. } => Ok(DIGEST_BODY_BYTES),
         ReplayRecord::PlayerAdmitted { .. } | ReplayRecord::PlayerRemoved { .. } => {
             Ok(PLAYER_BODY_BYTES)
         }
@@ -454,6 +503,7 @@ fn encode_record(record: &ReplayRecord, output: &mut Vec<u8>) -> Result<(), Repl
         ReplayRecord::CommandApplied { .. } => COMMAND_KIND,
         ReplayRecord::PlayerRemoved { .. } => REMOVAL_KIND,
         ReplayRecord::Checkpoint { .. } => CHECKPOINT_KIND,
+        ReplayRecord::DigestCheckpoint { .. } => DIGEST_CHECKPOINT_KIND,
     };
     output.reserve(RECORD_HEADER_BYTES + body_len);
     output.push(kind);
@@ -464,6 +514,7 @@ fn encode_record(record: &ReplayRecord, output: &mut Vec<u8>) -> Result<(), Repl
             .to_be_bytes(),
     );
     match record {
+        ReplayRecord::DigestCheckpoint { digest, .. } => output.extend_from_slice(digest),
         ReplayRecord::PlayerAdmitted { player_id, .. }
         | ReplayRecord::PlayerRemoved { player_id, .. } => {
             output.extend_from_slice(&player_id.to_be_bytes());
@@ -498,6 +549,13 @@ fn encode_record(record: &ReplayRecord, output: &mut Vec<u8>) -> Result<(), Repl
 
 fn decode_record(kind: u8, tick: u64, body: &[u8]) -> Result<ReplayRecord, ReplayError> {
     match kind {
+        DIGEST_CHECKPOINT_KIND => {
+            require_body_length(kind, body, DIGEST_BODY_BYTES)?;
+            Ok(ReplayRecord::DigestCheckpoint {
+                tick,
+                digest: body.try_into().expect("checked digest body"),
+            })
+        }
         ADMISSION_KIND => {
             require_body_length(kind, body, PLAYER_BODY_BYTES)?;
             Ok(ReplayRecord::PlayerAdmitted {
@@ -601,6 +659,43 @@ fn require_body_length(kind: u8, body: &[u8], expected: usize) -> Result<(), Rep
 mod tests {
     use super::*;
     use crate::world::{DemoSimulation, encode_demo_command};
+
+    #[test]
+    fn digest_checkpoints_round_trip_and_verify_each_tick() {
+        let mut source = DemoSimulation::new();
+        let mut log = ReplayLog::default();
+        for _ in 0..100 {
+            source.advance_tick().unwrap();
+            let snapshot = source.snapshot().unwrap();
+            log.append(ReplayRecord::DigestCheckpoint {
+                tick: snapshot.tick,
+                digest: canonical_digest(&snapshot),
+            });
+        }
+        let bytes = log.encode().unwrap();
+        assert_eq!(bytes.len(), REPLAY_HEADER_BYTES + 100 * 45);
+        assert_eq!(bytes[4], REPLAY_FORMAT_VERSION);
+        let decoded = ReplayLog::decode(&bytes).unwrap();
+        assert_eq!(decoded, log);
+        let result = verify_replay(DemoSimulation::new(), &decoded).unwrap();
+        assert_eq!(result.checkpoints_verified, 100);
+        assert_eq!(result.final_snapshot, source.snapshot().unwrap());
+        let mut tampered = bytes.clone();
+        tampered[REPLAY_HEADER_BYTES + RECORD_HEADER_BYTES] ^= 1;
+        assert_eq!(
+            verify_replay(
+                DemoSimulation::new(),
+                &ReplayLog::decode(&tampered).unwrap()
+            ),
+            Err(ReplayError::CheckpointDigestMismatch(1))
+        );
+        let mut legacy = bytes;
+        legacy[4] = LEGACY_REPLAY_FORMAT_VERSION;
+        assert_eq!(
+            ReplayLog::decode(&legacy),
+            Err(ReplayError::UnknownRecordKind(DIGEST_CHECKPOINT_KIND))
+        );
+    }
 
     #[test]
     fn replay_log_binary_round_trip_is_exact() {

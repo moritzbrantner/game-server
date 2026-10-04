@@ -370,9 +370,16 @@ impl<S: GameSimulation> MatchRuntime<S> {
         self.simulation.advance_tick()?;
         let snapshot = self.simulation.snapshot()?;
         if let Some(replay) = &mut self.replay {
-            replay.append(ReplayRecord::Checkpoint {
-                snapshot: snapshot.clone(),
-            });
+            if snapshot.payload.len() > crate::replay::FULL_CHECKPOINT_PAYLOAD_THRESHOLD {
+                replay.append(ReplayRecord::DigestCheckpoint {
+                    tick: snapshot.tick,
+                    digest: crate::replay::canonical_digest(&snapshot),
+                });
+            } else {
+                replay.append(ReplayRecord::Checkpoint {
+                    snapshot: snapshot.clone(),
+                });
+            }
         }
         Ok(snapshot)
     }
@@ -453,6 +460,47 @@ mod tests {
             }
             Ok(SimulationSnapshot::new(self.tick, payload))
         }
+    }
+
+    #[test]
+    fn large_canonical_state_uses_digest_ticks_and_full_recovery_checkpoint() {
+        let mut runtime = MatchRuntime::new_with_replay_capture(FakeSimulation::default(), 10);
+        let lease = runtime.admit(token(1)).unwrap();
+        runtime
+            .submit_command(lease.player_id, lease.connection_epoch, 1, &[7; 1024])
+            .unwrap();
+        for _ in 0..100 {
+            runtime.advance_tick().unwrap();
+        }
+        runtime
+            .submit_command(lease.player_id, lease.connection_epoch, 2, &[9; 1024])
+            .unwrap();
+        let expected = runtime.advance_tick().unwrap();
+        runtime.freeze_for_recovery();
+        let image = runtime.recovery_image().unwrap();
+        assert_eq!(
+            image
+                .replay
+                .records()
+                .iter()
+                .filter(|record| matches!(record, ReplayRecord::DigestCheckpoint { .. }))
+                .count(),
+            101
+        );
+        assert!(
+            matches!(image.replay.records().last(), Some(ReplayRecord::Checkpoint { snapshot }) if snapshot == &expected)
+        );
+        let bytes = image.encode().unwrap();
+        assert!(
+            bytes.len() < 10_000,
+            "full canonical state retained at every tick"
+        );
+        let restored = MatchRuntime::restore_from_recovery(
+            FakeSimulation::default(),
+            RecoveryImage::decode(&bytes).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(restored.snapshot().unwrap(), expected);
     }
 
     fn token(value: u8) -> ReconnectToken {
