@@ -2,6 +2,8 @@ use std::fmt;
 
 pub const PROTOCOL_VERSION: u8 = 3;
 pub const COMMAND_HEADER_BYTES: usize = 8;
+pub const COMMAND_REJECTION_HEADER_BYTES: usize = 8;
+pub const MAX_COMMAND_REJECTION_PAYLOAD_BYTES: usize = 1024;
 pub const SNAPSHOT_HEADER_BYTES: usize = 20;
 pub const RECONNECT_TOKEN_BYTES: usize = 16;
 pub const WELCOME_BYTES: usize = 46;
@@ -20,6 +22,7 @@ pub const MIN_FRAGMENTED_DATAGRAM_BYTES: usize =
     SNAPSHOT_FRAGMENT_HEADER_BYTES + MAX_SNAPSHOT_FRAME_BYTES.div_ceil(MAX_SNAPSHOT_FRAGMENTS);
 
 const COMMAND_KIND: u8 = 1;
+const COMMAND_REJECTION_KIND: u8 = 5;
 const SNAPSHOT_KIND: u8 = 2;
 const WELCOME_KIND: u8 = 3;
 pub(crate) const SNAPSHOT_FRAGMENT_KIND: u8 = 4;
@@ -30,6 +33,12 @@ pub type PlayerId = u32;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommandFrame {
+    pub sequence: u32,
+    pub payload: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommandRejectionFrame {
     pub sequence: u32,
     pub payload: Vec<u8>,
 }
@@ -133,19 +142,37 @@ impl fmt::Display for ProtocolError {
 impl std::error::Error for ProtocolError {}
 
 pub fn encode_command(sequence: u32, payload: &[u8]) -> Result<Vec<u8>, ProtocolError> {
+    encode_sequenced(COMMAND_KIND, sequence, payload, MAX_COMMAND_PAYLOAD_BYTES)
+}
+
+pub fn encode_command_rejection(sequence: u32, payload: &[u8]) -> Result<Vec<u8>, ProtocolError> {
+    encode_sequenced(
+        COMMAND_REJECTION_KIND,
+        sequence,
+        payload,
+        MAX_COMMAND_REJECTION_PAYLOAD_BYTES,
+    )
+}
+
+fn encode_sequenced(
+    kind: u8,
+    sequence: u32,
+    payload: &[u8],
+    maximum: usize,
+) -> Result<Vec<u8>, ProtocolError> {
     if sequence == 0 {
         return Err(ProtocolError::InvalidSequence);
     }
-    if payload.len() > MAX_COMMAND_PAYLOAD_BYTES {
+    if payload.len() > maximum {
         return Err(ProtocolError::PayloadTooLarge {
-            maximum: MAX_COMMAND_PAYLOAD_BYTES,
+            maximum,
             actual: payload.len(),
         });
     }
     let payload_len = u16::try_from(payload.len()).expect("bounded command payload length");
     let mut bytes = Vec::with_capacity(COMMAND_HEADER_BYTES + payload.len());
     bytes.push(PROTOCOL_VERSION);
-    bytes.push(COMMAND_KIND);
+    bytes.push(kind);
     bytes.extend_from_slice(&sequence.to_be_bytes());
     bytes.extend_from_slice(&payload_len.to_be_bytes());
     bytes.extend_from_slice(payload);
@@ -153,13 +180,31 @@ pub fn encode_command(sequence: u32, payload: &[u8]) -> Result<Vec<u8>, Protocol
 }
 
 pub fn decode_command(bytes: &[u8]) -> Result<CommandFrame, ProtocolError> {
+    let (sequence, payload) = decode_sequenced(bytes, COMMAND_KIND, MAX_COMMAND_PAYLOAD_BYTES)?;
+    Ok(CommandFrame { sequence, payload })
+}
+
+pub fn decode_command_rejection(bytes: &[u8]) -> Result<CommandRejectionFrame, ProtocolError> {
+    let (sequence, payload) = decode_sequenced(
+        bytes,
+        COMMAND_REJECTION_KIND,
+        MAX_COMMAND_REJECTION_PAYLOAD_BYTES,
+    )?;
+    Ok(CommandRejectionFrame { sequence, payload })
+}
+
+fn decode_sequenced(
+    bytes: &[u8],
+    kind: u8,
+    maximum: usize,
+) -> Result<(u32, Vec<u8>), ProtocolError> {
     if bytes.len() < COMMAND_HEADER_BYTES {
         return Err(ProtocolError::IncorrectLength {
             expected: COMMAND_HEADER_BYTES,
             actual: bytes.len(),
         });
     }
-    require_header(bytes, COMMAND_KIND)?;
+    require_header(bytes, kind)?;
     let sequence = u32::from_be_bytes(bytes[2..6].try_into().expect("checked command header"));
     if sequence == 0 {
         return Err(ProtocolError::InvalidSequence);
@@ -167,17 +212,14 @@ pub fn decode_command(bytes: &[u8]) -> Result<CommandFrame, ProtocolError> {
     let payload_len = usize::from(u16::from_be_bytes(
         bytes[6..8].try_into().expect("checked command header"),
     ));
-    if payload_len > MAX_COMMAND_PAYLOAD_BYTES {
+    if payload_len > maximum {
         return Err(ProtocolError::PayloadTooLarge {
-            maximum: MAX_COMMAND_PAYLOAD_BYTES,
+            maximum,
             actual: payload_len,
         });
     }
     require_length(bytes, COMMAND_HEADER_BYTES + payload_len)?;
-    Ok(CommandFrame {
-        sequence,
-        payload: bytes[COMMAND_HEADER_BYTES..].to_vec(),
-    })
+    Ok((sequence, bytes[COMMAND_HEADER_BYTES..].to_vec()))
 }
 
 pub fn encode_snapshot(snapshot: &SnapshotFrame) -> Result<Vec<u8>, ProtocolError> {
@@ -717,6 +759,34 @@ mod tests {
             decode_snapshot_owned(corrupted),
             Err(ProtocolError::InvalidStateHash { .. })
         ));
+    }
+
+    #[test]
+    fn command_rejections_are_bounded_distinct_and_sequence_correlated() {
+        let bytes = encode_command_rejection(17, b"private feedback").unwrap();
+        assert_eq!(bytes[..8], [3, 5, 0, 0, 0, 17, 0, 16]);
+        assert_eq!(
+            decode_command_rejection(&bytes).unwrap(),
+            CommandRejectionFrame {
+                sequence: 17,
+                payload: b"private feedback".to_vec()
+            }
+        );
+        assert!(decode_command(&bytes).is_err());
+        assert!(decode_command_rejection(&encode_command(17, b"feedback").unwrap()).is_err());
+        assert!(encode_command_rejection(0, b"").is_err());
+        assert!(
+            encode_command_rejection(1, &vec![0; MAX_COMMAND_REJECTION_PAYLOAD_BYTES + 1]).is_err()
+        );
+        for length in 0..bytes.len() {
+            assert!(decode_command_rejection(&bytes[..length]).is_err());
+        }
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(decode_command_rejection(&trailing).is_err());
+        let mut invalid = bytes;
+        invalid[0] = 99;
+        assert!(decode_command_rejection(&invalid).is_err());
     }
 
     #[test]
