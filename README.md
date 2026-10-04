@@ -21,6 +21,8 @@ Single-match and hosted listeners share one internal connection module for admis
 
 `browser` exposes the versioned browser-facing boundary without creating a second gameplay protocol. `BROWSER_PROTOCOL_CONTRACT` binds the route version to the existing command/snapshot protocol version, reliable-control format version, reconnect-token size, payload ceilings, and snapshot fragment bound so browser clients can pin one explicit compatibility surface.
 
+Hosted browser deployments can set `MatchHostWebTransportConfig::allowed_origins` to `Some(BrowserOriginAllowlist::new(["https://board.example"])?)`. The allowlist requires canonical HTTP(S) origins and rejects missing/nonmatching headers before admission or reconnect fencing. `None` permits native/local clients without an Origin. This is a browser boundary, not authentication; see [the origin decision](docs/adr/0007-browser-origin-allowlists.md).
+
 Use `BrowserRoutePrefix` plus a validated `MatchId` to address a match. With a `/game` base path and match ID `uno_01`, the canonical paths are:
 
 ```text

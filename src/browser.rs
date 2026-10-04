@@ -5,8 +5,57 @@ use crate::protocol::{
     MAX_SNAPSHOT_PAYLOAD_BYTES, PROTOCOL_VERSION, RECONNECT_TOKEN_BYTES,
 };
 use crate::session::ReconnectToken;
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
+
+pub const MAX_BROWSER_ORIGINS: usize = 16;
+pub const MAX_BROWSER_ORIGIN_BYTES: usize = 2048;
+
+/// Exact serialized HTTP(S) origins. This browser boundary is not client authentication.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BrowserOriginAllowlist(BTreeSet<String>);
+
+impl BrowserOriginAllowlist {
+    pub fn new(
+        origins: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Result<Self, BrowserOriginError> {
+        let mut allowed = BTreeSet::new();
+        for (index, origin) in origins.into_iter().enumerate() {
+            let origin = origin.into();
+            if index >= MAX_BROWSER_ORIGINS || origin.len() > MAX_BROWSER_ORIGIN_BYTES {
+                return Err(BrowserOriginError);
+            }
+            let parsed = url::Url::parse(&origin).map_err(|_| BrowserOriginError)?;
+            if !matches!(parsed.scheme(), "http" | "https")
+                || parsed.origin().ascii_serialization() != origin
+            {
+                return Err(BrowserOriginError);
+            }
+            allowed.insert(origin);
+        }
+        if allowed.is_empty() {
+            return Err(BrowserOriginError);
+        }
+        Ok(Self(allowed))
+    }
+
+    pub fn allows(&self, origin: Option<&str>) -> bool {
+        origin.is_some_and(|origin| self.0.contains(origin))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BrowserOriginError;
+
+impl fmt::Display for BrowserOriginError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(
+            "browser allowlist requires 1–16 canonical HTTP(S) origins up to 2048 bytes each",
+        )
+    }
+}
+impl Error for BrowserOriginError {}
 
 pub const BROWSER_ROUTE_VERSION: u8 = 1;
 pub const BROWSER_MATCH_SEGMENT: &str = "matches";
@@ -155,6 +204,59 @@ fn validate_base_path(value: &str) -> Result<(), BrowserRouteError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn origin_allowlists_are_canonical_bounded_exact_and_never_match_missing_origins() {
+        let allowed = BrowserOriginAllowlist::new([
+            "https://board.example",
+            "http://127.0.0.1:5173",
+            "https://board.example",
+        ])
+        .unwrap();
+        assert!(allowed.allows(Some("https://board.example")));
+        assert!(allowed.allows(Some("http://127.0.0.1:5173")));
+        for origin in [
+            None,
+            Some("null"),
+            Some("https://board.example.attacker.test"),
+            Some("https://board.example/"),
+            Some("http://board.example"),
+        ] {
+            assert!(!allowed.allows(origin));
+        }
+        assert!(BrowserOriginAllowlist::new(std::iter::empty::<String>()).is_err());
+        for origin in [
+            "*",
+            "null",
+            "https://board.example/",
+            "https://board.example:443",
+            "https://user:secret@board.example",
+            "https://board.example/path",
+            "https://board.example?query",
+            "https://board.example#fragment",
+        ] {
+            assert!(BrowserOriginAllowlist::new([origin]).is_err());
+        }
+        assert!(
+            BrowserOriginAllowlist::new([format!(
+                "https://{}.example",
+                "a".repeat(MAX_BROWSER_ORIGIN_BYTES)
+            )])
+            .is_err()
+        );
+        assert!(
+            BrowserOriginAllowlist::new(
+                (0..=MAX_BROWSER_ORIGINS).map(|i| format!("https://board-{i}.example"))
+            )
+            .is_err()
+        );
+        assert!(
+            !BrowserOriginAllowlist::new(["https://user:secret@board.example"])
+                .unwrap_err()
+                .to_string()
+                .contains("secret")
+        );
+    }
 
     fn match_id(value: &str) -> MatchId {
         MatchId::new(value).unwrap()

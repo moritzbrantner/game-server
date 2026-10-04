@@ -729,6 +729,7 @@ mod tests {
                 certificate_pem: cert,
                 private_key_pem: key,
                 route_prefix: prefix.clone(),
+                allowed_origins: None,
                 drain_grace: Duration::ZERO,
             };
             let recovery = MatchHostRecoveryConfig {
