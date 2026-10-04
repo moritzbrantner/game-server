@@ -67,6 +67,11 @@ pub trait GameSimulation: Send + 'static {
     fn add_player(&mut self, player_id: PlayerId) -> Result<(), SimulationError>;
     fn remove_player(&mut self, player_id: PlayerId) -> bool;
 
+    /// Invalidate presentation-only state after an accepted disconnect or reconnect.
+    /// This notification must not alter canonical snapshots or gameplay. It is
+    /// intentionally infallible and is not included in the deterministic replay.
+    fn connection_changed(&mut self, _player_id: PlayerId) {}
+
     fn try_remove_player(&mut self, player_id: PlayerId) -> Result<bool, SimulationError> {
         Ok(self.remove_player(player_id))
     }

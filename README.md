@@ -42,6 +42,8 @@ Games with private state must opt into `SnapshotScope::PlayerScoped` and impleme
 
 Both shared and player-scoped delivery validate the current connection epoch under the runtime lock before sending. A disconnected or replaced lease cannot receive a snapshot through the connection module.
 
+`GameSimulation::connection_changed(player_id)` lets Rust consumers invalidate ephemeral presentation state, such as tentative placements, after an accepted disconnect or reconnect. Stale epochs and invalid reconnect tokens produce no notification. The default is a no-op; implementations must keep canonical snapshots and gameplay unchanged. These notifications are intentionally absent from replay. Recovery restores sessions offline, and the first accepted reconnect notifies the simulation before it can serve that connection.
+
 This boundary is intended for hidden-information games such as card games. It keeps visibility policy in the supplied game simulation rather than duplicating game rules in WebTransport handlers.
 
 ## Snapshot fragmentation

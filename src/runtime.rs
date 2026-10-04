@@ -248,9 +248,11 @@ impl<S: GameSimulation> MatchRuntime<S> {
             return Err(RuntimeError::Frozen);
         }
         let current_tick = self.current_tick();
-        Ok(self
+        let lease = self
             .sessions
-            .reconnect(previous_token, replacement_token, current_tick)?)
+            .reconnect(previous_token, replacement_token, current_tick)?;
+        self.simulation.connection_changed(lease.player_id);
+        Ok(lease)
     }
 
     pub fn disconnect(&mut self, player_id: PlayerId, connection_epoch: u32) -> bool {
@@ -258,8 +260,13 @@ impl<S: GameSimulation> MatchRuntime<S> {
             return false;
         }
         let current_tick = self.current_tick();
-        self.sessions
-            .disconnect(player_id, connection_epoch, current_tick)
+        let disconnected = self
+            .sessions
+            .disconnect(player_id, connection_epoch, current_tick);
+        if disconnected {
+            self.simulation.connection_changed(player_id);
+        }
+        disconnected
     }
 
     pub(crate) fn abort_admission(
@@ -273,9 +280,7 @@ impl<S: GameSimulation> MatchRuntime<S> {
         let removed = match self.simulation.try_remove_player(player_id) {
             Ok(removed) => removed,
             Err(error) => {
-                let current_tick = self.current_tick();
-                self.sessions
-                    .disconnect(player_id, connection_epoch, current_tick);
+                self.disconnect(player_id, connection_epoch);
                 return Err(error.into());
             }
         };
@@ -415,9 +420,13 @@ mod tests {
         tick: u64,
         players: Vec<PlayerId>,
         commands: Vec<(PlayerId, u32, Vec<u8>)>,
+        connection_changes: Vec<PlayerId>,
     }
 
     impl GameSimulation for FakeSimulation {
+        fn connection_changed(&mut self, player_id: PlayerId) {
+            self.connection_changes.push(player_id);
+        }
         fn tick_hz(&self) -> u16 {
             20
         }
@@ -517,6 +526,37 @@ mod tests {
         )
         .unwrap();
         assert_eq!(restored.snapshot().unwrap(), expected);
+    }
+
+    #[test]
+    fn connection_notifications_are_fenced_and_presentation_only() {
+        let mut runtime = MatchRuntime::new_with_replay_capture(FakeSimulation::default(), 10);
+        let lease = runtime.admit(token(1)).unwrap();
+        let canonical = runtime.snapshot().unwrap();
+        assert!(!runtime.disconnect(lease.player_id, lease.connection_epoch + 1));
+        assert!(runtime.simulation.connection_changes.is_empty());
+        assert!(runtime.disconnect(lease.player_id, lease.connection_epoch));
+        assert!(!runtime.disconnect(lease.player_id, lease.connection_epoch));
+        assert!(runtime.reconnect(token(9), token(2)).is_err());
+        assert_eq!(runtime.simulation.connection_changes, [lease.player_id]);
+        let resumed = runtime.reconnect(token(1), token(2)).unwrap();
+        assert!(!runtime.disconnect(lease.player_id, lease.connection_epoch));
+        assert_eq!(
+            runtime.simulation.connection_changes,
+            [lease.player_id, lease.player_id]
+        );
+        assert_eq!(runtime.snapshot().unwrap(), canonical);
+        assert_eq!(resumed.connection_epoch, lease.connection_epoch + 1);
+        runtime.freeze_for_recovery();
+        let mut restored = MatchRuntime::restore_from_recovery(
+            FakeSimulation::default(),
+            runtime.recovery_image().unwrap(),
+        )
+        .unwrap();
+        assert!(restored.simulation.connection_changes.is_empty());
+        restored.reconnect(token(2), token(3)).unwrap();
+        assert_eq!(restored.simulation.connection_changes, [lease.player_id]);
+        assert_eq!(restored.snapshot().unwrap(), canonical);
     }
 
     #[test]
