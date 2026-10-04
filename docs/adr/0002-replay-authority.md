@@ -21,3 +21,11 @@ Valid replay and recovery wire formats are unchanged; a fixed version-one replay
 The interpreter performs additional identity and sequence checks during replay. Benchmarks report that validation cost explicitly. Live command and snapshot paths avoid constructing replay payload copies when capture is disabled, shared broadcast receivers reuse immutable encoded storage, and replay encoding writes records directly into its output buffer. These optimizations preserve runtime behavior and wire bytes.
 
 See [benchmark evidence](../../benchmarks/README.md) for measurements, workload definitions, and repeatable commands.
+
+## Compact tick checkpoints
+
+Version-two logs can retain a SHA-256 digest instead of the full canonical payload at each tick. The domain-separated digest covers the tick, state hash, payload length, and exact canonical payload. Verification and recovery still advance and check every tick using the same interpreter; identity, command sequence, and maximum tick gap rules are unchanged. Digests are private recovery evidence and never become player snapshots.
+
+The runtime selects digest checkpoints when the canonical payload exceeds 20 bytes, where the 45-byte digest record is smaller than a full checkpoint. Recovery always appends a full final checkpoint. Logs containing only existing record kinds continue to encode as version one, preserving the fixed byte fixture; the decoder accepts both versions and rejects digest records under version one.
+
+Tick history now grows by at most 45 encoded bytes per tick, independent of canonical payload size. This bounds six hours at 20 Hz to 19,440,000 tick-record bytes, plus commands, session events, and the full final checkpoint. History still grows with match duration and authoritative events; consumers must enforce their own match lifetime. The existing recovery image size limit remains enforced.
