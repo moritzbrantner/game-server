@@ -298,7 +298,9 @@ impl<S: GameSimulation> LiveMatchHost<S> {
             hosted.runtime.lock().await.begin_drain();
         }
     }
-    pub(crate) async fn is_draining(&self) -> bool {
+    /// Process admission state, including the interval while individual runtimes enter drain.
+    /// Observations serialize with that transition instead of reporting partially drained membership.
+    pub async fn is_draining(&self) -> bool {
         *self.inner.gate.read().await
     }
     pub(crate) fn close(&self) {
@@ -433,6 +435,42 @@ mod tests {
         assert_eq!(old.runtime.lock().await.current_tick(), tick);
         host.stop().await;
     }
+    #[tokio::test]
+    async fn process_drain_observation_waits_for_the_complete_runtime_transition() {
+        let host = live(1).await;
+        assert!(!host.is_draining().await);
+        host.place(id("alpha"), runtime()).await.unwrap();
+        let hosted = host.get(&id("alpha")).unwrap();
+        let runtime = hosted.runtime.lock().await;
+        let draining = {
+            let host = host.clone();
+            tokio::spawn(async move { host.begin_drain().await })
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while host.inner.gate.try_read().is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            !runtime.is_draining(),
+            "runtime lock deliberately delays the process transition"
+        );
+        let observation = host.is_draining();
+        tokio::pin!(observation);
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(observation.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(runtime);
+        assert!(observation.await);
+        draining.await.unwrap();
+        assert!(hosted.runtime.lock().await.is_draining());
+        host.stop().await;
+    }
+
     #[tokio::test]
     async fn concurrent_placement_obeys_capacity_and_drain_fences_mutations() {
         let host = live(1).await;
