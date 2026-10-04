@@ -88,7 +88,9 @@ pub use session::{
     DEFAULT_MAX_PLAYERS, DEFAULT_RECONNECT_GRACE_TICKS, ReconnectToken, RecoverableSession,
     SessionError, SessionLease, SessionRecoveryError, SessionRecoverySnapshot, SessionRegistry,
 };
-pub use simulation::{GameSimulation, SimulationError, SimulationSnapshot, SnapshotScope};
+pub use simulation::{
+    GameSimulation, PlayerSnapshotContext, SimulationError, SimulationSnapshot, SnapshotScope,
+};
 pub use transport::{
     TransportError, WebTransportConfig, serve, serve_with_control, serve_with_control_and_shutdown,
     serve_with_shutdown,

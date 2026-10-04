@@ -389,7 +389,12 @@ impl<S: GameSimulation> MatchRuntime<S> {
     }
 
     pub fn snapshot_for(&self, player_id: PlayerId) -> Result<SimulationSnapshot, RuntimeError> {
-        Ok(self.simulation.snapshot_for(player_id)?)
+        Ok(self.simulation.snapshot_for_with_context(
+            player_id,
+            crate::PlayerSnapshotContext {
+                sessions: &self.sessions,
+            },
+        )?)
     }
 
     fn record(&mut self, record: ReplayRecord) {
@@ -451,6 +456,17 @@ mod tests {
             Ok(())
         }
 
+        fn snapshot_for_with_context(
+            &self,
+            player_id: PlayerId,
+            context: crate::PlayerSnapshotContext<'_>,
+        ) -> Result<SimulationSnapshot, SimulationError> {
+            Ok(SimulationSnapshot::new(
+                self.tick,
+                vec![u8::from(context.is_connected(player_id))],
+            ))
+        }
+
         fn snapshot(&self) -> Result<SimulationSnapshot, SimulationError> {
             let mut payload = vec![self.players.len() as u8];
             for (player_id, sequence, command) in &self.commands {
@@ -501,6 +517,43 @@ mod tests {
         )
         .unwrap();
         assert_eq!(restored.snapshot().unwrap(), expected);
+    }
+
+    #[test]
+    fn player_projection_presence_tracks_fenced_sessions_and_recovery() {
+        let mut runtime = MatchRuntime::new_with_replay_capture(FakeSimulation::default(), 10);
+        let lease = runtime.admit(token(1)).unwrap();
+        assert_eq!(runtime.snapshot_for(lease.player_id).unwrap().payload, [1]);
+        let canonical = runtime.snapshot().unwrap();
+        assert!(!runtime.disconnect(lease.player_id, lease.connection_epoch + 1));
+        assert_eq!(runtime.snapshot_for(lease.player_id).unwrap().payload, [1]);
+        assert!(runtime.disconnect(lease.player_id, lease.connection_epoch));
+        assert_eq!(runtime.snapshot_for(lease.player_id).unwrap().payload, [0]);
+        assert_eq!(runtime.snapshot().unwrap(), canonical);
+        let next = runtime.reconnect(token(1), token(2)).unwrap();
+        assert!(!runtime.disconnect(lease.player_id, lease.connection_epoch));
+        assert_eq!(runtime.snapshot_for(next.player_id).unwrap().payload, [1]);
+        runtime.freeze_for_recovery();
+        let mut restored = MatchRuntime::restore_from_recovery(
+            FakeSimulation::default(),
+            runtime.recovery_image().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(restored.snapshot_for(next.player_id).unwrap().payload, [0]);
+        let resumed = restored.reconnect(token(2), token(3)).unwrap();
+        assert_eq!(
+            restored.snapshot_for(resumed.player_id).unwrap().payload,
+            [1]
+        );
+        assert_eq!(restored.snapshot().unwrap(), canonical);
+        assert!(restored.disconnect(resumed.player_id, resumed.connection_epoch));
+        for _ in 0..12 {
+            restored.advance_tick().unwrap();
+        }
+        assert_eq!(
+            restored.snapshot_for(resumed.player_id).unwrap().payload,
+            [0]
+        );
     }
 
     fn token(value: u8) -> ReconnectToken {

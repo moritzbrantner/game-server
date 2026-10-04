@@ -268,6 +268,12 @@ impl SessionRegistry {
             .count()
     }
 
+    pub(crate) fn is_connected(&self, player_id: PlayerId) -> bool {
+        self.players
+            .get(&player_id)
+            .is_some_and(|session| session.connected)
+    }
+
     pub fn owns_connection(&self, player_id: PlayerId, connection_epoch: u32) -> bool {
         self.players.get(&player_id).is_some_and(|session| {
             session.connected && session.connection_epoch == connection_epoch
