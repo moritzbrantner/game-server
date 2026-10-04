@@ -21,8 +21,9 @@ pub mod world;
 
 pub use browser::{
     BROWSER_MATCH_SEGMENT, BROWSER_PROTOCOL_CONTRACT, BROWSER_RECONNECT_SEGMENT,
-    BROWSER_ROUTE_VERSION, BrowserAdmission, BrowserProtocolContract, BrowserRouteError,
-    BrowserRoutePrefix, BrowserSessionRoute,
+    BROWSER_ROUTE_VERSION, BrowserAdmission, BrowserOriginAllowlist, BrowserOriginError,
+    BrowserProtocolContract, BrowserRouteError, BrowserRoutePrefix, BrowserSessionRoute,
+    MAX_BROWSER_ORIGIN_BYTES, MAX_BROWSER_ORIGINS,
 };
 pub use control::{
     CONTROL_FORMAT_VERSION, CONTROL_HEADER_BYTES, ControlContext, ControlRequest, ControlResponse,

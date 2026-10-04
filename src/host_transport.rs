@@ -1,4 +1,4 @@
-use crate::browser::{BrowserAdmission, BrowserRoutePrefix};
+use crate::browser::{BrowserAdmission, BrowserOriginAllowlist, BrowserRoutePrefix};
 use crate::connection::{
     AdmissionRequest, ConnectionState, MAX_CONCURRENT_CONTROL_HANDLERS, handle_connection,
 };
@@ -27,6 +27,8 @@ pub struct MatchHostWebTransportConfig {
     pub certificate_pem: PathBuf,
     pub private_key_pem: PathBuf,
     pub route_prefix: BrowserRoutePrefix,
+    /// None permits native/local clients without Origin. Browser deployments should configure this.
+    pub allowed_origins: Option<BrowserOriginAllowlist>,
     pub drain_grace: Duration,
 }
 
@@ -313,6 +315,7 @@ pub(crate) async fn serve_live_host_inner<S: GameSimulation, C: MatchControlServ
     };
     state.host.start().await;
     let route_prefix = config.route_prefix.clone();
+    let allowed_origins = Arc::new(config.allowed_origins);
     if let Some(ready) = ready {
         let _ = ready.send(());
     }
@@ -321,6 +324,7 @@ pub(crate) async fn serve_live_host_inner<S: GameSimulation, C: MatchControlServ
     let incoming_session = |incoming: wtransport::endpoint::IncomingSession| {
         let state = state.clone();
         let route_prefix = route_prefix.clone();
+        let allowed_origins = Arc::clone(&allowed_origins);
         async move {
             let request = match incoming.await {
                 Ok(request) => request,
@@ -329,6 +333,12 @@ pub(crate) async fn serve_live_host_inner<S: GameSimulation, C: MatchControlServ
                     return;
                 }
             };
+            if let Some(allowed) = allowed_origins.as_ref()
+                && !allowed.allows(request.origin())
+            {
+                request.forbidden().await;
+                return;
+            }
             let route = match route_prefix.parse(request.path()) {
                 Ok(Some(route)) if state.host.get(&route.match_id).is_some() => route,
                 Ok(Some(_)) | Ok(None) | Err(_) => {
@@ -469,8 +479,151 @@ mod tests {
             certificate_pem: PathBuf::from("unused-cert.pem"),
             private_key_pem: PathBuf::from("unused-key.pem"),
             route_prefix: BrowserRoutePrefix::new("/matches").unwrap(),
+            allowed_origins: None,
             drain_grace: Duration::ZERO,
         }
+    }
+
+    #[tokio::test]
+    async fn configured_origins_gate_new_and_reconnect_sessions_before_admission_or_epoch_fencing()
+    {
+        use crate::test_support::TestDirectory;
+        use crate::{BrowserOriginAllowlist, ReconnectToken, WELCOME_BYTES, decode_welcome};
+        use wtransport::{ClientConfig, endpoint::ConnectOptions, error::ConnectingError};
+
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let directory = TestDirectory::new();
+            let identity = Identity::self_signed(["localhost", "127.0.0.1"]).unwrap();
+            let hash = identity.certificate_chain().as_slice()[0].hash();
+            let certificate = directory.path().join("cert.pem");
+            let key = directory.path().join("key.pem");
+            identity
+                .certificate_chain()
+                .store_pemfile(&certificate)
+                .await
+                .unwrap();
+            identity
+                .private_key()
+                .store_secret_pemfile(&key)
+                .await
+                .unwrap();
+            let reservation = std::net::UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+            let port = reservation.local_addr().unwrap().port();
+            drop(reservation);
+            let prefix = BrowserRoutePrefix::new("/game").unwrap();
+            let id = MatchId::new("alpha").unwrap();
+            let mut matches = MatchHost::new(1).unwrap();
+            matches
+                .insert(id.clone(), MatchRuntime::new(DemoSimulation::new(), 1000))
+                .unwrap();
+            let host = LiveMatchHost::new(matches);
+            let (shutdown, receiver) = mpsc::channel(1);
+            let (ready, started) = oneshot::channel();
+            let mut tasks = JoinSet::new();
+            tasks.spawn(serve_live_host_inner(
+                host.clone(),
+                RejectMatchControlService,
+                MatchHostWebTransportConfig {
+                    port,
+                    certificate_pem: certificate,
+                    private_key_pem: key,
+                    route_prefix: prefix.clone(),
+                    drain_grace: Duration::ZERO,
+                    allowed_origins: Some(
+                        BrowserOriginAllowlist::new(["https://board.example"]).unwrap(),
+                    ),
+                },
+                receiver,
+                Some(ready),
+                None,
+                false,
+            ));
+            started.await.unwrap();
+            let client = Endpoint::client(
+                ClientConfig::builder()
+                    .with_bind_default()
+                    .with_server_certificate_hashes([hash])
+                    .build(),
+            )
+            .unwrap();
+            let url = format!("https://127.0.0.1:{port}{}", prefix.match_path(&id));
+            assert!(matches!(
+                client.connect(url.clone()).await,
+                Err(ConnectingError::SessionRejected)
+            ));
+            assert!(matches!(
+                client
+                    .connect(
+                        ConnectOptions::builder(url.clone())
+                            .add_header("origin", "https://other.example")
+                            .build()
+                    )
+                    .await,
+                Err(ConnectingError::SessionRejected)
+            ));
+            assert_eq!(host.statuses().await[0].occupied_player_slots, 0);
+            let admitted = client
+                .connect(
+                    ConnectOptions::builder(url)
+                        .add_header("origin", "https://board.example")
+                        .build(),
+                )
+                .await
+                .unwrap();
+            let mut stream = admitted.accept_uni().await.unwrap();
+            let mut bytes = [0; WELCOME_BYTES];
+            stream.read_exact(&mut bytes).await.unwrap();
+            let original = decode_welcome(&bytes).unwrap();
+            assert_eq!(original.player_id, 1);
+            let reconnect = format!(
+                "https://127.0.0.1:{port}{}",
+                prefix.reconnect_path(&id, ReconnectToken(original.reconnect_token))
+            );
+            assert!(matches!(
+                client
+                    .connect(
+                        ConnectOptions::builder(reconnect.clone())
+                            .add_header("origin", "https://other.example")
+                            .build()
+                    )
+                    .await,
+                Err(ConnectingError::SessionRejected)
+            ));
+            assert!(matches!(
+                client.connect(reconnect.clone()).await,
+                Err(ConnectingError::SessionRejected)
+            ));
+            host.inspect(&id, |runtime| {
+                runtime.validate_connection(original.player_id, original.connection_epoch)
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(host.statuses().await[0].occupied_player_slots, 1);
+            admitted.close(0_u32.into(), b"");
+            admitted.closed().await;
+            while host.statuses().await[0].active_players != 0 {
+                tokio::task::yield_now().await;
+            }
+            let resumed = client
+                .connect(
+                    ConnectOptions::builder(reconnect)
+                        .add_header("origin", "https://board.example")
+                        .build(),
+                )
+                .await
+                .unwrap();
+            let mut stream = resumed.accept_uni().await.unwrap();
+            stream.read_exact(&mut bytes).await.unwrap();
+            let current = decode_welcome(&bytes).unwrap();
+            assert_eq!(current.player_id, original.player_id);
+            assert!(current.connection_epoch > original.connection_epoch);
+            assert_eq!(host.statuses().await[0].occupied_player_slots, 1);
+            shutdown.send(()).await.unwrap();
+            tasks.join_next().await.unwrap().unwrap().unwrap();
+        })
+        .await
+        .unwrap();
     }
     #[tokio::test]
     async fn static_empty_or_pre_draining_hosts_fail_closed_before_binding() {
