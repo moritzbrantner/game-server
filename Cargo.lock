@@ -271,6 +271,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "geometry-kernels"
+version = "0.1.0"
+source = "git+https://github.com/moritzbrantner/rust-kernels?rev=7049e423ef00f5f65e7276281c0845d431ed6300#7049e423ef00f5f65e7276281c0845d431ed6300"
+dependencies = [
+ "spatial-kernels",
+]
+
+[[package]]
 name = "getrandom"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -564,7 +572,11 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 [[package]]
 name = "physics-engine"
 version = "0.1.0"
-source = "git+https://github.com/moritzbrantner/physics-engine.git?rev=8ea513395ad6893e45da7d6fa983b6cd3949a4ac#8ea513395ad6893e45da7d6fa983b6cd3949a4ac"
+source = "git+https://github.com/moritzbrantner/physics-engine.git?rev=0aa703e3cd6bc3e835d59b59ad15d88abb72c4b3#0aa703e3cd6bc3e835d59b59ad15d88abb72c4b3"
+dependencies = [
+ "geometry-kernels",
+ "sha2",
+]
 
 [[package]]
 name = "pin-project-lite"
@@ -898,6 +910,11 @@ dependencies = [
  "libc",
  "windows-sys 0.61.2",
 ]
+
+[[package]]
+name = "spatial-kernels"
+version = "0.1.0"
+source = "git+https://github.com/moritzbrantner/rust-kernels?rev=7049e423ef00f5f65e7276281c0845d431ed6300#7049e423ef00f5f65e7276281c0845d431ed6300"
 
 [[package]]
 name = "stable_deref_trait"
