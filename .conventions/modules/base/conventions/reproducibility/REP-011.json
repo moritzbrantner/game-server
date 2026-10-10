@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 1,
+  "ruleId": "REP-011",
+  "enforcement": {
+    "kind": "builtin",
+    "check": "text-hygiene"
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 1,
+  "ruleId": "REPO-010",
+  "enforcement": {
+    "kind": "builtin",
+    "check": "todo-format"
+  }
+}
