@@ -135,14 +135,10 @@ impl RecoveryImage {
     pub fn encode(&self) -> Result<Vec<u8>, RecoveryError> {
         self.validate_structure()?;
         let replay = self.replay.encode()?;
-        if replay.len() > u32::MAX as usize {
-            return Err(RecoveryError::ReplayTooLarge(replay.len()));
-        }
-        if self.sessions.sessions.len() > usize::from(u16::MAX) {
-            return Err(RecoveryError::SessionCountTooLarge(
-                self.sessions.sessions.len(),
-            ));
-        }
+        let encoded_replay_len =
+            u32::try_from(replay.len()).map_err(|_| RecoveryError::ReplayTooLarge(replay.len()))?;
+        let encoded_session_count = u16::try_from(self.sessions.sessions.len())
+            .map_err(|_| RecoveryError::SessionCountTooLarge(self.sessions.sessions.len()))?;
         let expected_size = HEADER_BYTES
             .checked_add(
                 SESSION_BYTES
@@ -161,16 +157,8 @@ impl RecoveryImage {
         bytes.extend_from_slice(&self.current_tick.to_be_bytes());
         bytes.extend_from_slice(&self.reconnect_grace_ticks.to_be_bytes());
         bytes.extend_from_slice(&self.sessions.next_player_id.to_be_bytes());
-        bytes.extend_from_slice(
-            &u16::try_from(self.sessions.sessions.len())
-                .expect("bounded recovery session count")
-                .to_be_bytes(),
-        );
-        bytes.extend_from_slice(
-            &u32::try_from(replay.len())
-                .expect("bounded recovery replay length")
-                .to_be_bytes(),
-        );
+        bytes.extend_from_slice(&encoded_session_count.to_be_bytes());
+        bytes.extend_from_slice(&encoded_replay_len.to_be_bytes());
         for session in &self.sessions.sessions {
             bytes.extend_from_slice(&session.player_id.to_be_bytes());
             bytes.extend_from_slice(&session.connection_epoch.to_be_bytes());
@@ -199,8 +187,8 @@ impl RecoveryImage {
         let reconnect_grace_ticks = read_u64(bytes, 13)?;
         let next_player_id = read_u32(bytes, 21)?;
         let session_count = usize::from(read_u16(bytes, 25)?);
-        let replay_len =
-            usize::try_from(read_u32(bytes, 27)?).expect("u32 replay length fits supported usize");
+        let replay_len = usize::try_from(read_u32(bytes, 27)?)
+            .map_err(|_| RecoveryError::ImageTooLarge(usize::MAX))?;
         let sessions_len = SESSION_BYTES
             .checked_mul(session_count)
             .ok_or(RecoveryError::ImageTooLarge(usize::MAX))?;
@@ -223,13 +211,7 @@ impl RecoveryImage {
             let player_id = read_u32(bytes, offset)?;
             let connection_epoch = read_u32(bytes, offset + 4)?;
             let remaining_grace_ticks = read_u64(bytes, offset + 8)?;
-            let token_start = offset + 16;
-            let token_end = token_start + RECONNECT_TOKEN_BYTES;
-            let reconnect_token = ReconnectToken(
-                bytes[token_start..token_end]
-                    .try_into()
-                    .expect("checked recovery session length"),
-            );
+            let reconnect_token = ReconnectToken(read_array(bytes, offset + 16)?);
             sessions.push(RecoverableSession {
                 player_id,
                 reconnect_token,
@@ -285,7 +267,7 @@ impl RecoveryImage {
             return Err(RecoveryError::ImageTooLarge(size));
         }
         let limit = u64::try_from(MAX_RECOVERY_IMAGE_BYTES + 1)
-            .expect("recovery image byte limit fits supported u64");
+            .map_err(|_| RecoveryError::ImageTooLarge(MAX_RECOVERY_IMAGE_BYTES + 1))?;
         let mut file = File::open(path).map_err(io_error)?.take(limit);
         let mut bytes = Vec::with_capacity(size);
         file.read_to_end(&mut bytes).map_err(io_error)?;
@@ -397,37 +379,24 @@ impl RecoveryImage {
     }
 }
 
+fn read_array<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N], RecoveryError> {
+    let end = offset.checked_add(N).ok_or(RecoveryError::Truncated)?;
+    bytes
+        .get(offset..end)
+        .and_then(|field| field.try_into().ok())
+        .ok_or(RecoveryError::Truncated)
+}
+
 fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, RecoveryError> {
-    let end = offset.checked_add(2).ok_or(RecoveryError::Truncated)?;
-    Ok(u16::from_be_bytes(
-        bytes
-            .get(offset..end)
-            .ok_or(RecoveryError::Truncated)?
-            .try_into()
-            .expect("checked u16 recovery range"),
-    ))
+    read_array(bytes, offset).map(u16::from_be_bytes)
 }
 
 fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, RecoveryError> {
-    let end = offset.checked_add(4).ok_or(RecoveryError::Truncated)?;
-    Ok(u32::from_be_bytes(
-        bytes
-            .get(offset..end)
-            .ok_or(RecoveryError::Truncated)?
-            .try_into()
-            .expect("checked u32 recovery range"),
-    ))
+    read_array(bytes, offset).map(u32::from_be_bytes)
 }
 
 fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, RecoveryError> {
-    let end = offset.checked_add(8).ok_or(RecoveryError::Truncated)?;
-    Ok(u64::from_be_bytes(
-        bytes
-            .get(offset..end)
-            .ok_or(RecoveryError::Truncated)?
-            .try_into()
-            .expect("checked u64 recovery range"),
-    ))
+    read_array(bytes, offset).map(u64::from_be_bytes)
 }
 
 fn recovery_temp_path(path: &Path) -> PathBuf {

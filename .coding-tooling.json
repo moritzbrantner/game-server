@@ -1,0 +1,58 @@
+{
+  "schemaVersion": 1,
+  "profile": "repository-foundation-v1",
+  "tiers": {
+    "fast": [
+      "format:check",
+      "lint",
+      "test"
+    ],
+    "full": [
+      "format:check",
+      "lint",
+      "test",
+      "build"
+    ]
+  },
+  "requiredCapabilities": [
+    "format:check",
+    "lint",
+    "test",
+    "build"
+  ],
+  "capabilityCommands": {
+    ".": {
+      "format:check": [
+        "cargo",
+        "fmt",
+        "--all",
+        "--",
+        "--check"
+      ],
+      "lint": [
+        "cargo",
+        "clippy",
+        "--locked",
+        "--all-targets",
+        "--all-features",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "test": [
+        "cargo",
+        "test",
+        "--locked",
+        "--all-targets",
+        "--all-features"
+      ],
+      "build": [
+        "cargo",
+        "build",
+        "--locked",
+        "--release",
+        "--all-features"
+      ]
+    }
+  }
+}

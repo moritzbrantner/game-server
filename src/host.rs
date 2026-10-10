@@ -362,10 +362,9 @@ impl<S: GameSimulation> MatchHost<S> {
                 occupied_slots: runtime.slot_count(),
             });
         }
-        Ok(self
-            .matches
+        self.matches
             .remove(id)
-            .expect("match existence checked before removal"))
+            .ok_or_else(|| HostError::UnknownMatch(id.clone()))
     }
 }
 

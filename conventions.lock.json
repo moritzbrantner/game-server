@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 2,
+  "requestedModules": [
+    "rust"
+  ],
+  "resolvedModules": [
+    "base",
+    "rust"
+  ],
+  "files": {
+    "modules/base/principles/README.md": "3d58fb814c77122520a9140a1f81a0e4b6f53276f404b25d3bb0d364ddb29c31",
+    "modules/base/docs/adr/0001-capability-internalization.md": "43e98e05265dd48f1f559cc428ba037e3da5530af687237764900a27471ab30e",
+    "modules/base/conventions/agents/README.md": "75b0cc474a865d7af8a99f60dc88ac49bc9df61bff2bd0a51093d57741906efc",
+    "modules/base/conventions/codebase-design/README.md": "6743ceffc083283edb53232ced06aebac58fc0e71db0d042cfb35bb140c68a67",
+    "modules/base/conventions/repository/README.md": "593e058a2569c6e7acdcd7e2212a5571b9cfa8a94f02fdd3d0674bfc8439f794",
+    "modules/base/conventions/repository/REPO-010.json": "9f5cb19d1dcb35b8b7d7866d87200db6b1717806a0a894bd951bf1d54e771333",
+    "modules/base/conventions/repository/REPO-012.json": "8d8139e3e99bda60ed85db1aefd3149b383818bd74888fc255d3d6c57acb226e",
+    "modules/base/conventions/repository/REPO-013.json": "579de2f1800e75119e85f73dcbc85d78735444eb6dd79562e511488b6e7c62fd",
+    "modules/base/conventions/reproducibility/README.md": "1f9ec0574118ef99cb0b42415efa86fdc656a44e42144470f8b541ba50f11389",
+    "modules/base/conventions/reproducibility/REP-011.json": "4ba7ca9eaf0343c94daecb80347694db25a78bb0aaf254256902f21d7ed5caff",
+    "modules/base/conventions/reliability/README.md": "014d10aa07ce42f8537bafdb7ed2e382e4ef35be09ffec501c9b7e000666626f",
+    "modules/base/conventions/testing/README.md": "7adcd0380ae4c826050d2c729e55648ce81c5bdceb307c87f1fc4ae6ae6e4aac",
+    "modules/base/conventions/scripts/README.md": "8a72616fc9b04833e9c2208712666b3e934b1e046f2a25c8c64388d76e8ba899",
+    "modules/base/conventions/security/README.md": "13d51a84d3aec3efc8f1919417680698c9dc7ab1c01286e0454ef8149c33c0fa",
+    "modules/rust/technologies/rust/README.md": "cf6eaeb058e999e8df328f9d2c9d17dc7330c6323074720efbf297d72deea583",
+    "modules/rust/technologies/rust/RUST-002.json": "727685a156625cab8db0e6eb2bbe8f72fece6a7d4199024e1213647e52292074",
+    "configurations.json": "569bf6db9f0a2c85726ccb231698002bb12727682fbfd96e93472591427b14f2",
+    "index.md": "f2bb723f89152f8c06b30c69ae7be760a4106fc8e8df6f3fdd975e9a7aefe638"
+  }
+}

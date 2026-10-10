@@ -115,17 +115,10 @@ impl ReplayLog {
             if version == LEGACY_REPLAY_FORMAT_VERSION && kind == DIGEST_CHECKPOINT_KIND {
                 return Err(ReplayError::UnknownRecordKind(kind));
             }
-            let tick = u64::from_be_bytes(
-                bytes[offset + 1..offset + 9]
-                    .try_into()
-                    .expect("checked replay record header"),
-            );
-            let body_len = usize::try_from(u32::from_be_bytes(
-                bytes[offset + 9..offset + 13]
-                    .try_into()
-                    .expect("checked replay record header"),
-            ))
-            .expect("u32 fits usize on supported targets");
+            let tick = u64::from_be_bytes(field(bytes, offset + 1)?);
+            let body_len = u32::from_be_bytes(field(bytes, offset + 9)?);
+            let body_len =
+                usize::try_from(body_len).map_err(|_| ReplayError::RecordTooLarge(usize::MAX))?;
             if body_len > MAX_REPLAY_BODY_BYTES {
                 return Err(ReplayError::RecordTooLarge(body_len));
             }
@@ -134,9 +127,9 @@ impl ReplayLog {
             if body_end > bytes.len() {
                 return Err(ReplayError::Truncated);
             }
-            if previous_tick.is_some_and(|previous| tick < previous) {
+            if let Some(previous) = previous_tick.filter(|previous| tick < *previous) {
                 return Err(ReplayError::NonMonotonicTick {
-                    previous: previous_tick.expect("checked previous tick"),
+                    previous,
                     actual: tick,
                 });
             }
@@ -348,9 +341,9 @@ pub(crate) fn replay_into<S: GameSimulation>(
 
     for record in log.records() {
         let record_tick = record.tick();
-        if previous_tick.is_some_and(|previous| record_tick < previous) {
+        if let Some(previous) = previous_tick.filter(|previous| record_tick < *previous) {
             return Err(ReplayError::NonMonotonicTick {
-                previous: previous_tick.expect("checked previous tick"),
+                previous,
                 actual: record_tick,
             });
         }
@@ -449,11 +442,10 @@ pub(crate) fn canonical_digest(snapshot: &SimulationSnapshot) -> [u8; 32] {
     context.update(&snapshot.state_hash.to_be_bytes());
     context.update(&(snapshot.payload.len() as u64).to_be_bytes());
     context.update(&snapshot.payload);
-    context
-        .finish()
-        .as_ref()
-        .try_into()
-        .expect("SHA256 has 32 bytes")
+    let mut digest = [0_u8; 32];
+    // SHA-256 always produces 32 bytes.
+    digest.copy_from_slice(context.finish().as_ref());
+    digest
 }
 
 fn record_body_len(record: &ReplayRecord) -> Result<usize, ReplayError> {
@@ -498,6 +490,8 @@ fn record_body_len(record: &ReplayRecord) -> Result<usize, ReplayError> {
 
 fn encode_record(record: &ReplayRecord, output: &mut Vec<u8>) -> Result<(), ReplayError> {
     let body_len = record_body_len(record)?;
+    let encoded_body_len =
+        u32::try_from(body_len).map_err(|_| ReplayError::RecordTooLarge(body_len))?;
     let kind = match record {
         ReplayRecord::PlayerAdmitted { .. } => ADMISSION_KIND,
         ReplayRecord::CommandApplied { .. } => COMMAND_KIND,
@@ -508,11 +502,7 @@ fn encode_record(record: &ReplayRecord, output: &mut Vec<u8>) -> Result<(), Repl
     output.reserve(RECORD_HEADER_BYTES + body_len);
     output.push(kind);
     output.extend_from_slice(&record.tick().to_be_bytes());
-    output.extend_from_slice(
-        &u32::try_from(body_len)
-            .expect("bounded replay body length")
-            .to_be_bytes(),
-    );
+    output.extend_from_slice(&encoded_body_len.to_be_bytes());
     match record {
         ReplayRecord::DigestCheckpoint { digest, .. } => output.extend_from_slice(digest),
         ReplayRecord::PlayerAdmitted { player_id, .. }
@@ -529,7 +519,10 @@ fn encode_record(record: &ReplayRecord, output: &mut Vec<u8>) -> Result<(), Repl
             output.extend_from_slice(&sequence.to_be_bytes());
             output.extend_from_slice(
                 &u32::try_from(payload.len())
-                    .expect("bounded command payload length")
+                    .map_err(|_| ReplayError::PayloadTooLarge {
+                        maximum: MAX_COMMAND_PAYLOAD_BYTES,
+                        actual: payload.len(),
+                    })?
                     .to_be_bytes(),
             );
             output.extend_from_slice(payload);
@@ -538,7 +531,10 @@ fn encode_record(record: &ReplayRecord, output: &mut Vec<u8>) -> Result<(), Repl
             output.extend_from_slice(&snapshot.state_hash.to_be_bytes());
             output.extend_from_slice(
                 &u32::try_from(snapshot.payload.len())
-                    .expect("bounded snapshot payload length")
+                    .map_err(|_| ReplayError::PayloadTooLarge {
+                        maximum: MAX_SNAPSHOT_PAYLOAD_BYTES,
+                        actual: snapshot.payload.len(),
+                    })?
                     .to_be_bytes(),
             );
             output.extend_from_slice(&snapshot.payload);
@@ -547,20 +543,28 @@ fn encode_record(record: &ReplayRecord, output: &mut Vec<u8>) -> Result<(), Repl
     Ok(())
 }
 
+/// Reads `N` bytes at `offset`; callers have already checked the length.
+fn field<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N], ReplayError> {
+    bytes
+        .get(offset..offset + N)
+        .and_then(|field| field.try_into().ok())
+        .ok_or(ReplayError::Truncated)
+}
+
 fn decode_record(kind: u8, tick: u64, body: &[u8]) -> Result<ReplayRecord, ReplayError> {
     match kind {
         DIGEST_CHECKPOINT_KIND => {
             require_body_length(kind, body, DIGEST_BODY_BYTES)?;
             Ok(ReplayRecord::DigestCheckpoint {
                 tick,
-                digest: body.try_into().expect("checked digest body"),
+                digest: field(body, 0)?,
             })
         }
         ADMISSION_KIND => {
             require_body_length(kind, body, PLAYER_BODY_BYTES)?;
             Ok(ReplayRecord::PlayerAdmitted {
                 tick,
-                player_id: u32::from_be_bytes(body.try_into().expect("checked player body")),
+                player_id: u32::from_be_bytes(field(body, 0)?),
             })
         }
         COMMAND_KIND => {
@@ -571,16 +575,18 @@ fn decode_record(kind: u8, tick: u64, body: &[u8]) -> Result<ReplayRecord, Repla
                     actual: body.len(),
                 });
             }
-            let player_id =
-                u32::from_be_bytes(body[0..4].try_into().expect("checked command body"));
-            let sequence = u32::from_be_bytes(body[4..8].try_into().expect("checked command body"));
+            let player_id = u32::from_be_bytes(field(body, 0)?);
+            let sequence = u32::from_be_bytes(field(body, 4)?);
             if sequence == 0 {
                 return Err(ReplayError::InvalidSequence);
             }
-            let payload_len = usize::try_from(u32::from_be_bytes(
-                body[8..12].try_into().expect("checked command body"),
-            ))
-            .expect("u32 fits usize on supported targets");
+            let payload_len =
+                usize::try_from(u32::from_be_bytes(field(body, 8)?)).map_err(|_| {
+                    ReplayError::PayloadTooLarge {
+                        maximum: MAX_COMMAND_PAYLOAD_BYTES,
+                        actual: usize::MAX,
+                    }
+                })?;
             if payload_len > MAX_COMMAND_PAYLOAD_BYTES {
                 return Err(ReplayError::PayloadTooLarge {
                     maximum: MAX_COMMAND_PAYLOAD_BYTES,
@@ -599,7 +605,7 @@ fn decode_record(kind: u8, tick: u64, body: &[u8]) -> Result<ReplayRecord, Repla
             require_body_length(kind, body, PLAYER_BODY_BYTES)?;
             Ok(ReplayRecord::PlayerRemoved {
                 tick,
-                player_id: u32::from_be_bytes(body.try_into().expect("checked player body")),
+                player_id: u32::from_be_bytes(field(body, 0)?),
             })
         }
         CHECKPOINT_KIND => {
@@ -610,12 +616,14 @@ fn decode_record(kind: u8, tick: u64, body: &[u8]) -> Result<ReplayRecord, Repla
                     actual: body.len(),
                 });
             }
-            let state_hash =
-                u64::from_be_bytes(body[0..8].try_into().expect("checked checkpoint body"));
-            let payload_len = usize::try_from(u32::from_be_bytes(
-                body[8..12].try_into().expect("checked checkpoint body"),
-            ))
-            .expect("u32 fits usize on supported targets");
+            let state_hash = u64::from_be_bytes(field(body, 0)?);
+            let payload_len =
+                usize::try_from(u32::from_be_bytes(field(body, 8)?)).map_err(|_| {
+                    ReplayError::PayloadTooLarge {
+                        maximum: MAX_SNAPSHOT_PAYLOAD_BYTES,
+                        actual: usize::MAX,
+                    }
+                })?;
             if payload_len > MAX_SNAPSHOT_PAYLOAD_BYTES {
                 return Err(ReplayError::PayloadTooLarge {
                     maximum: MAX_SNAPSHOT_PAYLOAD_BYTES,

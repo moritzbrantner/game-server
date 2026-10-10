@@ -169,7 +169,10 @@ fn encode_sequenced(
             actual: payload.len(),
         });
     }
-    let payload_len = u16::try_from(payload.len()).expect("bounded command payload length");
+    let payload_len = u16::try_from(payload.len()).map_err(|_| ProtocolError::PayloadTooLarge {
+        maximum,
+        actual: payload.len(),
+    })?;
     let mut bytes = Vec::with_capacity(COMMAND_HEADER_BYTES + payload.len());
     bytes.push(PROTOCOL_VERSION);
     bytes.push(kind);
@@ -205,13 +208,11 @@ fn decode_sequenced(
         });
     }
     require_header(bytes, kind)?;
-    let sequence = u32::from_be_bytes(bytes[2..6].try_into().expect("checked command header"));
+    let sequence = u32::from_be_bytes(field(bytes, 2)?);
     if sequence == 0 {
         return Err(ProtocolError::InvalidSequence);
     }
-    let payload_len = usize::from(u16::from_be_bytes(
-        bytes[6..8].try_into().expect("checked command header"),
-    ));
+    let payload_len = usize::from(u16::from_be_bytes(field(bytes, 6)?));
     if payload_len > maximum {
         return Err(ProtocolError::PayloadTooLarge {
             maximum,
@@ -237,7 +238,10 @@ pub fn encode_snapshot(snapshot: &SnapshotFrame) -> Result<Vec<u8>, ProtocolErro
         });
     }
     let payload_len =
-        u16::try_from(snapshot.payload.len()).expect("bounded snapshot payload length");
+        u16::try_from(snapshot.payload.len()).map_err(|_| ProtocolError::PayloadTooLarge {
+            maximum: MAX_SNAPSHOT_PAYLOAD_BYTES,
+            actual: snapshot.payload.len(),
+        })?;
     let mut bytes = Vec::with_capacity(SNAPSHOT_HEADER_BYTES + snapshot.payload.len());
     bytes.push(PROTOCOL_VERSION);
     bytes.push(SNAPSHOT_KIND);
@@ -270,7 +274,7 @@ pub(crate) fn decode_snapshot_owned(mut bytes: Vec<u8>) -> Result<SnapshotFrame,
 
 fn verify_snapshot_frame(bytes: &[u8]) -> Result<(u64, u64), ProtocolError> {
     let tick = snapshot_frame_tick(bytes)?;
-    let state_hash = u64::from_be_bytes(bytes[10..18].try_into().expect("checked snapshot header"));
+    let state_hash = u64::from_be_bytes(field(bytes, 10)?);
     let expected_hash = snapshot_hash(tick, &bytes[SNAPSHOT_HEADER_BYTES..]);
     if expected_hash != state_hash {
         return Err(ProtocolError::InvalidStateHash {
@@ -290,10 +294,8 @@ pub(crate) fn snapshot_frame_tick(bytes: &[u8]) -> Result<u64, ProtocolError> {
         });
     }
     require_header(bytes, SNAPSHOT_KIND)?;
-    let tick = u64::from_be_bytes(bytes[2..10].try_into().expect("checked snapshot header"));
-    let payload_len = usize::from(u16::from_be_bytes(
-        bytes[18..20].try_into().expect("checked snapshot header"),
-    ));
+    let tick = u64::from_be_bytes(field(bytes, 2)?);
+    let payload_len = usize::from(u16::from_be_bytes(field(bytes, 18)?));
     require_length(bytes, SNAPSHOT_HEADER_BYTES + payload_len)?;
     Ok(tick)
 }
@@ -325,13 +327,18 @@ pub fn encode_snapshot_fragments(
             required,
         });
     }
-    let count = u8::try_from(required).expect("bounded snapshot fragment count");
-    Ok(frame
+    let too_many = ProtocolError::TooManyFragments {
+        maximum: MAX_SNAPSHOT_FRAGMENTS,
+        required,
+    };
+    let count = u8::try_from(required).map_err(|_| too_many.clone())?;
+    frame
         .chunks(chunk_capacity)
         .enumerate()
         .map(|(index, chunk)| {
-            let index = u8::try_from(index).expect("bounded snapshot fragment index");
-            let chunk_len = u16::try_from(chunk.len()).expect("bounded snapshot fragment chunk");
+            let index = u8::try_from(index).map_err(|_| too_many.clone())?;
+            // `chunk_capacity` is capped at `u16::MAX` above.
+            let chunk_len = u16::try_from(chunk.len()).map_err(|_| too_many.clone())?;
             let mut bytes = Vec::with_capacity(SNAPSHOT_FRAGMENT_HEADER_BYTES + chunk.len());
             bytes.push(PROTOCOL_VERSION);
             bytes.push(SNAPSHOT_FRAGMENT_KIND);
@@ -340,9 +347,9 @@ pub fn encode_snapshot_fragments(
             bytes.push(count);
             bytes.extend_from_slice(&chunk_len.to_be_bytes());
             bytes.extend_from_slice(chunk);
-            bytes
+            Ok(bytes)
         })
-        .collect())
+        .collect()
 }
 
 /// Decodes the header of one snapshot fragment datagram and borrows its chunk.
@@ -354,7 +361,7 @@ pub fn decode_snapshot_fragment(bytes: &[u8]) -> Result<SnapshotFragment<'_>, Pr
         });
     }
     require_header(bytes, SNAPSHOT_FRAGMENT_KIND)?;
-    let tick = u64::from_be_bytes(bytes[2..10].try_into().expect("checked fragment header"));
+    let tick = u64::from_be_bytes(field(bytes, 2)?);
     let index = bytes[10];
     let count = bytes[11];
     if count == 0 || usize::from(count) > MAX_SNAPSHOT_FRAGMENTS {
@@ -363,9 +370,7 @@ pub fn decode_snapshot_fragment(bytes: &[u8]) -> Result<SnapshotFragment<'_>, Pr
     if index >= count {
         return Err(ProtocolError::InvalidFragmentIndex { index, count });
     }
-    let chunk_len = usize::from(u16::from_be_bytes(
-        bytes[12..14].try_into().expect("checked fragment header"),
-    ));
+    let chunk_len = usize::from(u16::from_be_bytes(field(bytes, 12)?));
     if chunk_len == 0 {
         return Err(ProtocolError::EmptyFragment);
     }
@@ -409,17 +414,13 @@ pub fn decode_welcome(bytes: &[u8]) -> Result<Welcome, ProtocolError> {
     require_length(bytes, WELCOME_BYTES)?;
     require_header(bytes, WELCOME_KIND)?;
     Ok(Welcome {
-        player_id: u32::from_be_bytes(bytes[2..6].try_into().expect("checked welcome length")),
-        tick_hz: u16::from_be_bytes(bytes[6..8].try_into().expect("checked welcome length")),
-        max_players: u16::from_be_bytes(bytes[8..10].try_into().expect("checked welcome length")),
-        current_tick: u64::from_be_bytes(bytes[10..18].try_into().expect("checked welcome length")),
-        connection_epoch: u32::from_be_bytes(
-            bytes[18..22].try_into().expect("checked welcome length"),
-        ),
-        reconnect_token: bytes[22..38].try_into().expect("checked welcome length"),
-        reconnect_grace_ticks: u64::from_be_bytes(
-            bytes[38..46].try_into().expect("checked welcome length"),
-        ),
+        player_id: u32::from_be_bytes(field(bytes, 2)?),
+        tick_hz: u16::from_be_bytes(field(bytes, 6)?),
+        max_players: u16::from_be_bytes(field(bytes, 8)?),
+        current_tick: u64::from_be_bytes(field(bytes, 10)?),
+        connection_epoch: u32::from_be_bytes(field(bytes, 18)?),
+        reconnect_token: field(bytes, 22)?,
+        reconnect_grace_ticks: u64::from_be_bytes(field(bytes, 38)?),
     })
 }
 
@@ -438,6 +439,17 @@ fn require_header(bytes: &[u8], expected_kind: u8) -> Result<(), ProtocolError> 
         return Err(ProtocolError::UnexpectedKind(bytes[1]));
     }
     Ok(())
+}
+
+/// Reads `N` bytes at `offset`; callers have already checked the frame length.
+fn field<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N], ProtocolError> {
+    bytes
+        .get(offset..offset + N)
+        .and_then(|field| field.try_into().ok())
+        .ok_or(ProtocolError::IncorrectLength {
+            expected: offset + N,
+            actual: bytes.len(),
+        })
 }
 
 fn require_length(bytes: &[u8], expected: usize) -> Result<(), ProtocolError> {
