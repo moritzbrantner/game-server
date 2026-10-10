@@ -1,0 +1,26 @@
+name: Agent tooling contract audit (one-shot)
+
+on:
+  push:
+    branches:
+      - agent/adopt-coding-tooling
+
+permissions:
+  contents: read
+
+jobs:
+  tooling-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.2
+      - name: Verify installed cache and plan repository capabilities
+        run: |
+          git clone --depth 1 https://github.com/moritzbrantner/coding-tooling.git ../coding-tooling
+          bun ../coding-tooling/src/cli.ts conventions check --json
+          for tier in fast full; do
+            echo "=== $tier tier ==="
+            bun ../coding-tooling/src/cli.ts plan --tier "$tier" --json
+          done
