@@ -1,0 +1,7 @@
+{
+  "schemaVersion": 1,
+  "registry": "coding-agent-conventions",
+  "modules": [
+    "rust"
+  ]
+}
