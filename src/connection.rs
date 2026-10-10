@@ -259,8 +259,9 @@ async fn run_established_connection<S: GameSimulation>(
                             match outcome {
                                 Ok(_) | Err(RuntimeError::Frozen) => {}
                                 Err(RuntimeError::Simulation(error)) if error.command_rejection().is_some() => {
-                                    let payload = error.command_rejection().expect("recoverable rejection was matched");
-                                    if send_command_rejection(connection, command.sequence, payload, shutdown).await.is_err() {
+                                    if let Some(payload) = error.command_rejection()
+                                        && send_command_rejection(connection, command.sequence, payload, shutdown).await.is_err()
+                                    {
                                         close(connection, CLOSE_PROTOCOL, "command rejection delivery failed");
                                         return Ok(());
                                     }
@@ -440,14 +441,12 @@ async fn run_control_stream<S: GameSimulation>(
                 Ok(response) => response,
                 Err(error) => {
                     eprintln!("reliable-control response rejected: {error}");
-                    encode_control_response(false, b"")
-                        .expect("empty reliable-control rejection is always encodable")
+                    encode_control_response(false, b"").map_err(|error| error.to_string())?
                 }
             },
             Err(error) => {
                 eprintln!("reliable-control request rejected: {error}");
-                encode_control_response(false, b"")
-                    .expect("empty reliable-control rejection is always encodable")
+                encode_control_response(false, b"").map_err(|error| error.to_string())?
             }
         };
 
@@ -614,7 +613,7 @@ async fn dispatch_control<S: GameSimulation>(
     handler
         .join_next()
         .await
-        .expect("one control handler was spawned")
+        .ok_or_else(|| "reliable-control handler was not spawned".to_owned())?
         .map_err(|error| format!("reliable-control handler task failed: {error}"))?
 }
 

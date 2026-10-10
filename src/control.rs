@@ -173,7 +173,11 @@ fn encode_frame(kind: u8, payload: &[u8]) -> Result<Vec<u8>, ControlWireError> {
             actual: payload.len(),
         });
     }
-    let payload_len = u16::try_from(payload.len()).expect("bounded control payload fits u16");
+    let payload_len =
+        u16::try_from(payload.len()).map_err(|_| ControlWireError::PayloadTooLarge {
+            maximum: MAX_CONTROL_PAYLOAD_BYTES,
+            actual: payload.len(),
+        })?;
     let mut bytes = Vec::with_capacity(CONTROL_HEADER_BYTES + payload.len());
     bytes.extend_from_slice(CONTROL_MAGIC);
     bytes.push(CONTROL_FORMAT_VERSION);

@@ -235,38 +235,23 @@ pub fn decode_demo_snapshot(payload: &[u8]) -> Result<Vec<DemoSnapshotPlayer>, W
         return Err(WorldError::InvalidSnapshotLength);
     }
     let mut players = Vec::with_capacity(count);
-    for index in 0..count {
-        let offset = index * DEMO_PLAYER_BYTES;
+    let (records, _) = remainder.as_chunks::<DEMO_PLAYER_BYTES>();
+    for &[i0, i1, i2, i3, x0, x1, y0, y1, s0, s1, s2, s3] in records {
         players.push(DemoSnapshotPlayer {
-            player_id: u32::from_be_bytes(
-                remainder[offset..offset + 4]
-                    .try_into()
-                    .expect("checked demo snapshot length"),
-            ),
-            x: i16::from_be_bytes(
-                remainder[offset + 4..offset + 6]
-                    .try_into()
-                    .expect("checked demo snapshot length"),
-            ),
-            y: i16::from_be_bytes(
-                remainder[offset + 6..offset + 8]
-                    .try_into()
-                    .expect("checked demo snapshot length"),
-            ),
-            last_applied_sequence: u32::from_be_bytes(
-                remainder[offset + 8..offset + 12]
-                    .try_into()
-                    .expect("checked demo snapshot length"),
-            ),
+            player_id: u32::from_be_bytes([i0, i1, i2, i3]),
+            x: i16::from_be_bytes([x0, x1]),
+            y: i16::from_be_bytes([y0, y1]),
+            last_applied_sequence: u32::from_be_bytes([s0, s1, s2, s3]),
         });
     }
     Ok(players)
 }
 
 fn spawn_position(player_id: PlayerId) -> (i16, i16) {
-    let lane = i32::try_from(player_id % 8).expect("bounded lane");
-    let row = i32::try_from((player_id / 8) % 8).expect("bounded row");
-    ((lane * 256 - 896) as i16, (row * 256 - 896) as i16)
+    // Both values are below 8, so the casts are lossless and the results stay within ±896.
+    let lane = (player_id % 8) as i16;
+    let row = ((player_id / 8) % 8) as i16;
+    (lane * 256 - 896, row * 256 - 896)
 }
 
 #[cfg(test)]

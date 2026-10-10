@@ -249,9 +249,11 @@ async fn read_one_byte_or_close(recv_stream: &mut RecvStream) -> bool {
 }
 
 fn oversized_header() -> [u8; CONTROL_HEADER_BYTES] {
-    let payload_len = u16::try_from(MAX_CONTROL_PAYLOAD_BYTES + 1)
-        .expect("reliable-control maximum stays below u16::MAX")
-        .to_be_bytes();
+    const OVERSIZED_PAYLOAD_LEN: u16 = {
+        assert!(MAX_CONTROL_PAYLOAD_BYTES < u16::MAX as usize);
+        (MAX_CONTROL_PAYLOAD_BYTES + 1) as u16
+    };
+    let payload_len = OVERSIZED_PAYLOAD_LEN.to_be_bytes();
     [
         b'G',
         b'S',

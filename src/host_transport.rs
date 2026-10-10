@@ -273,12 +273,11 @@ pub(crate) async fn serve_live_host_inner<S: GameSimulation, C: MatchControlServ
     let endpoint = Endpoint::server(server_config)
         .map_err(|error| MatchHostTransportError::Endpoint(error.to_string()))?;
 
-    if recovery.as_ref().is_some_and(|plan| plan.consume_on_start) {
-        let directory = recovery
-            .as_ref()
-            .expect("checked recovery plan")
-            .directory
-            .clone();
+    if let Some(directory) = recovery
+        .as_ref()
+        .filter(|plan| plan.consume_on_start)
+        .map(|plan| plan.directory.clone())
+    {
         let consumption = spawn_blocking(move || {
             let result = consume_recovery_bundle(&directory);
             let active_exists = directory.exists();
