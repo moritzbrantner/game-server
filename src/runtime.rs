@@ -1,7 +1,7 @@
 use crate::PlayerId;
-use crate::protocol::MAX_COMMAND_PAYLOAD_BYTES;
+use crate::protocol::{CommandLane, MAX_COMMAND_PAYLOAD_BYTES};
 use crate::recovery::{RecoveryError, RecoveryImage};
-use crate::replay::{ReplayLog, ReplayRecord};
+use crate::replay::{LaneSequences, ReplayLog, ReplayRecord};
 use crate::session::{ReconnectToken, SessionError, SessionLease, SessionRegistry};
 use crate::simulation::{GameSimulation, SimulationError, SimulationSnapshot, SnapshotScope};
 use std::collections::BTreeMap;
@@ -86,7 +86,7 @@ impl From<RecoveryError> for RuntimeRecoveryError {
 pub struct MatchRuntime<S> {
     simulation: S,
     sessions: SessionRegistry,
-    last_sequences: BTreeMap<PlayerId, u32>,
+    last_sequences: BTreeMap<PlayerId, LaneSequences>,
     replay: Option<ReplayLog>,
     reconnect_grace_ticks: u64,
     draining: bool,
@@ -116,7 +116,7 @@ impl<S: GameSimulation> MatchRuntime<S> {
             &image.sessions,
         )
         .map_err(RecoveryError::from)?;
-        let last_sequences = image.last_sequences();
+        let last_sequences = image.lane_watermarks();
         Ok(Self {
             simulation,
             sessions,
@@ -231,7 +231,8 @@ impl<S: GameSimulation> MatchRuntime<S> {
             self.sessions.remove_slot(lease.player_id);
             return Err(error.into());
         }
-        self.last_sequences.insert(lease.player_id, 0);
+        self.last_sequences
+            .insert(lease.player_id, LaneSequences::default());
         self.record(ReplayRecord::PlayerAdmitted {
             tick: self.current_tick(),
             player_id: lease.player_id,
@@ -310,10 +311,35 @@ impl<S: GameSimulation> MatchRuntime<S> {
         }
     }
 
+    /// Submits a command on the datagram lane.
     pub fn submit_command(
         &mut self,
         player_id: PlayerId,
         connection_epoch: u32,
+        sequence: u32,
+        payload: &[u8],
+    ) -> Result<CommandOutcome, RuntimeError> {
+        self.submit_lane_command(
+            player_id,
+            connection_epoch,
+            CommandLane::Datagram,
+            sequence,
+            payload,
+        )
+    }
+
+    /// Submits a command on `lane`.
+    ///
+    /// Each lane has its own per-player watermark: a sequence at or below it returns
+    /// [`CommandOutcome::IgnoredStale`] and is not applied again. Both watermarks
+    /// survive reconnects and are dropped only when the player is removed. Errors,
+    /// including recoverable simulation rejections, consume neither the sequence nor
+    /// replay admission.
+    pub fn submit_lane_command(
+        &mut self,
+        player_id: PlayerId,
+        connection_epoch: u32,
+        lane: CommandLane,
         sequence: u32,
         payload: &[u8],
     ) -> Result<CommandOutcome, RuntimeError> {
@@ -327,7 +353,7 @@ impl<S: GameSimulation> MatchRuntime<S> {
         let last_sequence = self
             .last_sequences
             .get(&player_id)
-            .copied()
+            .map(|sequences| sequences.get(lane))
             .ok_or(RuntimeError::StaleConnection)?;
         if sequence <= last_sequence {
             return Ok(CommandOutcome::IgnoredStale);
@@ -339,12 +365,15 @@ impl<S: GameSimulation> MatchRuntime<S> {
             });
         }
         self.simulation
-            .apply_command(player_id, sequence, payload)?;
-        self.last_sequences.insert(player_id, sequence);
+            .apply_lane_command(player_id, lane, sequence, payload)?;
+        if let Some(sequences) = self.last_sequences.get_mut(&player_id) {
+            sequences.set(lane, sequence);
+        }
         if let Some(replay) = &mut self.replay {
             replay.append(ReplayRecord::CommandApplied {
                 tick: self.simulation.current_tick(),
                 player_id,
+                lane,
                 sequence,
                 payload: payload.to_vec(),
             });

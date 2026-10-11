@@ -21,8 +21,23 @@ pub const MAX_SNAPSHOT_FRAGMENTS: usize = 64;
 pub const MIN_FRAGMENTED_DATAGRAM_BYTES: usize =
     SNAPSHOT_FRAGMENT_HEADER_BYTES + MAX_SNAPSHOT_FRAME_BYTES.div_ceil(MAX_SNAPSHOT_FRAGMENTS);
 
+/// Version of the reliable command lane: its stream header and ack frame.
+pub const COMMAND_LANE_FORMAT_VERSION: u8 = 1;
+/// Exact size of the header that opens a reliable command lane stream.
+pub const COMMAND_LANE_HEADER_BYTES: usize = 6;
+/// A connection may open at most this many reliable command lanes over its lifetime.
+pub const MAX_COMMAND_LANES_PER_CONNECTION: usize = 1;
+/// Exact size of one reliable command acknowledgement frame.
+pub const RELIABLE_COMMAND_ACK_BYTES: usize = 7;
+
+/// First bytes of a reliable command lane stream; control streams start with `GSCT`.
+pub(crate) const COMMAND_LANE_MAGIC: &[u8; 4] = b"GSCL";
 const COMMAND_KIND: u8 = 1;
 const COMMAND_REJECTION_KIND: u8 = 5;
+const RELIABLE_COMMAND_ACK_KIND: u8 = 6;
+const ACK_APPLIED: u8 = 1;
+const ACK_DUPLICATE: u8 = 2;
+const ACK_REJECTED: u8 = 3;
 const SNAPSHOT_KIND: u8 = 2;
 const WELCOME_KIND: u8 = 3;
 pub(crate) const SNAPSHOT_FRAGMENT_KIND: u8 = 4;
@@ -30,6 +45,36 @@ const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
 pub type PlayerId = u32;
+
+/// The path a game command took into the authoritative runtime.
+///
+/// Each lane keeps its own per-player sequence watermark. Datagram commands are
+/// best-effort latest-wins input; reliable commands arrive in order on the
+/// connection's command lane stream and are acknowledged one by one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
+pub enum CommandLane {
+    Datagram,
+    Reliable,
+}
+
+/// Outcome reported for one reliable-lane command frame.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReliableCommandOutcome {
+    /// The command was applied and admitted to replay.
+    Applied,
+    /// The sequence is at or below the reliable watermark; it was applied before.
+    Duplicate,
+    /// The simulation privately rejected the command. Neither the sequence nor replay
+    /// admission was consumed, so the same sequence may be sent again later.
+    Rejected,
+}
+
+/// Fixed-size acknowledgement for one reliable-lane command frame.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReliableCommandAck {
+    pub sequence: u32,
+    pub outcome: ReliableCommandOutcome,
+}
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct CommandFrame {
@@ -94,6 +139,8 @@ pub enum ProtocolError {
     InvalidFragmentIndex { index: u8, count: u8 },
     EmptyFragment,
     InconsistentFragment { tick: u64 },
+    InvalidCommandLaneHeader,
+    InvalidAckOutcome(u8),
 }
 
 impl fmt::Display for ProtocolError {
@@ -135,6 +182,12 @@ impl fmt::Display for ProtocolError {
                 formatter,
                 "snapshot fragments for tick {tick} are inconsistent"
             ),
+            Self::InvalidCommandLaneHeader => {
+                write!(formatter, "invalid reliable command lane header")
+            }
+            Self::InvalidAckOutcome(outcome) => {
+                write!(formatter, "unknown reliable command ack outcome {outcome}")
+            }
         }
     }
 }
@@ -221,6 +274,86 @@ fn decode_sequenced(
     }
     require_length(bytes, COMMAND_HEADER_BYTES + payload_len)?;
     Ok((sequence, bytes[COMMAND_HEADER_BYTES..].to_vec()))
+}
+
+/// The constant header a client writes first on its reliable command lane stream:
+/// `GSCL`, the lane format version and the game protocol version of the command
+/// frames that follow.
+pub fn encode_command_lane_header() -> [u8; COMMAND_LANE_HEADER_BYTES] {
+    let mut header = [0_u8; COMMAND_LANE_HEADER_BYTES];
+    header[..COMMAND_LANE_MAGIC.len()].copy_from_slice(COMMAND_LANE_MAGIC);
+    header[4] = COMMAND_LANE_FORMAT_VERSION;
+    header[5] = PROTOCOL_VERSION;
+    header
+}
+
+/// Accepts exactly the bytes of [`encode_command_lane_header`].
+pub fn decode_command_lane_header(bytes: &[u8]) -> Result<(), ProtocolError> {
+    require_length(bytes, COMMAND_LANE_HEADER_BYTES)?;
+    if bytes[..COMMAND_LANE_MAGIC.len()] != COMMAND_LANE_MAGIC[..] {
+        return Err(ProtocolError::InvalidCommandLaneHeader);
+    }
+    if bytes[4] != COMMAND_LANE_FORMAT_VERSION {
+        return Err(ProtocolError::UnsupportedVersion(bytes[4]));
+    }
+    if bytes[5] != PROTOCOL_VERSION {
+        return Err(ProtocolError::UnsupportedVersion(bytes[5]));
+    }
+    Ok(())
+}
+
+/// Encodes one ack frame: game protocol version, kind 6, big-endian u32 sequence,
+/// outcome byte (1 applied, 2 duplicate, 3 rejected).
+pub fn encode_reliable_command_ack(ack: ReliableCommandAck) -> Result<Vec<u8>, ProtocolError> {
+    if ack.sequence == 0 {
+        return Err(ProtocolError::InvalidSequence);
+    }
+    let mut bytes = Vec::with_capacity(RELIABLE_COMMAND_ACK_BYTES);
+    bytes.push(PROTOCOL_VERSION);
+    bytes.push(RELIABLE_COMMAND_ACK_KIND);
+    bytes.extend_from_slice(&ack.sequence.to_be_bytes());
+    bytes.push(match ack.outcome {
+        ReliableCommandOutcome::Applied => ACK_APPLIED,
+        ReliableCommandOutcome::Duplicate => ACK_DUPLICATE,
+        ReliableCommandOutcome::Rejected => ACK_REJECTED,
+    });
+    Ok(bytes)
+}
+
+/// Decodes exactly one canonical ack frame.
+pub fn decode_reliable_command_ack(bytes: &[u8]) -> Result<ReliableCommandAck, ProtocolError> {
+    require_length(bytes, RELIABLE_COMMAND_ACK_BYTES)?;
+    require_header(bytes, RELIABLE_COMMAND_ACK_KIND)?;
+    let sequence = u32::from_be_bytes(field(bytes, 2)?);
+    if sequence == 0 {
+        return Err(ProtocolError::InvalidSequence);
+    }
+    let outcome = match bytes[6] {
+        ACK_APPLIED => ReliableCommandOutcome::Applied,
+        ACK_DUPLICATE => ReliableCommandOutcome::Duplicate,
+        ACK_REJECTED => ReliableCommandOutcome::Rejected,
+        other => return Err(ProtocolError::InvalidAckOutcome(other)),
+    };
+    Ok(ReliableCommandAck { sequence, outcome })
+}
+
+/// Checks a command frame header before its payload is read: version, kind,
+/// non-zero sequence and the declared payload bound. Returns the declared length.
+pub(crate) fn command_frame_payload_len(
+    header: &[u8; COMMAND_HEADER_BYTES],
+) -> Result<usize, ProtocolError> {
+    require_header(header, COMMAND_KIND)?;
+    if u32::from_be_bytes(field(header, 2)?) == 0 {
+        return Err(ProtocolError::InvalidSequence);
+    }
+    let payload_len = usize::from(u16::from_be_bytes(field(header, 6)?));
+    if payload_len > MAX_COMMAND_PAYLOAD_BYTES {
+        return Err(ProtocolError::PayloadTooLarge {
+            maximum: MAX_COMMAND_PAYLOAD_BYTES,
+            actual: payload_len,
+        });
+    }
+    Ok(payload_len)
 }
 
 pub fn encode_snapshot(snapshot: &SnapshotFrame) -> Result<Vec<u8>, ProtocolError> {

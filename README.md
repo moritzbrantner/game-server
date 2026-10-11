@@ -15,11 +15,11 @@ Reusable server-authoritative multiplayer runtime extracted from the proven `ser
 
 It does **not** own game-specific rules, matchmaking/accounts/rankings, or physics algorithms. Games supply deterministic simulation logic. Physics is delegated to `physics-engine` through an adapter boundary.
 
-Single-match and hosted listeners share one internal connection module for admission, welcome rollback, command ingestion, snapshot delivery, and reliable control. Hosted routing binds the match identity before entering that module. Server tasks own their connection and tick tasks; each connection owns its control exchanges, so canceling the owner also cancels pending work. See [the connection lifecycle decision](docs/adr/0001-shared-connection-lifecycle.md).
+Single-match and hosted listeners share one internal connection module for admission, welcome rollback, command ingestion (datagrams and the reliable command lane), snapshot delivery, and reliable control. Hosted routing binds the match identity before entering that module. Server tasks own their connection and tick tasks; each connection owns its control exchanges, so canceling the owner also cancels pending work. See [the connection lifecycle decision](docs/adr/0001-shared-connection-lifecycle.md).
 
 ## Browser integration contract
 
-`browser` exposes the versioned browser-facing boundary without creating a second gameplay protocol. `BROWSER_PROTOCOL_CONTRACT` binds the route version to the existing command/snapshot protocol version, reliable-control format version, reconnect-token size, payload ceilings, and snapshot fragment bound so browser clients can pin one explicit compatibility surface.
+`browser` exposes the versioned browser-facing boundary without creating a second gameplay protocol. `BROWSER_PROTOCOL_CONTRACT` binds the route version to the existing command/snapshot protocol version, reliable-control format version, reconnect-token size, payload ceilings, snapshot fragment bound, and reliable command lane format (lane format version, header and ack sizes, one lane per connection) so browser clients can pin one explicit compatibility surface.
 
 Hosted browser deployments can set `MatchHostWebTransportConfig::allowed_origins` to `Some(BrowserOriginAllowlist::new(["https://board.example"])?)`. The allowlist requires canonical HTTP(S) origins and rejects missing/nonmatching headers before admission or reconnect fencing. `None` permits native/local clients without an Origin. This is a browser boundary, not authentication; see [the origin decision](docs/adr/0007-browser-origin-allowlists.md).
 
@@ -86,7 +86,7 @@ See [the external simulation authority decision](docs/adr/0003-external-simulati
 
 ## Reliable control
 
-Realtime game commands and latest authoritative snapshots use WebTransport datagrams. Transactional/session control uses an independent versioned request/response frame over bidirectional WebTransport streams. Each payload is bounded to 4 KiB, each exchange is time-bounded to five seconds, and each connection can have at most four control exchanges in flight.
+Realtime game commands and latest authoritative snapshots use WebTransport datagrams; one-shot game commands can use the [reliable command lane](#reliable-command-lane). Transactional/session control uses an independent versioned request/response frame over bidirectional WebTransport streams that start with `GSCT`. Each payload is bounded to 4 KiB, each exchange is time-bounded to five seconds, and each connection can have at most four control exchanges in flight.
 
 Single-match applications opt in with `serve_with_control` or `serve_with_control_and_shutdown` and provide a `ControlService`. Hosted applications use `serve_match_host_with_control*` and provide a `MatchControlService`, which receives the validated `MatchId` in addition to the authenticated player ID and connection epoch. That preserves fencing identity even when different matches both allocate player ID 1. Neither control service has access to `GameSimulation`; authoritative game mutation therefore remains on the deterministic command/tick path.
 
@@ -95,6 +95,32 @@ Control handlers run off the async runtime. A server instance admits at most 64 
 Handler dispatch rechecks the connection epoch after waiting for capacity and after entering the blocking pool. Closing a connection cancels its pending exchanges; canceling an exchange also cancels handlers still queued in the blocking pool. A synchronous handler that has already started cannot be interrupted. It runs without holding the simulation lock and remains responsible for fencing delayed external side effects using its control context.
 
 The acceptance probes cover successful and rejected control exchanges, malformed, oversized, and trailing-byte fail-closed handling, stalled-stream timeout, the per-connection concurrency cap, continued realtime command/snapshot progress while a control stream is stalled, and match-scoped control routing through one hosted listener.
+
+## Reliable command lane
+
+Datagram commands stay best-effort and latest-wins, which suits held input. One-shot commands that must arrive exactly once use the reliable command lane instead. It is an ordered, acknowledged path into the same deterministic command/tick path. The runtime keeps an independent per-player watermark for each `CommandLane` (`Datagram`, `Reliable`), so later datagram commands never make a reliable command stale. `MatchRuntime::submit_lane_command` takes the lane, and `submit_command` stays the datagram lane. Simulations receive the lane through `GameSimulation::apply_lane_command`, whose default delegates to `apply_command`.
+
+A client opens one bidirectional stream per connection and writes the header from `encode_command_lane_header()`: `GSCL`, lane format version `1`, and protocol version `3`. Then it writes the existing `encode_command` frames in order. The server answers each frame, in order, with one fixed `RELIABLE_COMMAND_ACK_BYTES` (7-byte) ack that `decode_reliable_command_ack` reads. The ack bytes are the protocol version, kind `6`, a big-endian `u32` sequence, and an outcome:
+
+- `Applied`: the command was applied and admitted to replay.
+- `Duplicate`: the sequence is at or below the reliable watermark, so it was already applied, possibly on an earlier connection. It is not applied again.
+- `Rejected`: the simulation returned an ADR-0005 `command_rejected`. Neither the sequence nor replay admission is consumed, so the client may send the same sequence again later. The ack is the only rejection signal on the lane; the private kind-5 payload is not sent for lane commands.
+
+The reliable watermark survives disconnect and reconnect within the grace window. It resets only when the player is removed. After a reconnect, a client opens a new lane and sends every unacknowledged command again in order; each command is applied exactly once.
+
+The lane fails closed. These faults close the connection with protocol close code `1`:
+
+- a wrong header, version, or kind;
+- sequence zero;
+- a declared payload above `MAX_COMMAND_PAYLOAD_BYTES`;
+- a partial frame followed by FIN;
+- a frame that does not complete within ten seconds of its first byte;
+- a fatal simulation error;
+- a second lane on one connection.
+
+A FIN at a frame boundary only ends the lane. A command that reaches a frozen runtime is not acknowledged; the connection closes with code `3`, and the client sends the command again after it reconnects. The lane is a task owned by the connection. It holds the runtime lock only for the synchronous submission and never while it waits for I/O. A stalled lane, or a client that never reads its acks, therefore never blocks ticks, snapshots, datagram ingestion, or control. Streams are classified by their first four bytes without taking a control permit, under the existing five-second control deadline.
+
+See [the reliable command lane decision](docs/adr/0008-reliable-command-lane.md).
 
 ## Multi-match host
 
@@ -129,7 +155,7 @@ Set `GAME_SERVER_RECOVERY_PATH` to enable replay-backed graceful restart recover
 
 Recovery persistence is intentionally fail-closed: malformed evidence prevents startup, failed shutdown persistence resumes the live runtime, recovery I/O does not hold the runtime mutex, and the reliable welcome handshake is time-bounded so a peer cannot retain capacity indefinitely. This is graceful restart recovery rather than per-command crash journaling.
 
-Replay verification and recovery share one interpreter that enforces increasing player identities and per-player command sequences. Retired identities cannot be reused, commands require a live player, and recovery images must end with an authoritative checkpoint. These checks enforce runtime rules even when the supplied simulation would accept an impossible history. See [the replay authority decision](docs/adr/0002-replay-authority.md).
+Replay verification and recovery share one interpreter that enforces increasing player identities and strictly increasing command sequences per player and command lane. Replay format version 3 adds lane-aware command records. Logs without reliable-lane commands still encode byte-identically as version 1, or as version 2 when they contain digest checkpoints, and older logs decode as datagram commands. Recovery restores both lane watermarks. Retired identities cannot be reused, commands require a live player, and recovery images must end with an authoritative checkpoint. These checks enforce runtime rules even when the supplied simulation would accept an impossible history. See [the replay authority decision](docs/adr/0002-replay-authority.md).
 
 For process-hosted matches, use `prepare_match_host_for_recovery` plus `serve_prepared_match_host_with_status_and_control_and_shutdown`. The demo server enables this path with `GAME_SERVER_MATCH_IDS` and `GAME_SERVER_RECOVERY_DIR`; `GAME_SERVER_RECOVERY_PATH` remains single-match only.
 

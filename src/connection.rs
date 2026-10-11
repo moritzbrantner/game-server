@@ -3,19 +3,23 @@ use crate::control::{
     MAX_CONTROL_PAYLOAD_BYTES, decode_control_request, encode_control_response,
 };
 use crate::protocol::{
-    ProtocolError, RECONNECT_TOKEN_BYTES, SnapshotFrame, Welcome, decode_command,
-    encode_command_rejection, encode_snapshot, encode_snapshot_fragments, encode_welcome,
-    snapshot_frame_tick,
+    COMMAND_HEADER_BYTES, COMMAND_LANE_HEADER_BYTES, COMMAND_LANE_MAGIC, CommandLane,
+    MAX_COMMAND_LANES_PER_CONNECTION, ProtocolError, RECONNECT_TOKEN_BYTES, ReliableCommandAck,
+    ReliableCommandOutcome, SnapshotFrame, Welcome, command_frame_payload_len, decode_command,
+    decode_command_lane_header, encode_command_rejection, encode_reliable_command_ack,
+    encode_snapshot, encode_snapshot_fragments, encode_welcome, snapshot_frame_tick,
 };
-use crate::runtime::{MatchRuntime, RuntimeError};
+use crate::runtime::{CommandOutcome, MatchRuntime, RuntimeError};
 use crate::session::{ReconnectToken, SessionLease};
 use crate::simulation::{GameSimulation, SimulationSnapshot, SnapshotScope};
 use ring::rand::{SecureRandom, SystemRandom};
 use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Mutex, RwLock, Semaphore, broadcast};
 use tokio::task::JoinSet;
+use tokio::time::Instant;
 use wtransport::error::SendDatagramError;
 use wtransport::{Connection, RecvStream, SendStream, VarInt};
 
@@ -27,6 +31,13 @@ pub(crate) const SNAPSHOT_CHANNEL_DEPTH: usize = 1;
 const WELCOME_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const CONTROL_STREAM_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CONCURRENT_CONTROL_STREAMS: usize = 4;
+/// Client-opened bidirectional streams waiting for their first four bytes.
+const MAX_PENDING_STREAM_CLASSIFICATIONS: usize = 4;
+/// Prefix that tells a control stream (`GSCT`) from a command lane (`GSCL`).
+const STREAM_CLASS_BYTES: usize = 4;
+/// Once a reliable lane frame (or the rest of the lane header) has started, it
+/// must complete within this time. An idle lane between frames has no deadline.
+const COMMAND_LANE_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const MAX_CONCURRENT_CONTROL_HANDLERS: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -245,7 +256,12 @@ async fn run_established_connection<S: GameSimulation>(
     let mut snapshots = state.snapshots.subscribe();
     let mut snapshot_sender = SnapshotSender::default();
     let control_permits = Arc::new(Semaphore::new(MAX_CONCURRENT_CONTROL_STREAMS));
-    let mut control_tasks = JoinSet::new();
+    let classification_permits = Arc::new(Semaphore::new(MAX_PENDING_STREAM_CLASSIFICATIONS));
+    // Dropping these sets when the connection ends aborts every stream task,
+    // including a lane stalled on a read or on an ack the client never reads.
+    let mut stream_tasks = JoinSet::new();
+    let mut lane_tasks = JoinSet::new();
+    let mut lanes_opened = 0_usize;
     loop {
         tokio::select! {
             datagram = connection.receive_datagram() => {
@@ -280,18 +296,23 @@ async fn run_established_connection<S: GameSimulation>(
                     Err(_) => return Ok(()),
                 }
             }
-            control_stream = connection.accept_bi() => {
-                let (send_stream, recv_stream) = match control_stream {
+            stream = connection.accept_bi() => {
+                let (send_stream, recv_stream) = match stream {
                     Ok(streams) => streams,
                     Err(_) => return Ok(()),
                 };
-                let permit = match Arc::clone(&control_permits).try_acquire_owned() {
+                // Classification takes neither a control permit nor the runtime lock.
+                let classification = match Arc::clone(&classification_permits).try_acquire_owned() {
                     Ok(permit) => permit,
                     Err(_) => {
-                        eprintln!("reliable control stream rejected: concurrency limit reached");
+                        // Until classified, a stream is a control stream as far as clients can tell.
+                        eprintln!("reliable control stream rejected: concurrency limit reached before classification");
                         continue;
                     }
                 };
+                // The control deadline starts at accept, exactly as before classification existed.
+                let deadline = Instant::now() + CONTROL_STREAM_TIMEOUT;
+                let control_permits = Arc::clone(&control_permits);
                 let runtime = Arc::clone(&state.runtime);
                 let control = Arc::clone(&state.control);
                 let control_handlers = Arc::clone(&state.control_handlers);
@@ -299,23 +320,70 @@ async fn run_established_connection<S: GameSimulation>(
                     player_id: lease.player_id,
                     connection_epoch: lease.connection_epoch,
                 };
-                control_tasks.spawn(async move {
-                    let _permit = permit;
-                    run_control_stream(
-                        send_stream,
-                        recv_stream,
-                        context,
-                        runtime,
-                        control,
-                        control_handlers,
-                    ).await
+                stream_tasks.spawn(async move {
+                    let mut recv_stream = recv_stream;
+                    let prefix = classify_stream(&mut recv_stream, deadline).await;
+                    drop(classification);
+                    let prefix = match prefix {
+                        Ok(prefix) => prefix,
+                        Err(error) => return ClientStream::Control(Err(error)),
+                    };
+                    if &prefix == COMMAND_LANE_MAGIC {
+                        return ClientStream::CommandLane(send_stream, recv_stream);
+                    }
+                    let Ok(_permit) = control_permits.try_acquire_owned() else {
+                        return ClientStream::Control(Err(
+                            "reliable control stream rejected: concurrency limit reached".to_owned(),
+                        ));
+                    };
+                    ClientStream::Control(
+                        run_control_stream(
+                            send_stream,
+                            recv_stream,
+                            prefix,
+                            deadline,
+                            context,
+                            runtime,
+                            control,
+                            control_handlers,
+                        )
+                        .await,
+                    )
                 });
             }
-            completed = control_tasks.join_next(), if !control_tasks.is_empty() => {
+            completed = stream_tasks.join_next(), if !stream_tasks.is_empty() => {
                 match completed {
-                    Some(Ok(Ok(()))) | None => {}
-                    Some(Ok(Err(error))) => eprintln!("reliable control stream failed: {error}"),
+                    Some(Ok(ClientStream::CommandLane(send_stream, recv_stream))) => {
+                        if lanes_opened >= MAX_COMMAND_LANES_PER_CONNECTION {
+                            close(connection, CLOSE_PROTOCOL, "only one reliable command lane is allowed per connection");
+                            return Ok(());
+                        }
+                        lanes_opened += 1;
+                        lane_tasks.spawn(run_command_lane(
+                            recv_stream,
+                            send_stream,
+                            Arc::clone(&state.runtime),
+                            lease,
+                            COMMAND_LANE_FRAME_TIMEOUT,
+                        ));
+                    }
+                    Some(Ok(ClientStream::Control(Ok(())))) | None => {}
+                    Some(Ok(ClientStream::Control(Err(error)))) => eprintln!("reliable control stream failed: {error}"),
                     Some(Err(error)) => eprintln!("reliable control task failed: {error}"),
+                }
+            }
+            lane = lane_tasks.join_next(), if !lane_tasks.is_empty() => {
+                match lane {
+                    // A FIN at a frame boundary ends the lane, not the connection.
+                    Some(Ok(Ok(()))) | None => {}
+                    Some(Ok(Err(failure))) => {
+                        close(connection, failure.code, &failure.reason);
+                        return Ok(());
+                    }
+                    Some(Err(error)) => {
+                        close(connection, CLOSE_RUNTIME, &format!("reliable command lane task failed: {error}"));
+                        return Ok(());
+                    }
                 }
             }
             snapshot = snapshots.recv() => {
@@ -389,9 +457,33 @@ async fn send_command_rejection(
     }
 }
 
+/// A classified client-opened bidirectional stream.
+enum ClientStream {
+    /// A finished control exchange.
+    Control(Result<(), String>),
+    /// A command lane whose magic was consumed; the main loop enforces the lane limit.
+    CommandLane(SendStream, RecvStream),
+}
+
+/// Reads the first bytes that tell control and command lane streams apart.
+async fn classify_stream(
+    recv_stream: &mut RecvStream,
+    deadline: Instant,
+) -> Result<[u8; STREAM_CLASS_BYTES], String> {
+    let mut prefix = [0_u8; STREAM_CLASS_BYTES];
+    tokio::time::timeout_at(deadline, recv_stream.read_exact(&mut prefix))
+        .await
+        .map_err(|_| "reliable control stream timed out before classification".to_owned())?
+        .map_err(|error| error.to_string())?;
+    Ok(prefix)
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_control_stream<S: GameSimulation>(
     mut send_stream: SendStream,
     mut recv_stream: RecvStream,
+    prefix: [u8; STREAM_CLASS_BYTES],
+    deadline: Instant,
     context: ControlContext,
     runtime: Arc<Mutex<MatchRuntime<S>>>,
     control: Arc<dyn ControlService>,
@@ -399,8 +491,9 @@ async fn run_control_stream<S: GameSimulation>(
 ) -> Result<(), String> {
     let exchange = async {
         let mut header = [0_u8; CONTROL_HEADER_BYTES];
+        header[..STREAM_CLASS_BYTES].copy_from_slice(&prefix);
         recv_stream
-            .read_exact(&mut header)
+            .read_exact(&mut header[STREAM_CLASS_BYTES..])
             .await
             .map_err(|error| error.to_string())?;
         let payload_len = usize::from(u16::from_be_bytes([header[6], header[7]]));
@@ -461,9 +554,133 @@ async fn run_control_stream<S: GameSimulation>(
         Ok(())
     };
 
-    tokio::time::timeout(CONTROL_STREAM_TIMEOUT, exchange)
+    tokio::time::timeout_at(deadline, exchange)
         .await
         .map_err(|_| "reliable control stream timed out".to_owned())?
+}
+
+/// Why a reliable command lane closed its connection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LaneFailure {
+    pub(crate) code: u32,
+    pub(crate) reason: String,
+}
+
+impl LaneFailure {
+    fn protocol(reason: impl Into<String>) -> Self {
+        Self {
+            code: CLOSE_PROTOCOL,
+            reason: reason.into(),
+        }
+    }
+}
+
+/// Serves the connection's reliable command lane after its `GSCL` magic was read.
+///
+/// Each complete command frame is submitted on [`CommandLane::Reliable`] and answered,
+/// in order, by one ack frame. The runtime lock is held only for the synchronous
+/// submission, never across I/O. Acks are written with stream flow control: a client
+/// that does not read them stalls only this lane, never the connection loop. A FIN
+/// at a frame boundary ends the lane cleanly; any other lane fault fails closed.
+pub(crate) async fn run_command_lane<S, R, W>(
+    mut recv: R,
+    mut send: W,
+    runtime: Arc<Mutex<MatchRuntime<S>>>,
+    lease: SessionLease,
+    frame_timeout: Duration,
+) -> Result<(), LaneFailure>
+where
+    S: GameSimulation,
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut header = [0_u8; COMMAND_LANE_HEADER_BYTES];
+    header[..STREAM_CLASS_BYTES].copy_from_slice(COMMAND_LANE_MAGIC);
+    read_lane_bytes(
+        &mut recv,
+        &mut header[STREAM_CLASS_BYTES..],
+        Instant::now() + frame_timeout,
+    )
+    .await?;
+    decode_command_lane_header(&header)
+        .map_err(|error| LaneFailure::protocol(format!("reliable command lane header: {error}")))?;
+
+    let mut frame = Vec::with_capacity(COMMAND_HEADER_BYTES);
+    loop {
+        frame.clear();
+        frame.resize(COMMAND_HEADER_BYTES, 0);
+        // Waiting for the next frame has no deadline; a quiet lane is normal.
+        let first = recv.read(&mut frame[..1]).await.map_err(|error| {
+            LaneFailure::protocol(format!("reliable command lane read: {error}"))
+        })?;
+        if first == 0 {
+            send.shutdown().await.map_err(|error| {
+                LaneFailure::protocol(format!("reliable command lane finish: {error}"))
+            })?;
+            return Ok(());
+        }
+        let deadline = Instant::now() + frame_timeout;
+        read_lane_bytes(&mut recv, &mut frame[1..], deadline).await?;
+        let header: [u8; COMMAND_HEADER_BYTES] = frame[..COMMAND_HEADER_BYTES]
+            .try_into()
+            .map_err(|_| LaneFailure::protocol("reliable command header size"))?;
+        // Reject a bad header before waiting for, or buffering, its payload.
+        let payload_len = command_frame_payload_len(&header)
+            .map_err(|error| LaneFailure::protocol(format!("reliable command frame: {error}")))?;
+        frame.resize(COMMAND_HEADER_BYTES + payload_len, 0);
+        read_lane_bytes(&mut recv, &mut frame[COMMAND_HEADER_BYTES..], deadline).await?;
+        let command = decode_command(&frame)
+            .map_err(|error| LaneFailure::protocol(format!("reliable command frame: {error}")))?;
+
+        let submitted = runtime.lock().await.submit_lane_command(
+            lease.player_id,
+            lease.connection_epoch,
+            CommandLane::Reliable,
+            command.sequence,
+            &command.payload,
+        );
+        let outcome = match submitted {
+            Ok(CommandOutcome::Applied) => ReliableCommandOutcome::Applied,
+            Ok(CommandOutcome::IgnoredStale) => ReliableCommandOutcome::Duplicate,
+            // The ack is the final outcome. The private ADR-0005 payload is not sent:
+            // kind-5 frames carry no lane, so their sequence would be ambiguous.
+            Err(RuntimeError::Simulation(error)) if error.command_rejection().is_some() => {
+                ReliableCommandOutcome::Rejected
+            }
+            // Never acknowledge a command the frozen runtime did not decide. Closing
+            // makes the client re-send it after reconnecting to the recovered match.
+            Err(RuntimeError::Frozen) => {
+                return Err(LaneFailure {
+                    code: CLOSE_RUNTIME,
+                    reason: RuntimeError::Frozen.to_string(),
+                });
+            }
+            Err(error) => return Err(LaneFailure::protocol(error.to_string())),
+        };
+        let ack = encode_reliable_command_ack(ReliableCommandAck {
+            sequence: command.sequence,
+            outcome,
+        })
+        .map_err(|error| LaneFailure::protocol(error.to_string()))?;
+        send.write_all(&ack)
+            .await
+            .map_err(|error| LaneFailure::protocol(format!("reliable command ack: {error}")))?;
+    }
+}
+
+async fn read_lane_bytes<R: AsyncRead + Unpin>(
+    recv: &mut R,
+    buffer: &mut [u8],
+    deadline: Instant,
+) -> Result<(), LaneFailure> {
+    if buffer.is_empty() {
+        return Ok(());
+    }
+    tokio::time::timeout_at(deadline, recv.read_exact(buffer))
+        .await
+        .map_err(|_| LaneFailure::protocol("reliable command frame timed out"))?
+        .map(|_| ())
+        .map_err(|error| LaneFailure::protocol(format!("reliable command lane read: {error}")))
 }
 
 fn snapshot_for_connection<'a, S: GameSimulation>(
@@ -834,6 +1051,205 @@ mod tests {
             assert_eq!(capacity.available_permits(), 1);
         });
     }
+    fn lane_runtime() -> (Arc<Mutex<MatchRuntime<DemoSimulation>>>, SessionLease) {
+        let mut runtime = MatchRuntime::new_with_replay_capture(DemoSimulation::new(), 10);
+        let lease = runtime
+            .admit(ReconnectToken([1; RECONNECT_TOKEN_BYTES]))
+            .unwrap();
+        (Arc::new(Mutex::new(runtime)), lease)
+    }
+
+    fn lane_command(sequence: u32) -> Vec<u8> {
+        crate::encode_command(sequence, &crate::encode_demo_command(1, 0).unwrap()).unwrap()
+    }
+
+    /// Spawns the lane on in-memory pipes. Returns the client's write half, the
+    /// client's ack reader and the lane task.
+    fn spawn_lane(
+        runtime: &Arc<Mutex<MatchRuntime<DemoSimulation>>>,
+        lease: SessionLease,
+        ack_buffer: usize,
+        frame_timeout: Duration,
+    ) -> (
+        tokio::io::DuplexStream,
+        tokio::io::DuplexStream,
+        tokio::task::JoinHandle<Result<(), LaneFailure>>,
+    ) {
+        let (client_send, server_recv) = tokio::io::duplex(4096);
+        let (server_send, client_recv) = tokio::io::duplex(ack_buffer);
+        let lane = tokio::spawn(run_command_lane(
+            server_recv,
+            server_send,
+            Arc::clone(runtime),
+            lease,
+            frame_timeout,
+        ));
+        (client_send, client_recv, lane)
+    }
+
+    async fn write_lane_header(client: &mut tokio::io::DuplexStream) {
+        // The connection consumed the magic while classifying the stream.
+        client
+            .write_all(&crate::encode_command_lane_header()[STREAM_CLASS_BYTES..])
+            .await
+            .unwrap();
+    }
+
+    async fn read_lane_ack(client: &mut tokio::io::DuplexStream) -> ReliableCommandAck {
+        let mut ack = [0_u8; crate::RELIABLE_COMMAND_ACK_BYTES];
+        client.read_exact(&mut ack).await.unwrap();
+        crate::decode_reliable_command_ack(&ack).unwrap()
+    }
+
+    #[tokio::test]
+    async fn stalled_partial_lane_frame_times_out_but_an_idle_lane_does_not() {
+        let (runtime, lease) = lane_runtime();
+        let timeout = Duration::from_millis(200);
+        let (mut client, mut acks, lane) = spawn_lane(&runtime, lease, 64, timeout);
+        write_lane_header(&mut client).await;
+        client.write_all(&lane_command(1)).await.unwrap();
+        assert_eq!(
+            read_lane_ack(&mut acks).await,
+            ReliableCommandAck {
+                sequence: 1,
+                outcome: ReliableCommandOutcome::Applied
+            }
+        );
+        // Quiet between frames for longer than the frame timeout: still open.
+        tokio::time::sleep(timeout * 3).await;
+        assert!(!lane.is_finished(), "an idle lane must not time out");
+
+        let frame = lane_command(2);
+        client.write_all(&frame[..3]).await.unwrap();
+        let failure = tokio::time::timeout(Duration::from_secs(5), lane)
+            .await
+            .expect("a stalled partial frame must time out")
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(failure.code, CLOSE_PROTOCOL);
+        assert!(failure.reason.contains("timed out"), "{failure:?}");
+        // The partial frame was never submitted.
+        assert_eq!(
+            runtime
+                .lock()
+                .await
+                .submit_lane_command(
+                    lease.player_id,
+                    lease.connection_epoch,
+                    CommandLane::Reliable,
+                    2,
+                    &crate::encode_demo_command(1, 0).unwrap(),
+                )
+                .unwrap(),
+            CommandOutcome::Applied
+        );
+    }
+
+    #[tokio::test]
+    async fn unread_acks_stall_only_the_lane_and_never_hold_the_runtime_lock() {
+        let (runtime, lease) = lane_runtime();
+        // Room for one ack only: the second ack write blocks on backpressure.
+        let (mut client, mut acks, lane) = spawn_lane(
+            &runtime,
+            lease,
+            crate::RELIABLE_COMMAND_ACK_BYTES,
+            Duration::from_secs(10),
+        );
+        write_lane_header(&mut client).await;
+        for sequence in 1..=3 {
+            client.write_all(&lane_command(sequence)).await.unwrap();
+        }
+        // Wait until the lane is blocked writing the second ack.
+        loop {
+            let applied = runtime
+                .lock()
+                .await
+                .replay_log()
+                .unwrap()
+                .records()
+                .iter()
+                .filter(|record| matches!(record, crate::ReplayRecord::CommandApplied { .. }))
+                .count();
+            if applied == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!lane.is_finished());
+        {
+            let mut guard = runtime
+                .try_lock()
+                .expect("a lane blocked on acks must not hold the runtime lock");
+            guard.advance_tick().unwrap();
+        }
+        for sequence in 1..=3 {
+            assert_eq!(read_lane_ack(&mut acks).await.sequence, sequence);
+        }
+        drop(client);
+        tokio::time::timeout(Duration::from_secs(5), lane)
+            .await
+            .unwrap()
+            .unwrap()
+            .expect("FIN at a frame boundary ends the lane cleanly");
+    }
+
+    #[tokio::test]
+    async fn frozen_runtime_closes_the_lane_without_acknowledging() {
+        let (runtime, lease) = lane_runtime();
+        let (mut client, mut acks, lane) = spawn_lane(&runtime, lease, 64, Duration::from_secs(10));
+        write_lane_header(&mut client).await;
+        runtime.lock().await.freeze_for_recovery();
+        client.write_all(&lane_command(1)).await.unwrap();
+        let failure = tokio::time::timeout(Duration::from_secs(5), lane)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(failure.code, CLOSE_RUNTIME);
+        let mut rest = Vec::new();
+        acks.read_to_end(&mut rest).await.unwrap();
+        assert!(rest.is_empty(), "a frozen command must not be acknowledged");
+        let mut runtime = runtime.lock().await;
+        runtime.resume_after_failed_recovery();
+        assert_eq!(
+            runtime
+                .submit_lane_command(
+                    lease.player_id,
+                    lease.connection_epoch,
+                    CommandLane::Reliable,
+                    1,
+                    &crate::encode_demo_command(1, 0).unwrap(),
+                )
+                .unwrap(),
+            CommandOutcome::Applied,
+            "the unacknowledged sequence stays available for the re-send"
+        );
+    }
+
+    #[tokio::test]
+    async fn lane_header_must_match_exactly_before_any_frame() {
+        for remainder in [
+            vec![
+                crate::COMMAND_LANE_FORMAT_VERSION + 1,
+                crate::PROTOCOL_VERSION,
+            ],
+            vec![crate::COMMAND_LANE_FORMAT_VERSION],
+        ] {
+            let (runtime, lease) = lane_runtime();
+            let (mut client, _acks, lane) =
+                spawn_lane(&runtime, lease, 64, Duration::from_millis(200));
+            client.write_all(&remainder).await.unwrap();
+            client.shutdown().await.unwrap();
+            let failure = tokio::time::timeout(Duration::from_secs(5), lane)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(failure.code, CLOSE_PROTOCOL);
+        }
+    }
+
     struct PrivateSimulation {
         tick: u64,
     }

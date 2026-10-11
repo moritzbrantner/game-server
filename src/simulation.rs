@@ -1,5 +1,7 @@
 use crate::PlayerId;
-use crate::protocol::{MAX_COMMAND_REJECTION_PAYLOAD_BYTES, ProtocolError, snapshot_hash};
+use crate::protocol::{
+    CommandLane, MAX_COMMAND_REJECTION_PAYLOAD_BYTES, ProtocolError, snapshot_hash,
+};
 use std::fmt;
 
 #[derive(Clone, Eq, PartialEq)]
@@ -113,6 +115,24 @@ pub trait GameSimulation: Send + 'static {
         sequence: u32,
         payload: &[u8],
     ) -> Result<(), SimulationError>;
+
+    /// Applies one command together with the lane that delivered it.
+    ///
+    /// The runtime and replay verification always call this method. Sequences are
+    /// monotonic per (player, lane), so a game that implements it can tell held
+    /// datagram input from reliable one-shot commands. The default ignores the lane
+    /// and delegates to [`GameSimulation::apply_command`], so existing games compile
+    /// and behave unchanged.
+    fn apply_lane_command(
+        &mut self,
+        player_id: PlayerId,
+        _lane: CommandLane,
+        sequence: u32,
+        payload: &[u8],
+    ) -> Result<(), SimulationError> {
+        self.apply_command(player_id, sequence, payload)
+    }
+
     fn advance_tick(&mut self) -> Result<(), SimulationError>;
 
     fn snapshot_scope(&self) -> SnapshotScope {
