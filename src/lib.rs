@@ -110,3 +110,6 @@ pub use live_host::{LiveHostError, LiveMatchHost, LivePlacementFailure};
 
 #[cfg(test)]
 mod test_support;
+
+#[cfg(test)]
+mod command_lane_acceptance;
