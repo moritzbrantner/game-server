@@ -349,35 +349,56 @@ async fn reconnect_with_received_token(
 }
 
 /// Shared body of the long-outage cases: the client already holds `stalled.welcome`.
+///
+/// Whichever way the original connection recovers, the token from the received
+/// welcome must then resume the same player. A usable original connection is
+/// closed explicitly so the reconnect is always exercised.
 async fn assert_long_outage_recovers(server: &TestServer, stalled: StalledClient, case: &str) {
     let player = stalled.welcome.player_id;
     let restored_at = Instant::now();
-    match probe_after_outage(&stalled.connection, 1, case).await {
-        AfterOutage::Usable(acknowledgement, _lane_send, _lane_recv) => {
+    // Datagram sequence for the session that resumes with the received token. The
+    // datagram watermark survives reconnect, so it must exceed any earlier one.
+    let resumed_datagram_sequence = match probe_after_outage(&stalled.connection, 1, case).await {
+        AfterOutage::Usable(acknowledgement, lane_send, lane_recv) => {
             assert_eq!(acknowledgement, ack(1, APPLIED), "{case}");
             assert_session_usable(server, &stalled.connection, &stalled.welcome, 1, case).await;
             assert_no_leak(server, &[player], case).await;
-            stalled.connection.close(VarInt::from_u32(0), b"done");
+            drop((lane_send, lane_recv));
+            stalled
+                .connection
+                .close(VarInt::from_u32(0), b"exercise the received token");
+            2
         }
         AfterOutage::Ended(error) => {
             eprintln!(
                 "{case}: connection ended {:?} after the path returned: {error}",
                 restored_at.elapsed()
             );
-            wait_until_inactive(server, case).await;
-            let (_endpoint, connection, welcome) = reconnect_with_received_token(
-                server,
-                stalled.welcome.reconnect_token,
-                player,
-                case,
-            )
-            .await;
-            assert!(welcome.connection_epoch > stalled.welcome.connection_epoch);
-            assert_session_usable(server, &connection, &welcome, 1, case).await;
-            assert_no_leak(server, &[player], case).await;
-            connection.close(VarInt::from_u32(0), b"done");
+            1
         }
+    };
+    wait_until_inactive(server, case).await;
+    {
+        let runtime = server.state.runtime.lock().await;
+        assert_eq!(
+            runtime.slot_count(),
+            1,
+            "{case}: the player keeps its slot in grace"
+        );
     }
+    let (_endpoint, connection, welcome) =
+        reconnect_with_received_token(server, stalled.welcome.reconnect_token, player, case).await;
+    assert!(welcome.connection_epoch > stalled.welcome.connection_epoch);
+    assert_session_usable(
+        server,
+        &connection,
+        &welcome,
+        resumed_datagram_sequence,
+        case,
+    )
+    .await;
+    assert_no_leak(server, &[player], case).await;
+    connection.close(VarInt::from_u32(0), b"done");
 }
 
 #[tokio::test]
