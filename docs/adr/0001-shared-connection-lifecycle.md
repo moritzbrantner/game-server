@@ -31,4 +31,6 @@ Both hosting modes use the same session behavior and regression tests. Public se
 
 Synchronous handlers already running cannot be forcibly stopped. External effects committed after dispatch still require epoch fencing by the supplied handler or downstream system. Graceful recovery remains an explicit shutdown operation; canceling a serving future is resource cleanup, not a request to persist state.
 
+Welcome rollback applies only to a welcome that was never completely written, because the client may hold the token of any welcome that was. The welcome counts as delivered once written and finished locally, without waiting for the peer's ACK; see [ADR-0009](0009-local-stream-finish.md).
+
 Regression coverage includes stale shared/private snapshot leases, reconnect while a control request waits for capacity, cancellation while a handler waits in the blocking pool, capacity retention and tick progress during a running handler, welcome rollback, and release of both single-match and hosted tick tasks. The existing network experiments cover both listeners and their recovery paths.
