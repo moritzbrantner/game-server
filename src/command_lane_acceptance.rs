@@ -950,6 +950,67 @@ async fn reliable_command_reaches_the_authority_while_datagrams_are_dropped() {
     .expect("lossy reliable lane acceptance timed out");
 }
 
+/// `connection::send_command_rejection` bounds delivery to two seconds.
+const COMMAND_REJECTION_DELIVERY_BOUND: Duration = Duration::from_secs(2);
+
+/// A rejection is delivered once written and finished locally (ADR-0009), so an
+/// outage that hides the client's ACK for longer than the delivery bound neither
+/// stalls nor closes the connection.
+#[tokio::test]
+async fn command_rejection_does_not_wait_for_the_peer_ack() {
+    timeout(TEST_TIMEOUT, async {
+        let server = TestServer::start().await;
+        let mut relay = LossyRelay::start(server.port).await;
+        let client = connect(relay.port, &server.certificate_hash).await;
+        let player = client.welcome.player_id;
+
+        // The server receives the command, but nothing it sends reaches the client,
+        // so it never sees an ACK for the rejection stream.
+        relay.downstream_outage.store(true, Ordering::SeqCst);
+        client
+            .connection
+            .send_datagram(encode_command(1, b"needs-unlock").unwrap())
+            .unwrap();
+        sleep(COMMAND_REJECTION_DELIVERY_BOUND + Duration::from_secs(1)).await;
+        assert!(relay.dropped.load(Ordering::SeqCst) > 0);
+        relay.downstream_outage.store(false, Ordering::SeqCst);
+
+        let rejection = timeout(IO_TIMEOUT, async {
+            let mut stream = client.connection.accept_uni().await.unwrap();
+            let mut frame = [0_u8; 8 + b"locked".len()];
+            stream.read_exact(&mut frame).await.unwrap();
+            crate::decode_command_rejection(&frame).unwrap()
+        })
+        .await
+        .expect("the rejection must reach the client once the path returns");
+        assert_eq!(
+            rejection,
+            crate::CommandRejectionFrame {
+                sequence: 1,
+                payload: b"locked".to_vec()
+            }
+        );
+
+        client
+            .connection
+            .send_datagram(encode_command(2, b"after-outage").unwrap())
+            .unwrap();
+        timeout(
+            Duration::from_secs(5),
+            server.wait_for_applied(|applied| {
+                applied.contains(&(player, DATAGRAM, 2, b"after-outage".to_vec()))
+            }),
+        )
+        .await
+        .expect("the connection must stay usable after a delayed rejection ACK");
+        client.connection.close(VarInt::from_u32(0), b"done");
+        relay.tasks.shutdown().await;
+        server.shutdown().await;
+    })
+    .await
+    .expect("command rejection outage acceptance timed out");
+}
+
 #[test]
 fn verification_and_recovery_reject_non_monotonic_sequences_within_one_lane() {
     let mut runtime = MatchRuntime::new_with_replay_capture(LaneSimulation::default(), 10);

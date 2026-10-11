@@ -22,11 +22,11 @@ physics-engine = { git = "https://github.com/moritzbrantner/physics-engine.git",
 ring = "0.17.14"
 tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 url = "2.5.8"
-wtransport = { version = "0.7.2", default-features = false, features = ["ring"] }
+wtransport = { version = "0.7.2", default-features = false, features = ["quinn", "ring"] }
 
 [dev-dependencies]
 # Self-signed identities let tests run real WebTransport sessions on loopback.
-wtransport = { version = "0.7.2", default-features = false, features = ["ring", "self-signed"] }
+wtransport = { version = "0.7.2", default-features = false, features = ["quinn", "ring", "self-signed"] }
 
 [lints.rust]
 unsafe_code = "forbid"
