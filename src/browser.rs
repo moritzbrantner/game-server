@@ -1,8 +1,10 @@
 use crate::control::{CONTROL_FORMAT_VERSION, MAX_CONTROL_PAYLOAD_BYTES};
 use crate::host::{MatchId, MatchIdError};
 use crate::protocol::{
+    COMMAND_LANE_FORMAT_VERSION, COMMAND_LANE_HEADER_BYTES, MAX_COMMAND_LANES_PER_CONNECTION,
     MAX_COMMAND_PAYLOAD_BYTES, MAX_COMMAND_REJECTION_PAYLOAD_BYTES, MAX_SNAPSHOT_FRAGMENTS,
     MAX_SNAPSHOT_PAYLOAD_BYTES, PROTOCOL_VERSION, RECONNECT_TOKEN_BYTES,
+    RELIABLE_COMMAND_ACK_BYTES,
 };
 use crate::session::ReconnectToken;
 use std::collections::BTreeSet;
@@ -72,6 +74,10 @@ pub struct BrowserProtocolContract {
     pub max_snapshot_payload_bytes: usize,
     pub max_snapshot_fragments: usize,
     pub max_control_payload_bytes: usize,
+    pub command_lane_format_version: u8,
+    pub command_lane_header_bytes: usize,
+    pub reliable_command_ack_bytes: usize,
+    pub max_command_lanes_per_connection: usize,
 }
 
 pub const BROWSER_PROTOCOL_CONTRACT: BrowserProtocolContract = BrowserProtocolContract {
@@ -84,6 +90,10 @@ pub const BROWSER_PROTOCOL_CONTRACT: BrowserProtocolContract = BrowserProtocolCo
     max_snapshot_payload_bytes: MAX_SNAPSHOT_PAYLOAD_BYTES,
     max_snapshot_fragments: MAX_SNAPSHOT_FRAGMENTS,
     max_control_payload_bytes: MAX_CONTROL_PAYLOAD_BYTES,
+    command_lane_format_version: COMMAND_LANE_FORMAT_VERSION,
+    command_lane_header_bytes: COMMAND_LANE_HEADER_BYTES,
+    reliable_command_ack_bytes: RELIABLE_COMMAND_ACK_BYTES,
+    max_command_lanes_per_connection: MAX_COMMAND_LANES_PER_CONNECTION,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
