@@ -19,6 +19,9 @@
 //!   (`CLOSE_PROTOCOL`, 1), exactly like a malformed datagram command.
 //! - A stalled lane holds no runtime lock and never blocks ticks, snapshots or
 //!   datagram ingestion.
+//!
+//! The loopback harness (`TestServer`, `LossyRelay`, `connect`) is shared with
+//! `welcome_handshake_acceptance` (#45).
 
 use crate::connection::{
     AdmissionRequest, ConnectionState, SNAPSHOT_CHANNEL_DEPTH, handle_connection,
@@ -52,15 +55,15 @@ use wtransport::{
 /// `connection::CLOSE_PROTOCOL`.
 const PROTOCOL_CLOSE_CODE: u64 = 1;
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
-const TEST_TIMEOUT: Duration = Duration::from_secs(40);
+pub(crate) const TEST_TIMEOUT: Duration = Duration::from_secs(40);
 const TICK_INTERVAL: Duration = Duration::from_millis(20);
 
-type Applied = (PlayerId, CommandLane, u32, Vec<u8>);
+pub(crate) type Applied = (PlayerId, CommandLane, u32, Vec<u8>);
 
 /// Records the lane of every applied command in canonical state.
 /// `b"fatal"` is fatal; `b"needs-unlock"` is a private rejection until `b"unlock"`.
 #[derive(Clone, Debug, Default)]
-struct LaneSimulation {
+pub(crate) struct LaneSimulation {
     tick: u64,
     players: BTreeSet<PlayerId>,
     unlocked: BTreeSet<PlayerId>,
@@ -182,17 +185,35 @@ fn applied_commands(snapshot: &SimulationSnapshot) -> Vec<Applied> {
     applied
 }
 
-struct TestServer {
-    state: ConnectionState<LaneSimulation>,
-    port: u16,
-    certificate_hash: Sha256Digest,
-    admissions: Arc<std::sync::Mutex<VecDeque<AdmissionRequest>>>,
+pub(crate) struct TestServer {
+    pub(crate) state: ConnectionState<LaneSimulation>,
+    pub(crate) port: u16,
+    pub(crate) certificate_hash: Sha256Digest,
+    pub(crate) admissions: Arc<std::sync::Mutex<VecDeque<AdmissionRequest>>>,
+    /// Each accepted session waits for one permit before `handle_connection` runs.
+    welcome_gate: Arc<Semaphore>,
     tasks: JoinSet<()>,
 }
 
 impl TestServer {
     /// Serves `handle_connection` on loopback and ticks/publishes snapshots every 20 ms.
-    async fn start() -> Self {
+    pub(crate) async fn start() -> Self {
+        Self::start_with_gate(Semaphore::MAX_PERMITS).await
+    }
+
+    /// Like `start`, but every accepted WebTransport session waits for
+    /// `release_welcome` before admission and the welcome. A test can then change
+    /// the network path between session establishment and the welcome.
+    pub(crate) async fn start_gated() -> Self {
+        Self::start_with_gate(0).await
+    }
+
+    /// Lets one waiting (or the next) accepted session proceed to admission.
+    pub(crate) fn release_welcome(&self) {
+        self.welcome_gate.add_permits(1);
+    }
+
+    async fn start_with_gate(permits: usize) -> Self {
         let identity = Identity::self_signed(["localhost", "127.0.0.1"]).unwrap();
         let certificate_hash = identity.certificate_chain().as_slice()[0].hash();
         let endpoint = Endpoint::server(
@@ -217,10 +238,12 @@ impl TestServer {
             admission_gate: None,
         };
         let admissions = Arc::new(std::sync::Mutex::new(VecDeque::new()));
+        let welcome_gate = Arc::new(Semaphore::new(permits));
         let mut tasks = JoinSet::new();
 
         let accepting = state.clone();
         let queue = Arc::clone(&admissions);
+        let gate = Arc::clone(&welcome_gate);
         tasks.spawn(async move {
             let mut handlers = JoinSet::new();
             loop {
@@ -236,7 +259,9 @@ impl TestServer {
                     .pop_front()
                     .unwrap_or(AdmissionRequest::New);
                 let state = accepting.clone();
+                let gate = Arc::clone(&gate);
                 handlers.spawn(async move {
+                    gate.acquire().await.unwrap().forget();
                     if let Err(error) = handle_connection(connection, state, admission).await {
                         eprintln!("test connection ended with error: {error}");
                     }
@@ -263,15 +288,19 @@ impl TestServer {
             port,
             certificate_hash,
             admissions,
+            welcome_gate,
             tasks,
         }
     }
 
-    async fn applied(&self) -> Vec<Applied> {
+    pub(crate) async fn applied(&self) -> Vec<Applied> {
         applied_commands(&self.state.runtime.lock().await.snapshot().unwrap())
     }
 
-    async fn wait_for_applied(&self, predicate: impl Fn(&[Applied]) -> bool) -> Vec<Applied> {
+    pub(crate) async fn wait_for_applied(
+        &self,
+        predicate: impl Fn(&[Applied]) -> bool,
+    ) -> Vec<Applied> {
         loop {
             let applied = self.applied().await;
             if predicate(&applied) {
@@ -312,7 +341,7 @@ impl TestServer {
         );
     }
 
-    async fn shutdown(mut self) {
+    pub(crate) async fn shutdown(mut self) {
         self.tasks.shutdown().await;
     }
 }
@@ -324,10 +353,41 @@ struct TestClient {
 }
 
 async fn connect(port: u16, certificate_hash: &Sha256Digest) -> TestClient {
+    let (endpoint, connection) = connect_session(port, certificate_hash).await;
+    let welcome = read_welcome(&connection)
+        .await
+        .expect("welcome timed out")
+        .expect("welcome stream failed");
+    TestClient {
+        _endpoint: endpoint,
+        connection,
+        welcome,
+    }
+}
+
+/// Establishes the WebTransport session without reading the welcome.
+async fn connect_session(
+    port: u16,
+    certificate_hash: &Sha256Digest,
+) -> (Endpoint<Client>, Connection) {
+    try_connect_session(port, certificate_hash, None)
+        .await
+        .unwrap_or_else(|error| panic!("connect failed: {error}"))
+}
+
+/// Like `connect_session`, but returns why the session could not be established,
+/// for example because the server refused the admission while it was opening.
+/// `keep_alive` sets the client's QUIC keep-alive interval.
+pub(crate) async fn try_connect_session(
+    port: u16,
+    certificate_hash: &Sha256Digest,
+    keep_alive: Option<Duration>,
+) -> Result<(Endpoint<Client>, Connection), String> {
     let endpoint = Endpoint::client(
         ClientConfig::builder()
             .with_bind_default()
             .with_server_certificate_hashes([certificate_hash.clone()])
+            .keep_alive_interval(keep_alive)
             .build(),
     )
     .unwrap();
@@ -337,24 +397,28 @@ async fn connect(port: u16, certificate_hash: &Sha256Digest) -> TestClient {
     )
     .await
     .expect("connect timed out")
-    .unwrap();
-    let mut welcome = [0_u8; WELCOME_BYTES];
+    .map_err(|error| error.to_string())?;
+    Ok((endpoint, connection))
+}
+
+/// Reads the welcome within `IO_TIMEOUT`. The inner error says why no complete
+/// welcome arrived, for example because the server closed the session instead.
+pub(crate) async fn read_welcome(
+    connection: &Connection,
+) -> Result<Result<Welcome, String>, tokio::time::error::Elapsed> {
     timeout(IO_TIMEOUT, async {
-        connection
+        let mut stream = connection
             .accept_uni()
             .await
-            .unwrap()
+            .map_err(|error| format!("no welcome stream: {error}"))?;
+        let mut welcome = [0_u8; WELCOME_BYTES];
+        stream
             .read_exact(&mut welcome)
             .await
-            .unwrap();
+            .map_err(|error| format!("incomplete welcome: {error}"))?;
+        decode_welcome(&welcome).map_err(|error| error.to_string())
     })
     .await
-    .expect("welcome timed out");
-    TestClient {
-        _endpoint: endpoint,
-        connection,
-        welcome: decode_welcome(&welcome).unwrap(),
-    }
 }
 
 async fn open_bi(connection: &Connection) -> (SendStream, RecvStream) {
@@ -382,7 +446,7 @@ async fn read_ack(recv: &mut RecvStream) -> ReliableCommandAck {
     decode_reliable_command_ack(&bytes).unwrap()
 }
 
-fn ack(sequence: u32, outcome: ReliableCommandOutcome) -> ReliableCommandAck {
+pub(crate) fn ack(sequence: u32, outcome: ReliableCommandOutcome) -> ReliableCommandAck {
     ReliableCommandAck { sequence, outcome }
 }
 
@@ -404,9 +468,9 @@ fn token(value: u8) -> ReconnectToken {
     ReconnectToken([value; crate::RECONNECT_TOKEN_BYTES])
 }
 
-const DATAGRAM: CommandLane = CommandLane::Datagram;
-const RELIABLE: CommandLane = CommandLane::Reliable;
-const APPLIED: ReliableCommandOutcome = ReliableCommandOutcome::Applied;
+pub(crate) const DATAGRAM: CommandLane = CommandLane::Datagram;
+pub(crate) const RELIABLE: CommandLane = CommandLane::Reliable;
+pub(crate) const APPLIED: ReliableCommandOutcome = ReliableCommandOutcome::Applied;
 const DUPLICATE: ReliableCommandOutcome = ReliableCommandOutcome::Duplicate;
 const REJECTED: ReliableCommandOutcome = ReliableCommandOutcome::Rejected;
 
@@ -747,16 +811,19 @@ async fn stalled_lane_does_not_block_ticks_snapshots_or_datagram_commands() {
 
 /// A UDP relay between client and server that can drop every packet in both
 /// directions. QUIC retransmits lost stream data after the outage; datagrams lost
-/// during the outage are gone for good.
-struct LossyRelay {
-    port: u16,
-    outage: Arc<AtomicBool>,
-    dropped: Arc<AtomicU64>,
-    tasks: JoinSet<()>,
+/// during the outage are gone for good. `upstream_outage` and `downstream_outage`
+/// drop only client-to-server or only server-to-client packets.
+pub(crate) struct LossyRelay {
+    pub(crate) port: u16,
+    pub(crate) outage: Arc<AtomicBool>,
+    pub(crate) upstream_outage: Arc<AtomicBool>,
+    pub(crate) downstream_outage: Arc<AtomicBool>,
+    pub(crate) dropped: Arc<AtomicU64>,
+    pub(crate) tasks: JoinSet<()>,
 }
 
 impl LossyRelay {
-    async fn start(server_port: u16) -> Self {
+    pub(crate) async fn start(server_port: u16) -> Self {
         let client_side = Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
         let server_side = Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
         server_side
@@ -765,6 +832,8 @@ impl LossyRelay {
             .unwrap();
         let port = client_side.local_addr().unwrap().port();
         let outage = Arc::new(AtomicBool::new(false));
+        let upstream_outage = Arc::new(AtomicBool::new(false));
+        let downstream_outage = Arc::new(AtomicBool::new(false));
         let dropped = Arc::new(AtomicU64::new(0));
         let peer = Arc::new(std::sync::Mutex::new(None::<SocketAddr>));
         let mut tasks = JoinSet::new();
@@ -773,6 +842,7 @@ impl LossyRelay {
             let (client_side, server_side) = (Arc::clone(&client_side), Arc::clone(&server_side));
             let (outage, dropped, peer) =
                 (Arc::clone(&outage), Arc::clone(&dropped), Arc::clone(&peer));
+            let directional = Arc::clone(&upstream_outage);
             tasks.spawn(async move {
                 let mut buffer = vec![0_u8; 65_535];
                 loop {
@@ -780,7 +850,7 @@ impl LossyRelay {
                         continue;
                     };
                     *peer.lock().unwrap() = Some(from);
-                    if outage.load(Ordering::SeqCst) {
+                    if outage.load(Ordering::SeqCst) || directional.load(Ordering::SeqCst) {
                         dropped.fetch_add(1, Ordering::SeqCst);
                         continue;
                     }
@@ -791,13 +861,14 @@ impl LossyRelay {
         {
             let (outage, dropped, peer) =
                 (Arc::clone(&outage), Arc::clone(&dropped), Arc::clone(&peer));
+            let directional = Arc::clone(&downstream_outage);
             tasks.spawn(async move {
                 let mut buffer = vec![0_u8; 65_535];
                 loop {
                     let Ok(read) = server_side.recv(&mut buffer).await else {
                         continue;
                     };
-                    if outage.load(Ordering::SeqCst) {
+                    if outage.load(Ordering::SeqCst) || directional.load(Ordering::SeqCst) {
                         dropped.fetch_add(1, Ordering::SeqCst);
                         continue;
                     }
@@ -811,6 +882,8 @@ impl LossyRelay {
         Self {
             port,
             outage,
+            upstream_outage,
+            downstream_outage,
             dropped,
             tasks,
         }
@@ -875,6 +948,67 @@ async fn reliable_command_reaches_the_authority_while_datagrams_are_dropped() {
     })
     .await
     .expect("lossy reliable lane acceptance timed out");
+}
+
+/// `connection::send_command_rejection` bounds delivery to two seconds.
+const COMMAND_REJECTION_DELIVERY_BOUND: Duration = Duration::from_secs(2);
+
+/// A rejection is delivered once written and finished locally (ADR-0009), so an
+/// outage that hides the client's ACK for longer than the delivery bound neither
+/// stalls nor closes the connection.
+#[tokio::test]
+async fn command_rejection_does_not_wait_for_the_peer_ack() {
+    timeout(TEST_TIMEOUT, async {
+        let server = TestServer::start().await;
+        let mut relay = LossyRelay::start(server.port).await;
+        let client = connect(relay.port, &server.certificate_hash).await;
+        let player = client.welcome.player_id;
+
+        // The server receives the command, but nothing it sends reaches the client,
+        // so it never sees an ACK for the rejection stream.
+        relay.downstream_outage.store(true, Ordering::SeqCst);
+        client
+            .connection
+            .send_datagram(encode_command(1, b"needs-unlock").unwrap())
+            .unwrap();
+        sleep(COMMAND_REJECTION_DELIVERY_BOUND + Duration::from_secs(1)).await;
+        assert!(relay.dropped.load(Ordering::SeqCst) > 0);
+        relay.downstream_outage.store(false, Ordering::SeqCst);
+
+        let rejection = timeout(IO_TIMEOUT, async {
+            let mut stream = client.connection.accept_uni().await.unwrap();
+            let mut frame = [0_u8; 8 + b"locked".len()];
+            stream.read_exact(&mut frame).await.unwrap();
+            crate::decode_command_rejection(&frame).unwrap()
+        })
+        .await
+        .expect("the rejection must reach the client once the path returns");
+        assert_eq!(
+            rejection,
+            crate::CommandRejectionFrame {
+                sequence: 1,
+                payload: b"locked".to_vec()
+            }
+        );
+
+        client
+            .connection
+            .send_datagram(encode_command(2, b"after-outage").unwrap())
+            .unwrap();
+        timeout(
+            Duration::from_secs(5),
+            server.wait_for_applied(|applied| {
+                applied.contains(&(player, DATAGRAM, 2, b"after-outage".to_vec()))
+            }),
+        )
+        .await
+        .expect("the connection must stay usable after a delayed rejection ACK");
+        client.connection.close(VarInt::from_u32(0), b"done");
+        relay.tasks.shutdown().await;
+        server.shutdown().await;
+    })
+    .await
+    .expect("command rejection outage acceptance timed out");
 }
 
 #[test]

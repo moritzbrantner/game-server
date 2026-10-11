@@ -198,14 +198,16 @@ async fn send_welcome<S: GameSimulation>(
             .write_all(&welcome)
             .await
             .map_err(|error| error.to_string())?;
-        welcome_stream
-            .finish()
-            .await
-            .map_err(|error| error.to_string())?;
-        Ok(())
+        // The welcome is delivered once written and finished locally. Waiting for the
+        // peer's ACK would tie admission to the path and to the client's stream state.
+        finish_locally(&mut welcome_stream)
     };
 
+    // Biased: a welcome that is completely written counts as delivered, even if
+    // shutdown or a connection close becomes ready in the same poll. Rolling it back
+    // could invalidate a token the client already holds (ADR-0001, ADR-0009).
     tokio::select! {
+        biased;
         result = tokio::time::timeout(WELCOME_HANDSHAKE_TIMEOUT, handshake) => {
             match result {
                 Ok(result) => result,
@@ -215,6 +217,24 @@ async fn send_welcome<S: GameSimulation>(
         _ = shutdown.recv() => Err("server stopped before welcome completed".to_owned()),
         _ = connection.closed() => Err("connection closed before welcome completed".to_owned()),
     }
+}
+
+/// Queues the FIN of a server-written frame without waiting for the peer.
+///
+/// wtransport's `SendStream::finish()` queues the FIN and then awaits `stopped()`,
+/// which resolves only once the peer has acknowledged every byte or has sent
+/// STOP_SENDING. Server frames (welcome, command rejection, control response) count
+/// as delivered once they are written and finished locally (ADR-0009): the outcome
+/// is already fixed, and a path outage or a client that drops the stream after
+/// reading the frame must not turn a delivered frame into a failure. QUIC keeps
+/// retransmitting the finished stream until the peer acknowledges it or the
+/// connection ends, also after the handle is dropped; quinn's drop finishes an
+/// unfinished stream and never resets a finished one.
+fn finish_locally(stream: &mut SendStream) -> Result<(), String> {
+    stream
+        .quic_stream_mut()
+        .finish()
+        .map_err(|_| "stream was already finished or reset".to_owned())
 }
 
 fn rollback_failed_welcome<S: GameSimulation>(
@@ -446,8 +466,7 @@ async fn send_command_rejection(
             .write_all(&frame)
             .await
             .map_err(|error| error.to_string())?;
-        stream.finish().await.map_err(|error| error.to_string())?;
-        Ok(())
+        finish_locally(&mut stream)
     };
     // One rejection is in flight per connection; a non-reading client cannot retain work indefinitely.
     tokio::select! {
@@ -547,11 +566,7 @@ async fn run_control_stream<S: GameSimulation>(
             .write_all(&response)
             .await
             .map_err(|error| error.to_string())?;
-        send_stream
-            .finish()
-            .await
-            .map_err(|error| error.to_string())?;
-        Ok(())
+        finish_locally(&mut send_stream)
     };
 
     tokio::time::timeout_at(deadline, exchange)
@@ -614,6 +629,9 @@ where
             LaneFailure::protocol(format!("reliable command lane read: {error}"))
         })?;
         if first == 0 {
+            // For a WebTransport stream this is quinn's `poll_shutdown`, a local FIN
+            // that does not wait for the peer's ACK (ADR-0009); acks already written
+            // stay deliverable.
             send.shutdown().await.map_err(|error| {
                 LaneFailure::protocol(format!("reliable command lane finish: {error}"))
             })?;
