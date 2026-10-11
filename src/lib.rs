@@ -117,3 +117,6 @@ mod test_support;
 
 #[cfg(test)]
 mod command_lane_acceptance;
+
+#[cfg(test)]
+mod welcome_handshake_acceptance;
