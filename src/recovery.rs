@@ -1,5 +1,5 @@
-use crate::protocol::{PlayerId, RECONNECT_TOKEN_BYTES};
-use crate::replay::{ReplayError, ReplayLog, ReplayRecord, replay_into};
+use crate::protocol::{CommandLane, PlayerId, RECONNECT_TOKEN_BYTES};
+use crate::replay::{LaneSequences, ReplayError, ReplayLog, ReplayRecord, replay_into};
 use crate::session::{
     ReconnectToken, RecoverableSession, SessionRecoveryError, SessionRecoverySnapshot,
 };
@@ -277,28 +277,43 @@ impl RecoveryImage {
         Self::decode(&bytes)
     }
 
+    /// Datagram-lane watermark of every player in the image.
     pub fn last_sequences(&self) -> BTreeMap<PlayerId, u32> {
-        let current_players = self
+        self.last_lane_sequences()
+            .into_iter()
+            .filter(|((_, lane), _)| *lane == CommandLane::Datagram)
+            .map(|((player_id, _), sequence)| (player_id, sequence))
+            .collect()
+    }
+
+    /// Watermark of every (player, lane) pair for the players in the image.
+    pub fn last_lane_sequences(&self) -> BTreeMap<(PlayerId, CommandLane), u32> {
+        self.lane_watermarks()
+            .into_iter()
+            .flat_map(|(player_id, sequences)| {
+                [CommandLane::Datagram, CommandLane::Reliable]
+                    .map(|lane| ((player_id, lane), sequences.get(lane)))
+            })
+            .collect()
+    }
+
+    pub(crate) fn lane_watermarks(&self) -> BTreeMap<PlayerId, LaneSequences> {
+        let mut sequences = self
             .sessions
             .sessions
             .iter()
-            .map(|session| session.player_id)
-            .collect::<BTreeSet<_>>();
-        let mut sequences = current_players
-            .iter()
-            .map(|player_id| (*player_id, 0_u32))
+            .map(|session| (session.player_id, LaneSequences::default()))
             .collect::<BTreeMap<_, _>>();
         for record in self.replay.records() {
             if let ReplayRecord::CommandApplied {
                 player_id,
+                lane,
                 sequence,
                 ..
             } = record
-                && current_players.contains(player_id)
+                && let Some(current) = sequences.get_mut(player_id)
             {
-                sequences
-                    .entry(*player_id)
-                    .and_modify(|current| *current = (*current).max(*sequence));
+                current.set(*lane, current.get(*lane).max(*sequence));
             }
         }
         sequences
@@ -444,6 +459,7 @@ mod tests {
         replay.append(ReplayRecord::CommandApplied {
             tick: 0,
             player_id: 1,
+            lane: CommandLane::Datagram,
             sequence: 1,
             payload: command,
         });
@@ -547,6 +563,7 @@ mod tests {
         image.replay.append(ReplayRecord::CommandApplied {
             tick: image.current_tick,
             player_id: 1,
+            lane: CommandLane::Datagram,
             sequence: 2,
             payload: encode_demo_command(-1, 0).unwrap().to_vec(),
         });

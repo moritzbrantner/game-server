@@ -1,7 +1,8 @@
 use game_server::{
-    CommandFrame, CommandRejectionFrame, ControlRequest, ControlResponse, MatchRuntime,
-    ReconnectToken, RecoverableSession, ReplayRecord, SessionLease, SessionRecoverySnapshot,
-    SimulationSnapshot, SnapshotDatagram, SnapshotFragment, SnapshotFrame, Welcome,
+    CommandFrame, CommandLane, CommandRejectionFrame, ControlRequest, ControlResponse,
+    MatchRuntime, ReconnectToken, RecoverableSession, ReplayRecord, SessionLease,
+    SessionRecoverySnapshot, SimulationSnapshot, SnapshotDatagram, SnapshotFragment, SnapshotFrame,
+    Welcome,
 };
 
 #[test]
@@ -66,6 +67,7 @@ fn opaque_payloads_and_credentials_are_redacted_at_nested_diagnostic_boundaries(
             ReplayRecord::CommandApplied {
                 tick: 7,
                 player_id: 1,
+                lane: CommandLane::Reliable,
                 sequence: 3,
                 payload: secret.clone()
             }
