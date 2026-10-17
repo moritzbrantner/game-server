@@ -12,7 +12,7 @@ jobs:
   rust:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Show toolchain
         run: rustc --version && cargo --version
       - name: Format
@@ -42,7 +42,7 @@ jobs:
           bash recovery/hosted-restart-experiment.sh 2>&1 | tee hosted-restart.log
       - name: Upload hosted recovery failure diagnostics
         if: failure() && steps.hosted-restart.outcome == 'failure'
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: hosted-restart-failure
           path: hosted-restart.log

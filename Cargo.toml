@@ -26,7 +26,7 @@ wtransport = { version = "0.7.2", default-features = false, features = ["quinn",
 
 [dev-dependencies]
 # Self-signed identities let tests run real WebTransport sessions on loopback.
-wtransport = { version = "0.7.2", default-features = false, features = ["quinn", "ring", "self-signed"] }
+wtransport = { version = "=0.7.2", default-features = false, features = ["quinn", "ring", "self-signed"] }
 
 [lints.rust]
 unsafe_code = "forbid"
