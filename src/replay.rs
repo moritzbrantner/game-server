@@ -1,15 +1,17 @@
 use crate::protocol::{
     CommandLane, MAX_COMMAND_PAYLOAD_BYTES, MAX_SNAPSHOT_PAYLOAD_BYTES, PlayerId, snapshot_hash,
 };
+use crate::replay_baseline::{MAX_BASELINE_BODY_BYTES, ReplayBaseline};
 use crate::simulation::{GameSimulation, SimulationError, SimulationSnapshot};
 use std::collections::BTreeMap;
 use std::fmt;
 
-/// Newest replay format: version 4 adds trusted host input records.
+/// Newest replay format: version 5 adds an opt-in canonical recovery baseline.
 ///
 /// Encoding picks the oldest version that can carry a log, so datagram-only logs
 /// stay byte-identical to their version 1 (no digests) or version 2 encoding.
-pub const REPLAY_FORMAT_VERSION: u8 = 4;
+pub const REPLAY_FORMAT_VERSION: u8 = 5;
+const HOST_INPUT_REPLAY_FORMAT_VERSION: u8 = 4;
 const LANE_REPLAY_FORMAT_VERSION: u8 = 3;
 const DIGEST_REPLAY_FORMAT_VERSION: u8 = 2;
 const LEGACY_REPLAY_FORMAT_VERSION: u8 = 1;
@@ -24,6 +26,7 @@ const DIGEST_CHECKPOINT_KIND: u8 = 5;
 /// Version 3: a command on a non-datagram lane. Datagram commands keep kind 2.
 const LANE_COMMAND_KIND: u8 = 6;
 const HOST_INPUT_KIND: u8 = 7;
+const BASELINE_KIND: u8 = 8;
 const HOST_INPUT_FIXED_BODY_BYTES: usize = 4 + 4;
 const RELIABLE_LANE_BYTE: u8 = 1;
 const DIGEST_BODY_BYTES: usize = 32;
@@ -38,6 +41,9 @@ const MAX_VERIFIER_TICK_GAP: u64 = 1;
 
 #[derive(Clone, Eq, PartialEq)]
 pub enum ReplayRecord {
+    Baseline {
+        baseline: ReplayBaseline,
+    },
     PlayerAdmitted {
         tick: u64,
         player_id: PlayerId,
@@ -70,6 +76,7 @@ pub enum ReplayRecord {
 impl ReplayRecord {
     pub fn tick(&self) -> u64 {
         match self {
+            Self::Baseline { baseline } => baseline.snapshot.tick,
             Self::PlayerAdmitted { tick, .. }
             | Self::CommandApplied { tick, .. }
             | Self::HostInputApplied { tick, .. }
@@ -104,12 +111,14 @@ impl ReplayLog {
             .iter()
             .any(|record| matches!(record, ReplayRecord::DigestCheckpoint { .. }));
         bytes.push(
-            if self
+            if matches!(self.records.first(), Some(ReplayRecord::Baseline { .. })) {
+                REPLAY_FORMAT_VERSION
+            } else if self
                 .records
                 .iter()
                 .any(|record| matches!(record, ReplayRecord::HostInputApplied { .. }))
             {
-                REPLAY_FORMAT_VERSION
+                HOST_INPUT_REPLAY_FORMAT_VERSION
             } else if has_lane_commands {
                 LANE_REPLAY_FORMAT_VERSION
             } else if has_digests {
@@ -118,7 +127,10 @@ impl ReplayLog {
                 LEGACY_REPLAY_FORMAT_VERSION
             },
         );
-        for record in &self.records {
+        for (index, record) in self.records.iter().enumerate() {
+            if index != 0 && matches!(record, ReplayRecord::Baseline { .. }) {
+                return Err(ReplayError::InvalidBaseline("baseline must be first"));
+            }
             encode_record(record, &mut bytes)?;
         }
         Ok(bytes)
@@ -147,7 +159,8 @@ impl ReplayLog {
             let kind = bytes[offset];
             if (version < DIGEST_REPLAY_FORMAT_VERSION && kind == DIGEST_CHECKPOINT_KIND)
                 || (version < LANE_REPLAY_FORMAT_VERSION && kind == LANE_COMMAND_KIND)
-                || (version < REPLAY_FORMAT_VERSION && kind == HOST_INPUT_KIND)
+                || (version < HOST_INPUT_REPLAY_FORMAT_VERSION && kind == HOST_INPUT_KIND)
+                || (version < REPLAY_FORMAT_VERSION && kind == BASELINE_KIND)
             {
                 return Err(ReplayError::UnknownRecordKind(kind));
             }
@@ -155,7 +168,15 @@ impl ReplayLog {
             let body_len = u32::from_be_bytes(field(bytes, offset + 9)?);
             let body_len =
                 usize::try_from(body_len).map_err(|_| ReplayError::RecordTooLarge(usize::MAX))?;
-            if body_len > MAX_REPLAY_BODY_BYTES {
+            if kind == BASELINE_KIND && !records.is_empty() {
+                return Err(ReplayError::InvalidBaseline("baseline must be first"));
+            }
+            let maximum = if kind == BASELINE_KIND {
+                MAX_BASELINE_BODY_BYTES
+            } else {
+                MAX_REPLAY_BODY_BYTES
+            };
+            if body_len > maximum {
                 return Err(ReplayError::RecordTooLarge(body_len));
             }
             offset += RECORD_HEADER_BYTES;
@@ -198,6 +219,7 @@ pub struct ReplayVerification {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReplayError {
     InvalidMagic,
+    InvalidBaseline(&'static str),
     UnsupportedVersion(u8),
     UnknownRecordKind(u8),
     Truncated,
@@ -256,6 +278,7 @@ pub enum ReplayError {
 impl fmt::Display for ReplayError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidBaseline(reason) => write!(formatter, "invalid replay baseline: {reason}"),
             Self::InvalidMagic => write!(formatter, "invalid replay log magic"),
             Self::UnsupportedVersion(version) => {
                 write!(formatter, "unsupported replay format version {version}")
@@ -366,6 +389,9 @@ pub(crate) struct LaneSequences {
 }
 
 impl LaneSequences {
+    pub(crate) fn new(datagram: u32, reliable: u32) -> Self {
+        Self { datagram, reliable }
+    }
     pub(crate) fn get(&self, lane: CommandLane) -> u32 {
         match lane {
             CommandLane::Datagram => self.datagram,
@@ -404,7 +430,24 @@ pub(crate) fn replay_into<S: GameSimulation>(
     let mut previous_tick = None;
     let mut checkpoints_verified = 0_usize;
 
-    for record in log.records() {
+    for (index, record) in log.records().iter().enumerate() {
+        if let ReplayRecord::Baseline { baseline } = record {
+            if index != 0 {
+                return Err(ReplayError::InvalidBaseline("baseline must be first"));
+            }
+            baseline.validate()?;
+            simulation.restore_checkpoint(&baseline.snapshot)?;
+            if simulation.snapshot()? != baseline.snapshot {
+                return Err(ReplayError::InvalidBaseline(
+                    "restored simulation differs from checkpoint",
+                ));
+            }
+            last_admitted_player_id = baseline.highest_player_id;
+            sequences = baseline.watermarks();
+            previous_tick = Some(baseline.snapshot.tick);
+            checkpoints_verified += 1;
+            continue;
+        }
         let record_tick = record.tick();
         if let Some(previous) = previous_tick.filter(|previous| record_tick < *previous) {
             return Err(ReplayError::NonMonotonicTick {
@@ -432,6 +475,9 @@ pub(crate) fn replay_into<S: GameSimulation>(
         }
 
         match record {
+            ReplayRecord::Baseline { .. } => {
+                return Err(ReplayError::InvalidBaseline("baseline must be first"));
+            }
             ReplayRecord::PlayerAdmitted { player_id, .. } => {
                 if *player_id <= last_admitted_player_id {
                     return Err(ReplayError::NonIncreasingPlayerId {
@@ -532,6 +578,7 @@ pub(crate) fn canonical_digest(snapshot: &SimulationSnapshot) -> [u8; 32] {
 
 fn record_body_len(record: &ReplayRecord) -> Result<usize, ReplayError> {
     match record {
+        ReplayRecord::Baseline { baseline } => baseline.body_len(),
         ReplayRecord::HostInputApplied { payload, .. } => {
             if payload.len() > MAX_COMMAND_PAYLOAD_BYTES {
                 return Err(ReplayError::PayloadTooLarge {
@@ -591,6 +638,7 @@ fn encode_record(record: &ReplayRecord, output: &mut Vec<u8>) -> Result<(), Repl
     let encoded_body_len =
         u32::try_from(body_len).map_err(|_| ReplayError::RecordTooLarge(body_len))?;
     let kind = match record {
+        ReplayRecord::Baseline { .. } => BASELINE_KIND,
         ReplayRecord::PlayerAdmitted { .. } => ADMISSION_KIND,
         ReplayRecord::CommandApplied {
             lane: CommandLane::Datagram,
@@ -610,6 +658,7 @@ fn encode_record(record: &ReplayRecord, output: &mut Vec<u8>) -> Result<(), Repl
     output.extend_from_slice(&record.tick().to_be_bytes());
     output.extend_from_slice(&encoded_body_len.to_be_bytes());
     match record {
+        ReplayRecord::Baseline { baseline } => baseline.encode_body(output),
         ReplayRecord::HostInputApplied {
             player_id, payload, ..
         } => {
@@ -670,6 +719,9 @@ fn field<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N], ReplayE
 
 fn decode_record(kind: u8, tick: u64, body: &[u8]) -> Result<ReplayRecord, ReplayError> {
     match kind {
+        BASELINE_KIND => Ok(ReplayRecord::Baseline {
+            baseline: ReplayBaseline::decode(tick, body)?,
+        }),
         DIGEST_CHECKPOINT_KIND => {
             require_body_length(kind, body, DIGEST_BODY_BYTES)?;
             Ok(ReplayRecord::DigestCheckpoint {
@@ -819,6 +871,10 @@ fn require_body_length(kind: u8, body: &[u8], expected: usize) -> Result<(), Rep
 impl fmt::Debug for ReplayRecord {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Baseline { baseline } => f
+                .debug_struct("Baseline")
+                .field("baseline", baseline)
+                .finish(),
             Self::CommandApplied {
                 tick,
                 player_id,

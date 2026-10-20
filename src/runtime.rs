@@ -191,6 +191,51 @@ impl<S: GameSimulation> MatchRuntime<S> {
         self.draining = false;
     }
 
+    /// Captures an immutable canonical baseline and starts a new replay suffix.
+    /// The simulation must implement `restore_checkpoint` for cold recovery.
+    /// No I/O is performed. Keep the previous durable checkpoint/journal until this
+    /// returned image is safely stored; capture alone is not a durability commit.
+    pub fn checkpoint_replay(&mut self) -> Result<RecoveryImage, RuntimeRecoveryError> {
+        if self.replay.is_none() {
+            return Err(RuntimeRecoveryError::ReplayCaptureDisabled);
+        }
+        let snapshot = self.simulation.snapshot().map_err(RecoveryError::from)?;
+        let sessions = self.sessions.recovery_snapshot(snapshot.tick);
+        let players = sessions
+            .sessions
+            .iter()
+            .map(|session| {
+                let watermarks = self
+                    .last_sequences
+                    .get(&session.player_id)
+                    .copied()
+                    .unwrap_or_default();
+                crate::ReplayPlayerWatermarks {
+                    player_id: session.player_id,
+                    datagram_sequence: watermarks.get(CommandLane::Datagram),
+                    reliable_sequence: watermarks.get(CommandLane::Reliable),
+                }
+            })
+            .collect();
+        let mut replay = ReplayLog::default();
+        replay.append(ReplayRecord::Baseline {
+            baseline: crate::ReplayBaseline {
+                snapshot: snapshot.clone(),
+                highest_player_id: sessions.next_player_id - 1,
+                players,
+            },
+        });
+        let image = RecoveryImage {
+            current_tick: snapshot.tick,
+            reconnect_grace_ticks: self.reconnect_grace_ticks,
+            replay,
+            sessions,
+        };
+        let _ = image.encode()?;
+        self.replay = Some(image.replay.clone());
+        Ok(image)
+    }
+
     pub fn recovery_image(&self) -> Result<RecoveryImage, RuntimeRecoveryError> {
         if !self.frozen {
             return Err(RuntimeRecoveryError::RuntimeNotFrozen);

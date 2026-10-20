@@ -152,6 +152,17 @@ pub trait GameSimulation: Send + 'static {
 
     fn snapshot(&self) -> Result<SimulationSnapshot, SimulationError>;
 
+    /// Opt-in canonical cold restore, called only on a fresh, unserved simulation.
+    /// Validate the game's schema/content and restore the exact supplied state;
+    /// replay verifies the resulting canonical snapshot before applying its suffix.
+    /// External storage I/O remains the caller's responsibility.
+    fn restore_checkpoint(
+        &mut self,
+        _snapshot: &SimulationSnapshot,
+    ) -> Result<(), SimulationError> {
+        Err(SimulationError::new("checkpoint restore is unsupported"))
+    }
+
     fn snapshot_for(&self, _player_id: PlayerId) -> Result<SimulationSnapshot, SimulationError> {
         Err(SimulationError::new(
             "player-scoped snapshots require an explicit per-player projection",
