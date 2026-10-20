@@ -5,11 +5,12 @@ use crate::simulation::{GameSimulation, SimulationError, SimulationSnapshot};
 use std::collections::BTreeMap;
 use std::fmt;
 
-/// Newest replay format: version 3 adds lane-aware command records.
+/// Newest replay format: version 4 adds trusted host input records.
 ///
 /// Encoding picks the oldest version that can carry a log, so datagram-only logs
 /// stay byte-identical to their version 1 (no digests) or version 2 encoding.
-pub const REPLAY_FORMAT_VERSION: u8 = 3;
+pub const REPLAY_FORMAT_VERSION: u8 = 4;
+const LANE_REPLAY_FORMAT_VERSION: u8 = 3;
 const DIGEST_REPLAY_FORMAT_VERSION: u8 = 2;
 const LEGACY_REPLAY_FORMAT_VERSION: u8 = 1;
 const REPLAY_MAGIC: &[u8; 4] = b"GSRP";
@@ -22,6 +23,8 @@ const CHECKPOINT_KIND: u8 = 4;
 const DIGEST_CHECKPOINT_KIND: u8 = 5;
 /// Version 3: a command on a non-datagram lane. Datagram commands keep kind 2.
 const LANE_COMMAND_KIND: u8 = 6;
+const HOST_INPUT_KIND: u8 = 7;
+const HOST_INPUT_FIXED_BODY_BYTES: usize = 4 + 4;
 const RELIABLE_LANE_BYTE: u8 = 1;
 const DIGEST_BODY_BYTES: usize = 32;
 pub(crate) const FULL_CHECKPOINT_PAYLOAD_THRESHOLD: usize =
@@ -46,6 +49,11 @@ pub enum ReplayRecord {
         sequence: u32,
         payload: Vec<u8>,
     },
+    HostInputApplied {
+        tick: u64,
+        player_id: PlayerId,
+        payload: Vec<u8>,
+    },
     PlayerRemoved {
         tick: u64,
         player_id: PlayerId,
@@ -64,6 +72,7 @@ impl ReplayRecord {
         match self {
             Self::PlayerAdmitted { tick, .. }
             | Self::CommandApplied { tick, .. }
+            | Self::HostInputApplied { tick, .. }
             | Self::PlayerRemoved { tick, .. }
             | Self::DigestCheckpoint { tick, .. } => *tick,
             Self::Checkpoint { snapshot } => snapshot.tick,
@@ -94,13 +103,21 @@ impl ReplayLog {
             .records
             .iter()
             .any(|record| matches!(record, ReplayRecord::DigestCheckpoint { .. }));
-        bytes.push(if has_lane_commands {
-            REPLAY_FORMAT_VERSION
-        } else if has_digests {
-            DIGEST_REPLAY_FORMAT_VERSION
-        } else {
-            LEGACY_REPLAY_FORMAT_VERSION
-        });
+        bytes.push(
+            if self
+                .records
+                .iter()
+                .any(|record| matches!(record, ReplayRecord::HostInputApplied { .. }))
+            {
+                REPLAY_FORMAT_VERSION
+            } else if has_lane_commands {
+                LANE_REPLAY_FORMAT_VERSION
+            } else if has_digests {
+                DIGEST_REPLAY_FORMAT_VERSION
+            } else {
+                LEGACY_REPLAY_FORMAT_VERSION
+            },
+        );
         for record in &self.records {
             encode_record(record, &mut bytes)?;
         }
@@ -129,7 +146,8 @@ impl ReplayLog {
             }
             let kind = bytes[offset];
             if (version < DIGEST_REPLAY_FORMAT_VERSION && kind == DIGEST_CHECKPOINT_KIND)
-                || (version < REPLAY_FORMAT_VERSION && kind == LANE_COMMAND_KIND)
+                || (version < LANE_REPLAY_FORMAT_VERSION && kind == LANE_COMMAND_KIND)
+                || (version < REPLAY_FORMAT_VERSION && kind == HOST_INPUT_KIND)
             {
                 return Err(ReplayError::UnknownRecordKind(kind));
             }
@@ -450,6 +468,20 @@ pub(crate) fn replay_into<S: GameSimulation>(
                 simulation.apply_lane_command(*player_id, *lane, *sequence, payload)?;
                 watermarks.set(*lane, *sequence);
             }
+            ReplayRecord::HostInputApplied {
+                player_id, payload, ..
+            } => {
+                if !sequences.contains_key(player_id) {
+                    return Err(ReplayError::UnknownCommandPlayer(*player_id));
+                }
+                if payload.len() > MAX_COMMAND_PAYLOAD_BYTES {
+                    return Err(ReplayError::PayloadTooLarge {
+                        maximum: MAX_COMMAND_PAYLOAD_BYTES,
+                        actual: payload.len(),
+                    });
+                }
+                simulation.apply_host_input(*player_id, payload)?;
+            }
             ReplayRecord::PlayerRemoved { player_id, .. } => {
                 if sequences.remove(player_id).is_none()
                     || !simulation.try_remove_player(*player_id)?
@@ -500,6 +532,16 @@ pub(crate) fn canonical_digest(snapshot: &SimulationSnapshot) -> [u8; 32] {
 
 fn record_body_len(record: &ReplayRecord) -> Result<usize, ReplayError> {
     match record {
+        ReplayRecord::HostInputApplied { payload, .. } => {
+            if payload.len() > MAX_COMMAND_PAYLOAD_BYTES {
+                return Err(ReplayError::PayloadTooLarge {
+                    maximum: MAX_COMMAND_PAYLOAD_BYTES,
+                    actual: payload.len(),
+                });
+            }
+            Ok(HOST_INPUT_FIXED_BODY_BYTES + payload.len())
+        }
+
         ReplayRecord::DigestCheckpoint { .. } => Ok(DIGEST_BODY_BYTES),
         ReplayRecord::PlayerAdmitted { .. } | ReplayRecord::PlayerRemoved { .. } => {
             Ok(PLAYER_BODY_BYTES)
@@ -558,6 +600,7 @@ fn encode_record(record: &ReplayRecord, output: &mut Vec<u8>) -> Result<(), Repl
             lane: CommandLane::Reliable,
             ..
         } => LANE_COMMAND_KIND,
+        ReplayRecord::HostInputApplied { .. } => HOST_INPUT_KIND,
         ReplayRecord::PlayerRemoved { .. } => REMOVAL_KIND,
         ReplayRecord::Checkpoint { .. } => CHECKPOINT_KIND,
         ReplayRecord::DigestCheckpoint { .. } => DIGEST_CHECKPOINT_KIND,
@@ -567,6 +610,13 @@ fn encode_record(record: &ReplayRecord, output: &mut Vec<u8>) -> Result<(), Repl
     output.extend_from_slice(&record.tick().to_be_bytes());
     output.extend_from_slice(&encoded_body_len.to_be_bytes());
     match record {
+        ReplayRecord::HostInputApplied {
+            player_id, payload, ..
+        } => {
+            output.extend_from_slice(&player_id.to_be_bytes());
+            output.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            output.extend_from_slice(payload);
+        }
         ReplayRecord::DigestCheckpoint { digest, .. } => output.extend_from_slice(digest),
         ReplayRecord::PlayerAdmitted { player_id, .. }
         | ReplayRecord::PlayerRemoved { player_id, .. } => {
@@ -682,6 +732,28 @@ fn decode_record(kind: u8, tick: u64, body: &[u8]) -> Result<ReplayRecord, Repla
                 payload: body[fixed..].to_vec(),
             })
         }
+        HOST_INPUT_KIND => {
+            if body.len() < HOST_INPUT_FIXED_BODY_BYTES {
+                return Err(ReplayError::InvalidRecordLength {
+                    kind,
+                    expected: HOST_INPUT_FIXED_BODY_BYTES,
+                    actual: body.len(),
+                });
+            }
+            let payload_len = u32::from_be_bytes(field(body, 4)?) as usize;
+            if payload_len > MAX_COMMAND_PAYLOAD_BYTES {
+                return Err(ReplayError::PayloadTooLarge {
+                    maximum: MAX_COMMAND_PAYLOAD_BYTES,
+                    actual: payload_len,
+                });
+            }
+            require_body_length(kind, body, HOST_INPUT_FIXED_BODY_BYTES + payload_len)?;
+            Ok(ReplayRecord::HostInputApplied {
+                tick,
+                player_id: u32::from_be_bytes(field(body, 0)?),
+                payload: body[HOST_INPUT_FIXED_BODY_BYTES..].to_vec(),
+            })
+        }
         REMOVAL_KIND => {
             require_body_length(kind, body, PLAYER_BODY_BYTES)?;
             Ok(ReplayRecord::PlayerRemoved {
@@ -759,6 +831,16 @@ impl fmt::Debug for ReplayRecord {
                 .field("player_id", player_id)
                 .field("lane", lane)
                 .field("sequence", sequence)
+                .field("payload_bytes", &payload.len())
+                .finish(),
+            Self::HostInputApplied {
+                tick,
+                player_id,
+                payload,
+            } => f
+                .debug_struct("HostInputApplied")
+                .field("tick", tick)
+                .field("player_id", player_id)
                 .field("payload_bytes", &payload.len())
                 .finish(),
             Self::PlayerAdmitted { tick, player_id } => f
@@ -840,7 +922,7 @@ mod tests {
             payload: vec![0xee],
         });
         let encoded = log.encode().unwrap();
-        assert_eq!(encoded[4], REPLAY_FORMAT_VERSION);
+        assert_eq!(encoded[4], LANE_REPLAY_FORMAT_VERSION);
         let command = REPLAY_HEADER_BYTES + RECORD_HEADER_BYTES + PLAYER_BODY_BYTES;
         assert_eq!(encoded[command], LANE_COMMAND_KIND);
         let lane_byte = command + RECORD_HEADER_BYTES + 4;

@@ -735,11 +735,11 @@ fn mixed_lane_history_round_trips_through_replay_encoding_and_verification() {
         ]
     );
 
-    assert_eq!(REPLAY_FORMAT_VERSION, 3);
+    assert_eq!(REPLAY_FORMAT_VERSION, 4);
     let encoded = log.encode().unwrap();
     assert_eq!(&encoded[..4], b"GSRP");
     assert_eq!(
-        encoded[4], REPLAY_FORMAT_VERSION,
+        encoded[4], 3,
         "a log carrying reliable-lane commands uses the lane-aware replay version"
     );
     let decoded = ReplayLog::decode(&encoded).unwrap();

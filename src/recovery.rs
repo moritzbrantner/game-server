@@ -377,6 +377,7 @@ impl RecoveryImage {
                     live_players.remove(player_id);
                 }
                 ReplayRecord::CommandApplied { .. }
+                | ReplayRecord::HostInputApplied { .. }
                 | ReplayRecord::Checkpoint { .. }
                 | ReplayRecord::DigestCheckpoint { .. } => {}
             }
