@@ -370,10 +370,20 @@ impl RecoveryImage {
             });
         }
 
-        if !matches!(
+        let anchored = matches!(
+            self.replay.records().first(),
+            Some(ReplayRecord::Baseline { .. })
+        );
+        let full_checkpoint = matches!(
             self.replay.records().last(),
             Some(ReplayRecord::Checkpoint { .. } | ReplayRecord::Baseline { .. })
-        ) {
+        );
+        let anchored_digest = anchored
+            && matches!(
+                self.replay.records().last(),
+                Some(ReplayRecord::DigestCheckpoint { .. })
+            );
+        if !full_checkpoint && !anchored_digest {
             return Err(RecoveryError::MissingFinalCheckpoint);
         }
 

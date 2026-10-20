@@ -40,6 +40,7 @@ pub enum MatchHostTransportError {
     EmptyHost,
     HostAlreadyStarted,
     HostAlreadyDraining,
+    ConflictingRecoveryPolicies,
     InvalidTickRate(MatchId),
     PlayerCapacityTooLarge { match_id: MatchId, capacity: usize },
 }
@@ -54,6 +55,10 @@ impl fmt::Display for MatchHostTransportError {
                 write!(formatter, "match host transport has already started")
             }
             Self::EmptyHost => write!(formatter, "match host must contain at least one match"),
+            Self::ConflictingRecoveryPolicies => write!(
+                formatter,
+                "durable publication requires application-owned recovery, not a graceful file recovery bundle"
+            ),
             Self::HostAlreadyDraining => {
                 write!(
                     formatter,
@@ -239,6 +244,9 @@ pub(crate) async fn serve_live_host_inner<S: GameSimulation, C: MatchControlServ
     recovery: Option<MatchHostRecoveryPlan>,
     allow_empty: bool,
 ) -> Result<(), MatchHostTransportError> {
+    if host.has_persistence() && recovery.is_some() {
+        return Err(MatchHostTransportError::ConflictingRecoveryPolicies);
+    }
     let entries = host.entries();
     if entries.is_empty() && !allow_empty {
         return Err(MatchHostTransportError::EmptyHost);

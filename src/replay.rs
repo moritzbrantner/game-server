@@ -198,6 +198,57 @@ impl ReplayLog {
         Ok(Self { records })
     }
 
+    /// Appends a committed journal segment without reinterpreting gameplay.
+    /// Checks framing and tick order before mutation. Restore/verify still enforce
+    /// player identities and lane sequences through the shared interpreter.
+    pub fn append_journal(&mut self, suffix: &ReplayLog) -> Result<(), ReplayError> {
+        let mut previous_tick = self.records.last().map(ReplayRecord::tick);
+        for (index, record) in suffix.records.iter().enumerate() {
+            if matches!(record, ReplayRecord::Baseline { .. })
+                && (!self.records.is_empty() || index != 0)
+            {
+                return Err(ReplayError::InvalidBaseline("baseline must be first"));
+            }
+            record_body_len(record)?;
+            if let Some(previous) = previous_tick.filter(|previous| record.tick() < *previous) {
+                return Err(ReplayError::NonMonotonicTick {
+                    previous,
+                    actual: record.tick(),
+                });
+            }
+            previous_tick = Some(record.tick());
+        }
+        self.records.extend(suffix.records.iter().cloned());
+        Ok(())
+    }
+
+    pub(crate) fn suffix(&self, from: usize, maximum: usize) -> Result<(Self, usize), ReplayError> {
+        let records = self
+            .records
+            .get(from..)
+            .ok_or(ReplayError::InvalidBaseline(
+                "journal cursor exceeds replay",
+            ))?;
+        let mut byte_length = REPLAY_HEADER_BYTES;
+        for record in records {
+            byte_length = byte_length
+                .checked_add(RECORD_HEADER_BYTES + record_body_len(record)?)
+                .ok_or(ReplayError::RecordTooLarge(usize::MAX))?;
+            if byte_length > maximum {
+                return Err(ReplayError::PayloadTooLarge {
+                    maximum,
+                    actual: byte_length,
+                });
+            }
+        }
+        Ok((
+            Self {
+                records: records.to_vec(),
+            },
+            byte_length,
+        ))
+    }
+
     pub(crate) fn append(&mut self, record: ReplayRecord) {
         debug_assert!(
             self.records
