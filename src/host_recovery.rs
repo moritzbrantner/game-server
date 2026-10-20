@@ -501,6 +501,22 @@ mod tests {
             bundle.exists(),
             "preparation must not consume before transport binds"
         );
+        assert!(!prepared.host().is_serving());
+        assert_eq!(
+            prepared
+                .host()
+                .inspect(&id, |runtime| runtime.current_tick())
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            prepared
+                .host()
+                .inspect(&MatchId::new("missing").unwrap(), |_| ())
+                .await,
+            Err(crate::LiveHostError::UnknownMatch)
+        );
         let statuses = prepared.host.statuses().await;
         assert_eq!(statuses.len(), 1);
         assert_eq!(statuses[0].id, id);
