@@ -6,7 +6,7 @@ use crate::{
 use std::collections::BTreeMap;
 
 #[derive(Default)]
-struct CounterSimulation {
+pub(crate) struct CounterSimulation {
     tick: u64,
     players: BTreeMap<u32, u64>,
 }
@@ -56,6 +56,19 @@ impl GameSimulation for CounterSimulation {
             payload.extend_from_slice(&value.to_be_bytes());
         }
         Ok(SimulationSnapshot::new(self.tick, payload))
+    }
+    fn snapshot_scope(&self) -> crate::SnapshotScope {
+        crate::SnapshotScope::PlayerScoped
+    }
+    fn snapshot_for(&self, id: u32) -> Result<SimulationSnapshot, SimulationError> {
+        let value = self
+            .players
+            .get(&id)
+            .ok_or_else(|| SimulationError::new("unknown counter player"))?;
+        Ok(SimulationSnapshot::new(
+            self.tick,
+            value.to_be_bytes().to_vec(),
+        ))
     }
     fn restore_checkpoint(&mut self, snapshot: &SimulationSnapshot) -> Result<(), SimulationError> {
         let bytes = &snapshot.payload;

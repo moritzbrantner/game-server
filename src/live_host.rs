@@ -1,7 +1,13 @@
 //! Live hosted lifecycle. Consumers supply runtimes; the host owns capacity and retirement fencing.
-use crate::connection::{SNAPSHOT_CHANNEL_DEPTH, SnapshotPublication, snapshot_publication};
+use crate::connection::{
+    SNAPSHOT_CHANNEL_DEPTH, SnapshotPublication, committed_snapshot_publication,
+    snapshot_publication,
+};
 use crate::runtime::RuntimeError;
-use crate::{GameSimulation, MatchHost, MatchId, MatchRuntime, MatchStatus};
+use crate::{
+    GameSimulation, MatchHost, MatchId, MatchRuntime, MatchStatus, PersistenceError, RecoveryImage,
+    RuntimeRecoveryError, SnapshotCommitBatch, SnapshotPersistence,
+};
 use std::{
     collections::BTreeMap,
     fmt,
@@ -28,6 +34,9 @@ pub enum LiveHostError {
     UnknownMatch,
     InvalidTickRate,
     PlayerCapacityTooLarge,
+    ReplayCaptureDisabled,
+    NotCommitted,
+    Recovery(RuntimeRecoveryError),
     Runtime(RuntimeError),
 }
 impl fmt::Display for LiveHostError {
@@ -71,6 +80,8 @@ pub(crate) struct HostedMatch<S> {
     pub(crate) shutdown: broadcast::Sender<()>,
     retired: AtomicBool,
     tick_task: TaskMutex<Option<JoinHandle<()>>>,
+    initial_replay_len: usize,
+    committed_checkpoint: TaskMutex<Option<RecoveryImage>>,
 }
 impl<S> Drop for HostedMatch<S> {
     fn drop(&mut self) {
@@ -91,6 +102,7 @@ struct Inner<S> {
     serving: AtomicBool,
     claimed: AtomicBool,
     stop: broadcast::Sender<()>,
+    persistence: Option<SnapshotPersistence>,
 }
 /// Clonable management capability for trusted application servers, never a browser credential.
 pub struct LiveMatchHost<S> {
@@ -105,6 +117,26 @@ impl<S> Clone for LiveMatchHost<S> {
 }
 impl<S: GameSimulation> LiveMatchHost<S> {
     pub fn new(host: MatchHost<S>) -> Self {
+        Self::build(host, None)
+    }
+
+    /// Enables durable snapshot publication. Initial runtime state must already
+    /// have a durable recovery basis. The simulation must support canonical restore.
+    pub fn with_persistence(
+        host: MatchHost<S>,
+        persistence: SnapshotPersistence,
+    ) -> Result<Self, LiveHostError> {
+        for status in host.statuses() {
+            if host
+                .runtime(&status.id)
+                .is_none_or(|runtime| runtime.replay_log().is_none())
+            {
+                return Err(LiveHostError::ReplayCaptureDisabled);
+            }
+        }
+        Ok(Self::build(host, Some(persistence)))
+    }
+    fn build(host: MatchHost<S>, persistence: Option<SnapshotPersistence>) -> Self {
         let max_matches = host.max_matches();
         let draining = host.is_draining();
         let matches = host
@@ -121,9 +153,33 @@ impl<S: GameSimulation> LiveMatchHost<S> {
                 serving: AtomicBool::new(false),
                 claimed: AtomicBool::new(false),
                 stop,
+                persistence,
             }),
         }
     }
+    pub(crate) fn has_persistence(&self) -> bool {
+        self.inner.persistence.is_some()
+    }
+
+    /// Captures periodic checkpoint evidence without storage I/O. Durable hosts
+    /// return only their last committed boundary, even while a newer tick awaits I/O.
+    pub async fn checkpoint(&self, id: &MatchId) -> Result<RecoveryImage, LiveHostError> {
+        let hosted = self.get(id).ok_or(LiveHostError::UnknownMatch)?;
+        if self.has_persistence() {
+            return hosted
+                .committed_checkpoint
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .clone()
+                .ok_or(LiveHostError::NotCommitted);
+        }
+        let mut runtime = hosted.runtime.lock().await;
+        if hosted.retired.load(Ordering::Acquire) {
+            return Err(LiveHostError::UnknownMatch);
+        }
+        runtime.checkpoint_replay().map_err(LiveHostError::Recovery)
+    }
+
     pub fn is_serving(&self) -> bool {
         self.inner.serving.load(Ordering::Acquire)
     }
@@ -215,7 +271,8 @@ impl<S: GameSimulation> LiveMatchHost<S> {
             .map_err(LiveHostError::Runtime)
     }
 
-    /// Failed placement returns the original runtime intact. Publication and task start precede return.
+    /// Failed placement returns the original runtime intact. Routing and task start precede return.
+    /// With persistence enabled, the caller must establish the initial durable recovery basis first.
     pub async fn place(
         &self,
         id: MatchId,
@@ -239,6 +296,8 @@ impl<S: GameSimulation> LiveMatchHost<S> {
             Some(LiveHostError::InvalidTickRate)
         } else if runtime.max_players() > usize::from(u16::MAX) {
             Some(LiveHostError::PlayerCapacityTooLarge)
+        } else if self.has_persistence() && runtime.replay_log().is_none() {
+            Some(LiveHostError::ReplayCaptureDisabled)
         } else if runtime.is_draining() || runtime.is_frozen() {
             Some(LiveHostError::Draining)
         } else {
@@ -253,7 +312,13 @@ impl<S: GameSimulation> LiveMatchHost<S> {
         }
         let tick_hz = runtime.tick_hz();
         let hosted = Arc::new(hosted(runtime));
-        start_tick(&id, &hosted, self.inner.stop.subscribe(), tick_hz);
+        start_tick(
+            &id,
+            &hosted,
+            self.inner.stop.subscribe(),
+            tick_hz,
+            self.inner.persistence.clone(),
+        );
         matches.insert(id, hosted);
         Ok(())
     }
@@ -318,7 +383,13 @@ impl<S: GameSimulation> LiveMatchHost<S> {
         let matches = self.entries();
         for (id, hosted) in matches.iter() {
             let tick_hz = hosted.runtime.lock().await.tick_hz();
-            start_tick(id, hosted, self.inner.stop.subscribe(), tick_hz);
+            start_tick(
+                id,
+                hosted,
+                self.inner.stop.subscribe(),
+                tick_hz,
+                self.inner.persistence.clone(),
+            );
         }
         self.inner.serving.store(true, Ordering::Release);
     }
@@ -364,7 +435,8 @@ impl<S: GameSimulation> LiveMatchHost<S> {
         }
     }
 }
-fn hosted<S>(runtime: MatchRuntime<S>) -> HostedMatch<S> {
+fn hosted<S: GameSimulation>(runtime: MatchRuntime<S>) -> HostedMatch<S> {
+    let initial_replay_len = runtime.replay_log().map_or(0, |log| log.records().len());
     let (snapshots, _) = broadcast::channel(SNAPSHOT_CHANNEL_DEPTH);
     let (shutdown, _) = broadcast::channel(1);
     HostedMatch {
@@ -373,17 +445,22 @@ fn hosted<S>(runtime: MatchRuntime<S>) -> HostedMatch<S> {
         shutdown,
         retired: AtomicBool::new(false),
         tick_task: TaskMutex::new(None),
+        initial_replay_len,
+        committed_checkpoint: TaskMutex::new(None),
     }
 }
 fn start_tick<S: GameSimulation>(
     id: &MatchId,
-    hosted: &HostedMatch<S>,
+    hosted: &Arc<HostedMatch<S>>,
     mut stop: broadcast::Receiver<()>,
     tick_hz: u16,
+    persistence: Option<SnapshotPersistence>,
 ) {
     let runtime = Arc::clone(&hosted.runtime);
     let snapshots = hosted.snapshots.clone();
     let id = id.clone();
+    let owner = Arc::downgrade(hosted);
+    let mut cursor = hosted.initial_replay_len;
     let task = tokio::spawn(async move {
         let mut ticker =
             tokio::time::interval(Duration::from_micros(1_000_000 / u64::from(tick_hz)));
@@ -393,6 +470,46 @@ fn start_tick<S: GameSimulation>(
                 _ = stop.recv() => return,
                 _ = ticker.tick() => {
                     let mut runtime = runtime.lock().await;
+                    if let Some(persistence) = &persistence {
+                        if runtime.is_frozen() { continue; }
+                        let committed = async {
+                            let snapshot = runtime.advance_tick().map_err(|error| PersistenceError::new(error.to_string()))?;
+                            let checkpoint = runtime.checkpoint_image(snapshot.clone()).map_err(|error| PersistenceError::new(error.to_string()))?;
+                            let (journal, journal_bytes) = runtime.replay_suffix(cursor, persistence.max_batch_bytes).map_err(|error| PersistenceError::new(error.to_string()))?;
+                            let checkpoint_bytes = checkpoint.encode().map_err(|error| PersistenceError::new(error.to_string()))?.len();
+                            let remaining = persistence.max_batch_bytes.checked_sub(journal_bytes).and_then(|left| left.checked_sub(checkpoint_bytes))
+                                .ok_or_else(|| PersistenceError::new("persistence batch exceeds configured byte limit"))?;
+                            let publication = committed_snapshot_publication(&runtime, snapshot.clone(), checkpoint.sessions.sessions.iter().map(|session| session.player_id), remaining)
+                                .map_err(PersistenceError::new)?;
+                            let batch = SnapshotCommitBatch { match_id: id.clone(), snapshot, journal, checkpoint };
+                            // Serial backpressure: synchronous simulation has returned.
+                            // Keep mutation fenced while cancellation-aware storage runs.
+                            let was_draining = runtime.is_draining();
+                            // Pessimistically fence before await: cancellation or a
+                            // callback panic cannot leave an unfenced, uncommitted writer.
+                            runtime.fail_persistence();
+                            persistence.commit(&batch).await?;
+                            runtime.finish_persistence(was_draining);
+                            runtime.install_checkpoint(&batch.checkpoint);
+                            cursor = batch.checkpoint.replay.records().len();
+                            let hosted = owner.upgrade().ok_or_else(|| PersistenceError::new("host was dropped during commit"))?;
+                            *hosted.committed_checkpoint.lock().unwrap_or_else(|poison| poison.into_inner()) = Some(batch.checkpoint);
+                            Ok::<_, PersistenceError>((hosted.retired.load(Ordering::Acquire), publication))
+                        }.await;
+                        match committed {
+                            Ok((false, publication)) => { let _ = snapshots.send(publication); },
+                            Ok((true, _)) => return,
+                            Err(error) => {
+                                runtime.fail_persistence();
+                                if let Some(hosted) = owner.upgrade() {
+                                    let _ = hosted.shutdown.send(());
+                                }
+                                eprintln!("persistence_commit_failed match={id} tick={} error={error}", runtime.current_tick());
+                                return;
+                            }
+                        }
+                        continue;
+                    }
                     let scope = runtime.snapshot_scope();
                     match runtime.advance_tick() {
                         Ok(snapshot) => match snapshot_publication(scope, snapshot) {

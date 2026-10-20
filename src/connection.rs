@@ -14,6 +14,7 @@ use crate::session::{ReconnectToken, SessionLease};
 use crate::simulation::{GameSimulation, SimulationSnapshot, SnapshotScope};
 use ring::rand::{SecureRandom, SystemRandom};
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -50,6 +51,7 @@ pub(crate) enum AdmissionRequest {
 pub(crate) enum SnapshotPublication {
     Shared(Arc<[u8]>),
     PlayerScoped,
+    CommittedPlayers(BTreeMap<crate::PlayerId, Arc<[u8]>>),
 }
 
 pub(crate) fn snapshot_publication(
@@ -61,6 +63,33 @@ pub(crate) fn snapshot_publication(
             .map(|bytes| SnapshotPublication::Shared(bytes.into())),
         SnapshotScope::PlayerScoped => Ok(SnapshotPublication::PlayerScoped),
     }
+}
+
+pub(crate) fn committed_snapshot_publication<S: GameSimulation>(
+    runtime: &MatchRuntime<S>,
+    snapshot: SimulationSnapshot,
+    players: impl Iterator<Item = crate::PlayerId>,
+    mut remaining_bytes: usize,
+) -> Result<SnapshotPublication, String> {
+    if runtime.snapshot_scope() == SnapshotScope::Shared {
+        let frame = encode_simulation_snapshot(snapshot)?;
+        if frame.len() > remaining_bytes {
+            return Err("committed publication exceeds configured byte limit".to_owned());
+        }
+        return Ok(SnapshotPublication::Shared(frame.into()));
+    }
+    let mut frames = BTreeMap::new();
+    for player in players {
+        let projection = runtime
+            .snapshot_for(player)
+            .map_err(|error| error.to_string())?;
+        let frame = encode_simulation_snapshot(projection)?;
+        remaining_bytes = remaining_bytes
+            .checked_sub(frame.len())
+            .ok_or("committed publication exceeds configured byte limit")?;
+        frames.insert(player, frame.into());
+    }
+    Ok(SnapshotPublication::CommittedPlayers(frames))
 }
 
 fn encode_simulation_snapshot(snapshot: SimulationSnapshot) -> Result<Vec<u8>, String> {
@@ -410,6 +439,15 @@ async fn run_established_connection<S: GameSimulation>(
                 match snapshot {
                     Ok(publication) => {
                         let runtime = state.runtime.lock().await;
+                        if let SnapshotPublication::CommittedPlayers(frames) = &publication
+                            && !frames.contains_key(&lease.player_id)
+                        {
+                            if let Err(error) = runtime.validate_connection(lease.player_id, lease.connection_epoch) {
+                                close(connection, CLOSE_RUNTIME, &error.to_string());
+                                return Ok(());
+                            }
+                            continue;
+                        }
                         let snapshot = match snapshot_for_connection(&runtime, lease, &publication) {
                             Ok(snapshot) => snapshot,
                             Err(error) => {
@@ -711,6 +749,10 @@ fn snapshot_for_connection<'a, S: GameSimulation>(
         .map_err(|error| error.to_string())?;
     match publication {
         SnapshotPublication::Shared(snapshot) => Ok(Cow::Borrowed(snapshot)),
+        SnapshotPublication::CommittedPlayers(frames) => frames
+            .get(&lease.player_id)
+            .map(|bytes| Cow::Borrowed(bytes.as_ref()))
+            .ok_or_else(|| "player was admitted after the committed publication".to_owned()),
         SnapshotPublication::PlayerScoped => encode_simulation_snapshot(
             runtime
                 .snapshot_for(lease.player_id)
@@ -2102,5 +2144,43 @@ mod tests {
         let decoded = crate::decode_snapshot(&second).unwrap();
         assert_eq!(decoded.tick, 7);
         assert_eq!(decoded.payload, payload);
+    }
+}
+
+#[cfg(test)]
+mod committed_publication_tests {
+    use super::*;
+    #[test]
+    fn committed_private_frame_does_not_project_later_uncommitted_mutations() {
+        let mut runtime = MatchRuntime::new_with_replay_capture(
+            crate::checkpoint_tests::CounterSimulation::default(),
+            30,
+        );
+        let lease = runtime.admit(ReconnectToken([1; 16])).unwrap();
+        let snapshot = runtime.advance_tick().unwrap();
+        let publication = committed_snapshot_publication(
+            &runtime,
+            snapshot,
+            [lease.player_id].into_iter(),
+            10000,
+        )
+        .unwrap();
+        let committed = snapshot_for_connection(&runtime, lease, &publication)
+            .unwrap()
+            .into_owned();
+        runtime.submit_host_input(lease.player_id, &[9]).unwrap();
+        assert_eq!(
+            snapshot_for_connection(&runtime, lease, &publication).unwrap(),
+            committed
+        );
+        runtime.disconnect(lease.player_id, lease.connection_epoch);
+        let resumed = runtime
+            .reconnect(lease.reconnect_token, ReconnectToken([2; 16]))
+            .unwrap();
+        assert!(snapshot_for_connection(&runtime, lease, &publication).is_err());
+        assert_eq!(
+            snapshot_for_connection(&runtime, resumed, &publication).unwrap(),
+            committed
+        );
     }
 }

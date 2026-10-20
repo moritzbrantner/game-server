@@ -59,6 +59,7 @@ impl From<SimulationError> for RuntimeError {
 pub enum RuntimeRecoveryError {
     ReplayCaptureDisabled,
     RuntimeNotFrozen,
+    PersistenceFailed,
     Recovery(RecoveryError),
 }
 
@@ -67,6 +68,9 @@ impl fmt::Display for RuntimeRecoveryError {
         match self {
             Self::ReplayCaptureDisabled => {
                 write!(formatter, "runtime recovery requires replay capture")
+            }
+            Self::PersistenceFailed => {
+                write!(formatter, "runtime has an unresolved persistence failure")
             }
             Self::RuntimeNotFrozen => write!(formatter, "runtime must be frozen before recovery"),
             Self::Recovery(error) => write!(formatter, "recovery error: {error}"),
@@ -91,6 +95,7 @@ pub struct MatchRuntime<S> {
     reconnect_grace_ticks: u64,
     draining: bool,
     frozen: bool,
+    persistence_unresolved: bool,
 }
 
 impl<S: GameSimulation> MatchRuntime<S> {
@@ -125,6 +130,7 @@ impl<S: GameSimulation> MatchRuntime<S> {
             reconnect_grace_ticks: image.reconnect_grace_ticks,
             draining: false,
             frozen: false,
+            persistence_unresolved: false,
         })
     }
 
@@ -138,6 +144,7 @@ impl<S: GameSimulation> MatchRuntime<S> {
             reconnect_grace_ticks,
             draining: false,
             frozen: false,
+            persistence_unresolved: false,
         }
     }
 
@@ -187,6 +194,9 @@ impl<S: GameSimulation> MatchRuntime<S> {
     }
 
     pub fn resume_after_failed_recovery(&mut self) {
+        if self.persistence_unresolved {
+            return;
+        }
         self.frozen = false;
         self.draining = false;
     }
@@ -196,10 +206,22 @@ impl<S: GameSimulation> MatchRuntime<S> {
     /// No I/O is performed. Keep the previous durable checkpoint/journal until this
     /// returned image is safely stored; capture alone is not a durability commit.
     pub fn checkpoint_replay(&mut self) -> Result<RecoveryImage, RuntimeRecoveryError> {
+        let snapshot = self.simulation.snapshot().map_err(RecoveryError::from)?;
+        let image = self.checkpoint_image(snapshot)?;
+        self.install_checkpoint(&image);
+        Ok(image)
+    }
+
+    pub(crate) fn checkpoint_image(
+        &self,
+        snapshot: SimulationSnapshot,
+    ) -> Result<RecoveryImage, RuntimeRecoveryError> {
+        if self.persistence_unresolved {
+            return Err(RuntimeRecoveryError::PersistenceFailed);
+        }
         if self.replay.is_none() {
             return Err(RuntimeRecoveryError::ReplayCaptureDisabled);
         }
-        let snapshot = self.simulation.snapshot().map_err(RecoveryError::from)?;
         let sessions = self.sessions.recovery_snapshot(snapshot.tick);
         let players = sessions
             .sessions
@@ -232,11 +254,39 @@ impl<S: GameSimulation> MatchRuntime<S> {
             sessions,
         };
         let _ = image.encode()?;
-        self.replay = Some(image.replay.clone());
         Ok(image)
     }
 
+    pub(crate) fn install_checkpoint(&mut self, image: &RecoveryImage) {
+        self.replay = Some(image.replay.clone());
+    }
+    pub(crate) fn fail_persistence(&mut self) {
+        self.persistence_unresolved = true;
+        self.freeze_for_recovery();
+    }
+    pub(crate) fn finish_persistence(&mut self, was_draining: bool) {
+        self.persistence_unresolved = false;
+        self.frozen = false;
+        self.draining = was_draining;
+    }
+
+    pub(crate) fn replay_suffix(
+        &self,
+        from: usize,
+        maximum: usize,
+    ) -> Result<(ReplayLog, usize), RuntimeRecoveryError> {
+        self.replay
+            .as_ref()
+            .ok_or(RuntimeRecoveryError::ReplayCaptureDisabled)?
+            .suffix(from, maximum)
+            .map_err(RecoveryError::from)
+            .map_err(RuntimeRecoveryError::from)
+    }
+
     pub fn recovery_image(&self) -> Result<RecoveryImage, RuntimeRecoveryError> {
+        if self.persistence_unresolved {
+            return Err(RuntimeRecoveryError::PersistenceFailed);
+        }
         if !self.frozen {
             return Err(RuntimeRecoveryError::RuntimeNotFrozen);
         }

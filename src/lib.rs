@@ -7,9 +7,14 @@ pub mod host_recovery;
 pub mod host_status;
 pub mod host_transport;
 pub mod live_host;
+pub mod persistence;
 #[cfg(feature = "physics")]
 pub mod physics;
 pub mod protocol;
+pub use persistence::{
+    PersistenceError, SnapshotCommitBatch, SnapshotCommitFuture, SnapshotCommitter,
+    SnapshotPersistence,
+};
 pub mod reassembly;
 pub mod recovery;
 pub mod replay;
@@ -128,3 +133,6 @@ mod host_input_tests;
 
 #[cfg(test)]
 mod checkpoint_tests;
+
+#[cfg(test)]
+mod persistence_tests;
