@@ -169,9 +169,10 @@ impl<S: GameSimulation> LiveMatchHost<S> {
         }
         statuses
     }
-    /// Read-only trusted query, also available before serving and after shutdown.
-    /// Consumers can capture restored/final metadata, then perform storage I/O
-    /// outside the runtime lock. Never retain private projections publicly.
+    /// Read-only trusted query, also available before serving starts.
+    /// Consumers can capture restored metadata, then perform storage I/O outside
+    /// the runtime lock. Removed/closed matches still fail as unknown. Never
+    /// retain private projections publicly.
     pub async fn inspect<R>(
         &self,
         id: &MatchId,
