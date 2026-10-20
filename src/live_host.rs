@@ -28,6 +28,7 @@ pub enum LiveHostError {
     UnknownMatch,
     InvalidTickRate,
     PlayerCapacityTooLarge,
+    Runtime(RuntimeError),
 }
 impl fmt::Display for LiveHostError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -184,6 +185,36 @@ impl<S: GameSimulation> LiveMatchHost<S> {
         }
         Ok(query(&runtime))
     }
+    /// Submits trusted server data for the current connection after external I/O.
+    /// Rechecks the epoch under the runtime lock; stale control handlers cannot
+    /// mutate a replacement connection or a retired match.
+    pub async fn submit_host_input(
+        &self,
+        id: &MatchId,
+        player_id: crate::PlayerId,
+        connection_epoch: u32,
+        payload: &[u8],
+    ) -> Result<(), LiveHostError> {
+        let gate = self.inner.gate.read().await;
+        if !self.is_serving() {
+            return Err(LiveHostError::NotServing);
+        }
+        if *gate {
+            return Err(LiveHostError::Draining);
+        }
+        let hosted = self.get(id).ok_or(LiveHostError::UnknownMatch)?;
+        let mut runtime = hosted.runtime.lock().await;
+        if hosted.retired.load(Ordering::Acquire) {
+            return Err(LiveHostError::UnknownMatch);
+        }
+        runtime
+            .validate_connection(player_id, connection_epoch)
+            .map_err(LiveHostError::Runtime)?;
+        runtime
+            .submit_host_input(player_id, payload)
+            .map_err(LiveHostError::Runtime)
+    }
+
     /// Failed placement returns the original runtime intact. Publication and task start precede return.
     pub async fn place(
         &self,

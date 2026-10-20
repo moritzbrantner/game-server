@@ -133,6 +133,17 @@ pub trait GameSimulation: Send + 'static {
         self.apply_command(player_id, sequence, payload)
     }
 
+    /// Applies trusted, replayable server data without consuming a client sequence.
+    /// Must be deterministic and leave state unchanged on rejection, like commands.
+    /// External I/O belongs before submission, never in this callback.
+    fn apply_host_input(
+        &mut self,
+        _player_id: PlayerId,
+        _payload: &[u8],
+    ) -> Result<(), SimulationError> {
+        Err(SimulationError::new("host inputs are unsupported"))
+    }
+
     fn advance_tick(&mut self) -> Result<(), SimulationError>;
 
     fn snapshot_scope(&self) -> SnapshotScope {

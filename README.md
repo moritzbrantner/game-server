@@ -124,6 +124,26 @@ A FIN at a frame boundary only ends the lane. A command that reaches a frozen ru
 
 See [the reliable command lane decision](docs/adr/0008-reliable-command-lane.md).
 
+## Trusted host inputs
+
+`MatchRuntime::submit_host_input(player_id, payload)` applies trusted server data
+through `GameSimulation::apply_host_input` in order with accepted commands, before
+the next tick. The callback rejects by default, must be deterministic, and must
+leave state unchanged on error. Perform storage I/O before submitting; replay and
+recovery use the captured bytes without reading external storage again. Payloads
+use `MAX_COMMAND_PAYLOAD_BYTES`; host inputs do not consume client sequences.
+
+While serving, trusted application code uses
+`LiveMatchHost::submit_host_input(match_id, player_id, connection_epoch, payload)`.
+It rechecks connection ownership under the runtime lock and rejects drained,
+frozen, retired or missing matches/players. No client wire route exposes this API.
+Games still own validation, admission policy, durable leases and idempotency IDs.
+
+Logs containing host inputs encode as replay version 4 (record kind 7); existing
+logs retain their version 1–3 encoding. Older readers reject version 4. Recovery
+images retain their outer format and embed the versioned replay log. Host input
+payloads are private recovery data and omitted from debug output.
+
 ## Multi-match host
 
 `MatchHost` owns a bounded set of homogeneous `MatchRuntime` instances inside one process. Match IDs are URL-safe ASCII identifiers capped at 64 bytes, iteration is deterministic, and placement fails closed on duplicate IDs, process drain, or configured match capacity. Failed placement returns a `PlacementFailure` containing the original ID and runtime intact, so authoritative state is never discarded merely because placement must be retried elsewhere. Existing per-match player capacity remains owned by each simulation/runtime rather than being duplicated in the host.

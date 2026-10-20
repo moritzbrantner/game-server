@@ -120,3 +120,6 @@ mod command_lane_acceptance;
 
 #[cfg(test)]
 mod welcome_handshake_acceptance;
+
+#[cfg(test)]
+mod host_input_tests;

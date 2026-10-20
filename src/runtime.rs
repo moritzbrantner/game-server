@@ -311,6 +311,39 @@ impl<S: GameSimulation> MatchRuntime<S> {
         }
     }
 
+    /// Applies trusted server data in order with commands, before the next tick.
+    /// No client wire route calls this API. Rejected inputs are not recorded.
+    pub fn submit_host_input(
+        &mut self,
+        player_id: PlayerId,
+        payload: &[u8],
+    ) -> Result<(), RuntimeError> {
+        if self.frozen {
+            return Err(RuntimeError::Frozen);
+        }
+        if self.draining {
+            return Err(RuntimeError::Draining);
+        }
+        if !self.last_sequences.contains_key(&player_id) {
+            return Err(RuntimeError::StaleConnection);
+        }
+        if payload.len() > MAX_COMMAND_PAYLOAD_BYTES {
+            return Err(RuntimeError::CommandPayloadTooLarge {
+                maximum: MAX_COMMAND_PAYLOAD_BYTES,
+                actual: payload.len(),
+            });
+        }
+        self.simulation.apply_host_input(player_id, payload)?;
+        if let Some(replay) = &mut self.replay {
+            replay.append(ReplayRecord::HostInputApplied {
+                tick: self.simulation.current_tick(),
+                player_id,
+                payload: payload.to_vec(),
+            });
+        }
+        Ok(())
+    }
+
     /// Submits a command on the datagram lane.
     pub fn submit_command(
         &mut self,
