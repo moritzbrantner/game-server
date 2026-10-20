@@ -35,22 +35,6 @@ impl<S: GameSimulation> PreparedLiveMatchHost<S> {
     pub fn host(&self) -> LiveMatchHost<S> {
         self.host.clone()
     }
-
-    /// Read-only startup inspection before the prepared host is consumed by serving.
-    /// Consumers can capture restored identity metadata here, then acquire external
-    /// leases outside the runtime lock before starting any authoritative ticks.
-    pub async fn inspect<R>(
-        &self,
-        id: &MatchId,
-        query: impl FnOnce(&MatchRuntime<S>) -> R,
-    ) -> Result<R, crate::LiveHostError> {
-        let hosted = self
-            .host
-            .get(id)
-            .ok_or(crate::LiveHostError::UnknownMatch)?;
-        let runtime = hosted.runtime.lock().await;
-        Ok(query(&runtime))
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -520,6 +504,7 @@ mod tests {
         assert!(!prepared.host().is_serving());
         assert_eq!(
             prepared
+                .host()
                 .inspect(&id, |runtime| runtime.current_tick())
                 .await
                 .unwrap(),
@@ -527,6 +512,7 @@ mod tests {
         );
         assert_eq!(
             prepared
+                .host()
                 .inspect(&MatchId::new("missing").unwrap(), |_| ())
                 .await,
             Err(crate::LiveHostError::UnknownMatch)

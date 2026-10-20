@@ -169,15 +169,14 @@ impl<S: GameSimulation> LiveMatchHost<S> {
         }
         statuses
     }
-    /// Read-only trusted query; do not perform blocking IO in the callback or retain private projections publicly.
+    /// Read-only trusted query, also available before serving and after shutdown.
+    /// Consumers can capture restored/final metadata, then perform storage I/O
+    /// outside the runtime lock. Never retain private projections publicly.
     pub async fn inspect<R>(
         &self,
         id: &MatchId,
         query: impl FnOnce(&MatchRuntime<S>) -> R,
     ) -> Result<R, LiveHostError> {
-        if !self.inner.serving.load(Ordering::Acquire) {
-            return Err(LiveHostError::NotServing);
-        }
         let hosted = self.get(id).ok_or(LiveHostError::UnknownMatch)?;
         let runtime = hosted.runtime.lock().await;
         if hosted.retired.load(Ordering::Acquire) {
