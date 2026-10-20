@@ -171,6 +171,14 @@ GET /matches/<match-id>/status
 
 Health is process liveness and remains `200` during an intentional drain. Readiness means the hosted process or addressed runtime is available to serve gameplay rather than whether another match can be placed; a host already at its configured match count can therefore still be ready. Process and match readiness return `503` once draining begins, while `/status` reports the drain flag and current host membership and match capacity facts. Unknown match routes and mutating methods fail closed. The status surface deliberately does not duplicate game rules, transport admission, or mutable gameplay counters.
 
+## Durable hosted publication
+
+For application-owned durable storage, opt into `LiveMatchHost::with_persistence(host, SnapshotPersistence::new(service, timeout, max_batch_bytes)?)`. `SnapshotCommitter` receives an immutable tick snapshot, new replay journal records and a canonical recovery checkpoint. Its cancellable async future returns success only after the required commit. Replay capture and canonical checkpoint restore must be enabled, and the application's initial recovery basis must already be durable.
+
+The scheduler pauses that match's mutation while storage commits, then publishes the captured frames. Player-scoped connections never reproject newer uncommitted state. Deadline, commit failure or an exceeded configured byte limit freezes the writer and closes its connections; recovery retry cannot unfreeze it. Other matches keep their independent ticks. Call `LiveMatchHost::checkpoint` to obtain the latest committed image for a periodic object upload; it remains available while a newer tick is waiting on storage. Append committed journal segments through `ReplayLog::append_journal` when reconstructing recovery evidence.
+
+This service supplies ordering/publication, not a database, zone lease or economy implementation. The existing reliable command `Accepted` ACK is in-memory acceptance; economically durable outcomes appear in committed snapshots. Control handlers returning economic results must commit before replying. Durable hosts use application-owned recovery and cannot also enable generic graceful file-recovery bundles. See [durable publication](docs/adr/0012-durable-hosted-publication.md).
+
 ## Graceful recovery
 
 Set `GAME_SERVER_RECOVERY_PATH` to enable replay-backed graceful restart recovery for the single-match transport. On SIGTERM or Ctrl-C the runtime drains, freezes authoritative mutation, writes a bounded recovery image atomically, and then closes established sessions. On the next successful endpoint startup the image is verified, authoritative state and command watermarks are reconstructed, and saved sessions become disconnected/reconnectable before the consumed image is removed.
