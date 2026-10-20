@@ -215,3 +215,9 @@ See `ROADMAP.md` for the extraction plan and ownership boundaries.
 ## Performance evidence
 
 The opt-in [benchmark suite](benchmarks/README.md) measures live commands, ticks, shared snapshot fan-out, replay encoding/verification, and recovery. Versioned before/after receipts retain raw samples and source/environment fingerprints. Ordinary tests remain independent of timing thresholds.
+
+### Empty-match suspension and cold admission
+
+Hosts may opt into `LiveMatchHost::suspend_empty(match_id, confirmation_timeout, confirm)` to unload an empty runtime after its immutable recovery image is confirmed recoverable. Active and reconnectable sessions prevent suspension. Confirmation runs outside the runtime lock; failure retains a frozen resident match for retry, and canceling the caller does not discard an unverified runtime. Consumers own durable storage, empty grace policy and default-frozen game time.
+
+Before sharing/serving the host, `with_cold_admission(Arc<dyn ColdMatchResolver<S>>, timeout)` enables restoration of known missing matches on the existing validated WebTransport route. Concurrent cold requests serialize and recheck residence; resident matches bypass the hook. Errors and deadlines refuse admission, without creating fresh fallback state. See [the suspension decision](docs/adr/0013-empty-match-suspension.md) for ownership and recovery requirements. These hooks do not implement a game-specific offline progression policy or storage backend.

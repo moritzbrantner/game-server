@@ -1,4 +1,7 @@
 //! Live hosted lifecycle. Consumers supply runtimes; the host owns capacity and retirement fencing.
+mod suspension;
+pub use suspension::ColdMatchResolver;
+
 use crate::connection::{
     SNAPSHOT_CHANNEL_DEPTH, SnapshotPublication, committed_snapshot_publication,
     snapshot_publication,
@@ -36,6 +39,9 @@ pub enum LiveHostError {
     PlayerCapacityTooLarge,
     ReplayCaptureDisabled,
     NotCommitted,
+    MatchOccupied,
+    InvalidLifecycleTimeout,
+    Suspension(PersistenceError),
     Recovery(RuntimeRecoveryError),
     Runtime(RuntimeError),
 }
@@ -80,6 +86,8 @@ pub(crate) struct HostedMatch<S> {
     pub(crate) shutdown: broadcast::Sender<()>,
     retired: AtomicBool,
     tick_task: TaskMutex<Option<JoinHandle<()>>>,
+    lifecycle: Mutex<()>,
+    pending_suspension: TaskMutex<Option<RecoveryImage>>,
     initial_replay_len: usize,
     committed_checkpoint: TaskMutex<Option<RecoveryImage>>,
 }
@@ -103,6 +111,7 @@ struct Inner<S> {
     claimed: AtomicBool,
     stop: broadcast::Sender<()>,
     persistence: Option<SnapshotPersistence>,
+    cold_admission: Option<suspension::ColdAdmission<S>>,
 }
 /// Clonable management capability for trusted application servers, never a browser credential.
 pub struct LiveMatchHost<S> {
@@ -154,6 +163,7 @@ impl<S: GameSimulation> LiveMatchHost<S> {
                 claimed: AtomicBool::new(false),
                 stop,
                 persistence,
+                cold_admission: None,
             }),
         }
     }
@@ -339,21 +349,16 @@ impl<S: GameSimulation> LiveMatchHost<S> {
         if !self.inner.serving.load(Ordering::Acquire) {
             return Err(LiveHostError::NotServing);
         }
-        let hosted = {
-            let matches = self
-                .inner
-                .matches
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner());
-            let hosted = matches
-                .get(id)
-                .cloned()
-                .ok_or(LiveHostError::UnknownMatch)?;
-            if hosted.retired.swap(true, Ordering::AcqRel) {
-                return Err(LiveHostError::UnknownMatch);
-            }
-            hosted
-        };
+        let hosted = self.get(id).ok_or(LiveHostError::UnknownMatch)?;
+        let _lifecycle = hosted.lifecycle.lock().await;
+        if hosted.retired.swap(true, Ordering::AcqRel) {
+            return Err(LiveHostError::UnknownMatch);
+        }
+        self.remove_hosted(id, &hosted).await;
+        Ok(())
+    }
+    async fn remove_hosted(&self, id: &MatchId, hosted: &Arc<HostedMatch<S>>) {
+        hosted.retired.store(true, Ordering::Release);
         hosted.runtime.lock().await.freeze_for_recovery();
         let _ = hosted.shutdown.send(());
         let task = hosted
@@ -370,7 +375,6 @@ impl<S: GameSimulation> LiveMatchHost<S> {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .remove(id);
-        Ok(())
     }
     pub(crate) fn claim(&self) -> Result<(), LiveHostError> {
         self.inner
@@ -445,6 +449,8 @@ fn hosted<S: GameSimulation>(runtime: MatchRuntime<S>) -> HostedMatch<S> {
         shutdown,
         retired: AtomicBool::new(false),
         tick_task: TaskMutex::new(None),
+        lifecycle: Mutex::new(()),
+        pending_suspension: TaskMutex::new(None),
         initial_replay_len,
         committed_checkpoint: TaskMutex::new(None),
     }

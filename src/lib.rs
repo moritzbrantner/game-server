@@ -117,7 +117,7 @@ pub use world::{
 #[cfg(test)]
 mod benchmarks;
 
-pub use live_host::{LiveHostError, LiveMatchHost, LivePlacementFailure};
+pub use live_host::{ColdMatchResolver, LiveHostError, LiveMatchHost, LivePlacementFailure};
 
 #[cfg(test)]
 mod test_support;

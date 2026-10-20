@@ -347,7 +347,7 @@ pub(crate) async fn serve_live_host_inner<S: GameSimulation, C: MatchControlServ
                 return;
             }
             let route = match route_prefix.parse(request.path()) {
-                Ok(Some(route)) if state.host.get(&route.match_id).is_some() => route,
+                Ok(Some(route)) if state.host.resolve_match(&route.match_id).await => route,
                 Ok(Some(_)) | Ok(None) | Err(_) => {
                     let _ = request.not_found().await;
                     return;
@@ -632,6 +632,133 @@ mod tests {
         .await
         .unwrap();
     }
+    #[tokio::test]
+    async fn cold_hosted_routes_restore_one_runtime_before_real_session_admission() {
+        use crate::checkpoint_tests::CounterSimulation;
+        use crate::test_support::TestDirectory;
+        use crate::{
+            ColdMatchResolver, PersistenceError, SnapshotCommitFuture, WELCOME_BYTES,
+            decode_welcome,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use wtransport::ClientConfig;
+        struct Resolver {
+            image: RecoveryImage,
+            calls: AtomicUsize,
+        }
+        impl ColdMatchResolver<CounterSimulation> for Resolver {
+            fn resolve<'a>(
+                &'a self,
+                host: &'a LiveMatchHost<CounterSimulation>,
+                id: &'a MatchId,
+            ) -> SnapshotCommitFuture<'a> {
+                Box::pin(async move {
+                    if id.as_str() != "alpha" {
+                        return Err(PersistenceError::new("unknown match"));
+                    }
+                    self.calls.fetch_add(1, Ordering::SeqCst);
+                    let runtime = MatchRuntime::restore_from_recovery(
+                        CounterSimulation::default(),
+                        self.image.clone(),
+                    )
+                    .map_err(|cause| PersistenceError::new(cause.to_string()))?;
+                    host.place(id.clone(), runtime)
+                        .await
+                        .map_err(|cause| PersistenceError::new(cause.to_string()))
+                })
+            }
+        }
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let directory = TestDirectory::new();
+            let identity = Identity::self_signed(["localhost", "127.0.0.1"]).unwrap();
+            let hash = identity.certificate_chain().as_slice()[0].hash();
+            let certificate = directory.path().join("cert.pem");
+            let key = directory.path().join("key.pem");
+            identity
+                .certificate_chain()
+                .store_pemfile(&certificate)
+                .await
+                .unwrap();
+            identity
+                .private_key()
+                .store_secret_pemfile(&key)
+                .await
+                .unwrap();
+            let reservation = std::net::UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+            let port = reservation.local_addr().unwrap().port();
+            drop(reservation);
+            let mut runtime =
+                MatchRuntime::new_with_replay_capture(CounterSimulation::default(), 1000);
+            for _ in 0..17 {
+                runtime.advance_tick().unwrap();
+            }
+            let service = Arc::new(Resolver {
+                image: runtime.checkpoint_replay().unwrap(),
+                calls: AtomicUsize::new(0),
+            });
+            let host = LiveMatchHost::new(MatchHost::new(1).unwrap())
+                .with_cold_admission(service.clone(), Duration::from_secs(2))
+                .unwrap();
+            let (shutdown, receiver) = mpsc::channel(1);
+            let (ready, started) = oneshot::channel();
+            let mut tasks = JoinSet::new();
+            tasks.spawn(serve_live_host_inner(
+                host.clone(),
+                RejectMatchControlService,
+                MatchHostWebTransportConfig {
+                    port,
+                    certificate_pem: certificate,
+                    private_key_pem: key,
+                    route_prefix: BrowserRoutePrefix::new("/game").unwrap(),
+                    drain_grace: Duration::ZERO,
+                    allowed_origins: None,
+                },
+                receiver,
+                Some(ready),
+                None,
+                true,
+            ));
+            started.await.unwrap();
+            let client = Endpoint::client(
+                ClientConfig::builder()
+                    .with_bind_default()
+                    .with_server_certificate_hashes([hash])
+                    .build(),
+            )
+            .unwrap();
+            let url = format!("https://127.0.0.1:{port}/game/matches/alpha");
+            let (first, second) = tokio::join!(client.connect(url.clone()), client.connect(url));
+            let first = first.unwrap();
+            let second = second.unwrap();
+            let mut a = [0; WELCOME_BYTES];
+            first
+                .accept_uni()
+                .await
+                .unwrap()
+                .read_exact(&mut a)
+                .await
+                .unwrap();
+            let mut b = [0; WELCOME_BYTES];
+            second
+                .accept_uni()
+                .await
+                .unwrap()
+                .read_exact(&mut b)
+                .await
+                .unwrap();
+            assert_ne!(
+                decode_welcome(&a).unwrap().player_id,
+                decode_welcome(&b).unwrap().player_id
+            );
+            assert_eq!(service.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(host.statuses().await[0].occupied_player_slots, 2);
+            shutdown.send(()).await.unwrap();
+            tasks.join_next().await.unwrap().unwrap().unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn static_empty_or_pre_draining_hosts_fail_closed_before_binding() {
         let empty = MatchHost::<DemoSimulation>::new(1).unwrap();
