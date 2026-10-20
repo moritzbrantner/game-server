@@ -13,6 +13,7 @@ pub mod protocol;
 pub mod reassembly;
 pub mod recovery;
 pub mod replay;
+mod replay_baseline;
 pub mod runtime;
 pub mod session;
 pub mod simulation;
@@ -90,6 +91,7 @@ pub use recovery::{
 pub use replay::{
     REPLAY_FORMAT_VERSION, ReplayError, ReplayLog, ReplayRecord, ReplayVerification, verify_replay,
 };
+pub use replay_baseline::{ReplayBaseline, ReplayPlayerWatermarks};
 pub use runtime::{CommandOutcome, MatchRuntime, RuntimeError, RuntimeRecoveryError};
 pub use session::{
     DEFAULT_MAX_PLAYERS, DEFAULT_RECONNECT_GRACE_TICKS, ReconnectToken, RecoverableSession,
@@ -123,3 +125,6 @@ mod welcome_handshake_acceptance;
 
 #[cfg(test)]
 mod host_input_tests;
+
+#[cfg(test)]
+mod checkpoint_tests;

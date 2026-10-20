@@ -27,7 +27,8 @@
 //!
 //! // replay
 //! ReplayRecord::CommandApplied { tick, player_id, lane: CommandLane, sequence, payload }
-//! REPLAY_FORMAT_VERSION == 3; version 1 and 2 encodings decode as CommandLane::Datagram.
+//! Replay version 3 added lanes; versions 1 and 2 decode as CommandLane::Datagram.
+//! The current replay version also supports trusted inputs and canonical baselines.
 //!
 //! // protocol (crate root)
 //! pub const COMMAND_LANE_FORMAT_VERSION: u8;
@@ -735,7 +736,7 @@ fn mixed_lane_history_round_trips_through_replay_encoding_and_verification() {
         ]
     );
 
-    assert_eq!(REPLAY_FORMAT_VERSION, 4);
+    assert_eq!(REPLAY_FORMAT_VERSION, 5);
     let encoded = log.encode().unwrap();
     assert_eq!(&encoded[..4], b"GSRP");
     assert_eq!(

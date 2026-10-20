@@ -305,15 +305,25 @@ impl RecoveryImage {
             .map(|session| (session.player_id, LaneSequences::default()))
             .collect::<BTreeMap<_, _>>();
         for record in self.replay.records() {
-            if let ReplayRecord::CommandApplied {
-                player_id,
-                lane,
-                sequence,
-                ..
-            } = record
-                && let Some(current) = sequences.get_mut(player_id)
-            {
-                current.set(*lane, current.get(*lane).max(*sequence));
+            match record {
+                ReplayRecord::Baseline { baseline } => {
+                    for (player_id, watermarks) in baseline.watermarks() {
+                        if let Some(current) = sequences.get_mut(&player_id) {
+                            *current = watermarks;
+                        }
+                    }
+                }
+                ReplayRecord::CommandApplied {
+                    player_id,
+                    lane,
+                    sequence,
+                    ..
+                } => {
+                    if let Some(current) = sequences.get_mut(player_id) {
+                        current.set(*lane, current.get(*lane).max(*sequence));
+                    }
+                }
+                _ => {}
             }
         }
         sequences
@@ -362,15 +372,21 @@ impl RecoveryImage {
 
         if !matches!(
             self.replay.records().last(),
-            Some(ReplayRecord::Checkpoint { .. })
+            Some(ReplayRecord::Checkpoint { .. } | ReplayRecord::Baseline { .. })
         ) {
             return Err(RecoveryError::MissingFinalCheckpoint);
         }
 
         let mut live_players = BTreeSet::new();
+        let mut highest_player_id = 0;
         for record in self.replay.records() {
             match record {
+                ReplayRecord::Baseline { baseline } => {
+                    highest_player_id = baseline.highest_player_id;
+                    live_players.extend(baseline.players.iter().map(|player| player.player_id));
+                }
                 ReplayRecord::PlayerAdmitted { player_id, .. } => {
+                    highest_player_id = highest_player_id.max(*player_id);
                     live_players.insert(*player_id);
                 }
                 ReplayRecord::PlayerRemoved { player_id, .. } => {
@@ -381,6 +397,9 @@ impl RecoveryImage {
                 | ReplayRecord::Checkpoint { .. }
                 | ReplayRecord::DigestCheckpoint { .. } => {}
             }
+        }
+        if self.sessions.next_player_id <= highest_player_id {
+            return Err(RecoveryError::ReplayPlayerSetMismatch);
         }
         let session_players = self
             .sessions
