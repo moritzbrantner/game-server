@@ -8,8 +8,6 @@ pub mod host_status;
 pub mod host_transport;
 pub mod live_host;
 pub mod persistence;
-#[cfg(feature = "physics")]
-pub mod physics;
 pub mod protocol;
 pub use persistence::{
     PersistenceError, SnapshotCommitBatch, SnapshotCommitFuture, SnapshotCommitter,
@@ -69,8 +67,6 @@ pub use host_transport::{
     serve_match_host_with_control, serve_match_host_with_control_and_shutdown,
     serve_match_host_with_shutdown,
 };
-#[cfg(feature = "physics")]
-pub use physics::{PINNED_PHYSICS_ENGINE_REVISION, PhysicsWorldAdapter};
 pub use protocol::{
     COMMAND_HEADER_BYTES, COMMAND_LANE_FORMAT_VERSION, COMMAND_LANE_HEADER_BYTES,
     COMMAND_REJECTION_HEADER_BYTES, CommandFrame, CommandLane, CommandRejectionFrame,
