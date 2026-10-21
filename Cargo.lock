@@ -84,6 +84,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 
 [[package]]
+name = "bvh-kernels"
+version = "0.1.0"
+source = "git+https://github.com/moritzbrantner/rust-kernels?rev=00b455280c9dfc98fee7f07b55b6d605e5bdc047#00b455280c9dfc98fee7f07b55b6d605e5bdc047"
+dependencies = [
+ "spatial-kernels",
+]
+
+[[package]]
 name = "bytes"
 version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -273,7 +281,7 @@ dependencies = [
 [[package]]
 name = "geometry-kernels"
 version = "0.1.0"
-source = "git+https://github.com/moritzbrantner/rust-kernels?rev=c9a2d1bdaad586e6c4a25ffce2d78dba8060c758#c9a2d1bdaad586e6c4a25ffce2d78dba8060c758"
+source = "git+https://github.com/moritzbrantner/rust-kernels?rev=00b455280c9dfc98fee7f07b55b6d605e5bdc047#00b455280c9dfc98fee7f07b55b6d605e5bdc047"
 dependencies = [
  "spatial-kernels",
 ]
@@ -572,10 +580,11 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 [[package]]
 name = "physics-engine"
 version = "0.1.0"
-source = "git+https://github.com/moritzbrantner/physics-engine.git?rev=500e87d4e08f2316267216f85d5c4ed79be2a38b#500e87d4e08f2316267216f85d5c4ed79be2a38b"
+source = "git+https://github.com/moritzbrantner/physics-engine.git?rev=2a9af2d3f84ae9f15cc817797d27d61fd8f52384#2a9af2d3f84ae9f15cc817797d27d61fd8f52384"
 dependencies = [
+ "bvh-kernels",
  "geometry-kernels",
- "sha2",
+ "spatial-kernels",
 ]
 
 [[package]]
@@ -914,7 +923,7 @@ dependencies = [
 [[package]]
 name = "spatial-kernels"
 version = "0.1.0"
-source = "git+https://github.com/moritzbrantner/rust-kernels?rev=c9a2d1bdaad586e6c4a25ffce2d78dba8060c758#c9a2d1bdaad586e6c4a25ffce2d78dba8060c758"
+source = "git+https://github.com/moritzbrantner/rust-kernels?rev=00b455280c9dfc98fee7f07b55b6d605e5bdc047#00b455280c9dfc98fee7f07b55b6d605e5bdc047"
 
 [[package]]
 name = "stable_deref_trait"
