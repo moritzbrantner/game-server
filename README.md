@@ -13,7 +13,7 @@ Reusable server-authoritative multiplayer runtime extracted from the proven `ser
 - reconnect/resume semantics and graceful recovery;
 - multi-match process hosting and draining.
 
-It does **not** own game-specific rules, matchmaking/accounts/rankings, or physics algorithms. Games supply deterministic simulation logic. Physics is delegated to `physics-engine` through an adapter boundary.
+It does **not** own game-specific rules, matchmaking/accounts/rankings, or physics algorithms. Games supply deterministic simulation logic. Games run their own physics (Rapier) in their simulation crates; this crate has no physics dependency.
 
 Single-match and hosted listeners share one internal connection module for admission, welcome rollback, command ingestion (datagrams and the reliable command lane), snapshot delivery, and reliable control. Hosted routing binds the match identity before entering that module. Server tasks own their connection and tick tasks; each connection owns its control exchanges, so canceling the owner also cancels pending work. See [the connection lifecycle decision](docs/adr/0001-shared-connection-lifecycle.md).
 
