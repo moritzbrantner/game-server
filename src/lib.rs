@@ -3,10 +3,13 @@
 //! The default `transport` feature is the native host. Without it
 //! (`default-features = false`) the crate is the client wire layer — frame
 //! codecs, snapshot reassembly, browser routes and control frames — and builds
-//! for `wasm32-unknown-unknown`.
+//! for `wasm32-unknown-unknown`. The `browser-transport` feature adds
+//! [`BrowserSession`], a WebTransport client adapter for browsers.
 
 // Client wire layer: std + url only, builds for wasm32-unknown-unknown.
 pub mod browser;
+#[cfg(feature = "browser-transport")]
+pub mod browser_transport;
 pub mod control;
 pub mod external_simulation;
 pub mod match_id;
@@ -47,6 +50,11 @@ pub use browser::{
     BROWSER_ROUTE_VERSION, BrowserAdmission, BrowserOriginAllowlist, BrowserOriginError,
     BrowserProtocolContract, BrowserRouteError, BrowserRoutePrefix, BrowserSessionRoute,
     MAX_BROWSER_ORIGIN_BYTES, MAX_BROWSER_ORIGINS,
+};
+#[cfg(feature = "browser-transport")]
+pub use browser_transport::{
+    BROWSER_CLIENT_CLOSE_CODE, BROWSER_REJECTION_QUEUE_LIMIT, BROWSER_SNAPSHOT_QUEUE_LIMIT,
+    BrowserConnectOptions, BrowserSession, BrowserSessionEnd, BrowserTransportError,
 };
 pub use control::{
     CONTROL_FORMAT_VERSION, CONTROL_HEADER_BYTES, ControlContext, ControlRequest, ControlResponse,
