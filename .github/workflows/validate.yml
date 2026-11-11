@@ -22,6 +22,11 @@ jobs:
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Test
         run: cargo test --locked --all-targets --all-features
+      - name: Client wire layer for wasm32
+        run: |
+          rustup target add wasm32-unknown-unknown
+          cargo clippy --locked --lib --no-default-features --target wasm32-unknown-unknown -- -D warnings
+          cargo test --locked --lib --no-default-features
       - name: Test benchmark comparison rules
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s benchmarks -p 'test_*.py'
       - name: Release build
