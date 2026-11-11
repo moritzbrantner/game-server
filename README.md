@@ -46,6 +46,37 @@ game-server = { git = "https://github.com/moritzbrantner/game-server", default-f
 
 That keeps `protocol` (command/snapshot/fragment/welcome/ack codecs, `PROTOCOL_VERSION`), `reassembly::SnapshotReassembler`, `browser` (route prefixes, `MatchId`, reconnect paths, `BROWSER_PROTOCOL_CONTRACT`), `control` frames, `session::ReconnectToken`, and the `GameSimulation` trait with the demo world. Hosting, replay, recovery and serving need `transport`. The client brings its own WebTransport (for example the browser's `WebTransport` through JS or web-sys) and feeds its bytes through these codecs. CI checks this layer for wasm32.
 
+The `browser-transport` feature adds `BrowserSession`, a ready-made browser WebTransport adapter. It binds the browser's `WebTransport` directly with `wasm-bindgen`, so no `--cfg=web_sys_unstable_apis` is needed:
+
+```toml
+game-server = { git = "https://github.com/moritzbrantner/game-server", default-features = false, features = ["browser-transport"] }
+```
+
+```rust
+let prefix = BrowserRoutePrefix::new("/game")?;
+let match_id = MatchId::new("alpha")?;
+let url = format!("https://host.example:4433{}", prefix.match_path(&match_id));
+// For a self-signed dev certificate pass its SHA-256; `None` needs a publicly trusted one.
+let options = BrowserConnectOptions { server_certificate_hash: None };
+let session = BrowserSession::connect(&url, options).await?; // resolves with the welcome
+let welcome = session.welcome();
+session.send_command(1, &command_payload)?;                    // unreliable datagram
+let reply = session.control(b"ping").await?;                    // reliable bidirectional stream
+// Every frame: drain reassembled snapshots and command rejections.
+for snapshot in session.take_snapshots() { /* apply */ }
+for rejection in session.take_rejections() { /* roll back */ }
+if let Some(end) = session.end() {
+    // Reconnect within the grace window with the token from the welcome.
+    let token = ReconnectToken(welcome.reconnect_token);
+    let url = format!("https://host.example:4433{}", prefix.reconnect_path(&match_id, token));
+    let session = BrowserSession::connect(&url, options).await?;
+}
+```
+
+Background tasks run on `wasm_bindgen_futures::spawn_local`; snapshot and rejection queues keep the newest 64 entries. Dropping the session closes it. Reliable command lanes are not wrapped yet.
+
+Manual browser check: generate an ECDSA P-256 certificate valid at most 14 days (`openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -keyout key.pem -out cert.pem -days 10 -subj /CN=localhost -addext subjectAltName=IP:127.0.0.1`), run `GAME_SERVER_MATCH_IDS=m1 cargo run --bin game-server`, and connect a wasm page to `https://127.0.0.1:4433/game/matches/m1` with `server_certificate_hash` set to `openssl x509 -in cert.pem -outform der | openssl dgst -sha256`.
+
 For process-hosted matches, `serve_match_host*` owns one WebTransport listener and dispatches each canonical match/reconnect route to the matching `MatchHost` runtime. Unknown or malformed routes fail closed before admission. `GAME_SERVER_MATCH_IDS=alpha,beta` enables that mode in the demo server and serves `/game/matches/alpha` and `/game/matches/beta` from the same listener.
 
 ## Snapshot visibility

@@ -30,11 +30,18 @@ default = ["transport"]
 # Without it the crate is the client wire layer (frame codecs, snapshot
 # reassembly, browser routes, control frames) and builds for wasm32-unknown-unknown.
 transport = ["dep:ring", "dep:tokio", "dep:wtransport"]
+# Browser WebTransport client adapter (wasm32 in a browser), usable with
+# `default-features = false`. Binds WebTransport directly with wasm-bindgen,
+# so consumers need no `--cfg=web_sys_unstable_apis`.
+browser-transport = ["dep:js-sys", "dep:wasm-bindgen", "dep:wasm-bindgen-futures"]
 
 [dependencies]
+js-sys = { version = "0.3.80", optional = true }
 ring = { version = "0.17.14", optional = true }
 tokio = { version = "1.53.1", optional = true, features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 url = "2.5.8"
+wasm-bindgen = { version = "0.2.129", optional = true }
+wasm-bindgen-futures = { version = "0.4.80", optional = true }
 wtransport = { version = "0.7.2", optional = true, default-features = false, features = ["quinn", "ring"] }
 
 [dev-dependencies]
