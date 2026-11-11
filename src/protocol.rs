@@ -339,6 +339,7 @@ pub fn decode_reliable_command_ack(bytes: &[u8]) -> Result<ReliableCommandAck, P
 
 /// Checks a command frame header before its payload is read: version, kind,
 /// non-zero sequence and the declared payload bound. Returns the declared length.
+#[cfg(feature = "transport")]
 pub(crate) fn command_frame_payload_len(
     header: &[u8; COMMAND_HEADER_BYTES],
 ) -> Result<usize, ProtocolError> {

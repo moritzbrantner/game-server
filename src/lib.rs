@@ -1,27 +1,46 @@
+//! Server-authoritative match hosting over WebTransport.
+//!
+//! The default `transport` feature is the native host. Without it
+//! (`default-features = false`) the crate is the client wire layer — frame
+//! codecs, snapshot reassembly, browser routes and control frames — and builds
+//! for `wasm32-unknown-unknown`.
+
+// Client wire layer: std + url only, builds for wasm32-unknown-unknown.
 pub mod browser;
-mod connection;
 pub mod control;
 pub mod external_simulation;
-pub mod host;
-pub mod host_recovery;
-pub mod host_status;
-pub mod host_transport;
-pub mod live_host;
-pub mod persistence;
+pub mod match_id;
 pub mod protocol;
-pub use persistence::{
-    PersistenceError, SnapshotCommitBatch, SnapshotCommitFuture, SnapshotCommitter,
-    SnapshotPersistence,
-};
 pub mod reassembly;
-pub mod recovery;
-pub mod replay;
-mod replay_baseline;
-pub mod runtime;
 pub mod session;
 pub mod simulation;
-pub mod transport;
 pub mod world;
+
+// Native host: tokio, wtransport and ring.
+#[cfg(feature = "transport")]
+mod connection;
+#[cfg(feature = "transport")]
+pub mod host;
+#[cfg(feature = "transport")]
+pub mod host_recovery;
+#[cfg(feature = "transport")]
+pub mod host_status;
+#[cfg(feature = "transport")]
+pub mod host_transport;
+#[cfg(feature = "transport")]
+pub mod live_host;
+#[cfg(feature = "transport")]
+pub mod persistence;
+#[cfg(feature = "transport")]
+pub mod recovery;
+#[cfg(feature = "transport")]
+pub mod replay;
+#[cfg(feature = "transport")]
+mod replay_baseline;
+#[cfg(feature = "transport")]
+pub mod runtime;
+#[cfg(feature = "transport")]
+pub mod transport;
 
 pub use browser::{
     BROWSER_MATCH_SEGMENT, BROWSER_PROTOCOL_CONTRACT, BROWSER_RECONNECT_SEGMENT,
@@ -45,28 +64,7 @@ pub use external_simulation::{
     decode_external_simulation_response, encode_external_simulation_request,
     encode_external_simulation_response,
 };
-pub use host::{
-    HostError, HostStatus, MAX_MATCH_ID_BYTES, MatchHost, MatchId, MatchIdError, MatchStatus,
-    PlacementFailure,
-};
-pub use host_recovery::{
-    HOST_RECOVERY_BUNDLE_VERSION, MatchHostRecoveryConfig, MatchHostRecoveryError,
-    PreparedLiveMatchHost, PreparedMatchHost, prepare_live_match_host_for_recovery,
-    prepare_match_host_for_recovery,
-};
-pub use host_status::{
-    DEFAULT_HOST_STATUS_PORT, HOST_STATUS_CONTRACT_VERSION, HostStatusServerError,
-    MatchHostStatusConfig, serve_live_match_host_with_status_and_control_and_shutdown,
-    serve_match_host_with_status_and_control_and_shutdown,
-    serve_prepared_live_match_host_with_status_and_control_and_shutdown,
-    serve_prepared_match_host_with_status_and_control_and_shutdown,
-};
-pub use host_transport::{
-    MatchHostTransportError, MatchHostWebTransportConfig,
-    serve_live_match_host_with_control_and_shutdown, serve_match_host,
-    serve_match_host_with_control, serve_match_host_with_control_and_shutdown,
-    serve_match_host_with_shutdown,
-};
+pub use match_id::{MAX_MATCH_ID_BYTES, MatchId, MatchIdError};
 pub use protocol::{
     COMMAND_HEADER_BYTES, COMMAND_LANE_FORMAT_VERSION, COMMAND_LANE_HEADER_BYTES,
     COMMAND_REJECTION_HEADER_BYTES, CommandFrame, CommandLane, CommandRejectionFrame,
@@ -86,14 +84,6 @@ pub use reassembly::{
     SNAPSHOT_REASSEMBLY_MAX_BUFFERED_BYTES, SNAPSHOT_REASSEMBLY_MAX_IDLE_DATAGRAMS,
     SNAPSHOT_REASSEMBLY_MAX_PENDING, SnapshotReassembler, SnapshotReassemblyStats,
 };
-pub use recovery::{
-    MAX_RECOVERY_IMAGE_BYTES, RECOVERY_FORMAT_VERSION, RecoveryError, RecoveryImage,
-};
-pub use replay::{
-    REPLAY_FORMAT_VERSION, ReplayError, ReplayLog, ReplayRecord, ReplayVerification, verify_replay,
-};
-pub use replay_baseline::{ReplayBaseline, ReplayPlayerWatermarks};
-pub use runtime::{CommandOutcome, MatchRuntime, RuntimeError, RuntimeRecoveryError};
 pub use session::{
     DEFAULT_MAX_PLAYERS, DEFAULT_RECONNECT_GRACE_TICKS, ReconnectToken, RecoverableSession,
     SessionError, SessionLease, SessionRecoveryError, SessionRecoverySnapshot, SessionRegistry,
@@ -101,34 +91,76 @@ pub use session::{
 pub use simulation::{
     GameSimulation, PlayerSnapshotContext, SimulationError, SimulationSnapshot, SnapshotScope,
 };
-pub use transport::{
-    TransportError, WebTransportConfig, serve, serve_with_control, serve_with_control_and_shutdown,
-    serve_with_shutdown,
-};
 pub use world::{
     DEMO_MAX_PLAYERS, DEMO_TICK_HZ, DemoSimulation, DemoSnapshotPlayer, WorldError,
     decode_demo_snapshot, encode_demo_command,
 };
 
-#[cfg(test)]
+#[cfg(feature = "transport")]
+pub use host::{HostError, HostStatus, MatchHost, MatchStatus, PlacementFailure};
+#[cfg(feature = "transport")]
+pub use host_recovery::{
+    HOST_RECOVERY_BUNDLE_VERSION, MatchHostRecoveryConfig, MatchHostRecoveryError,
+    PreparedLiveMatchHost, PreparedMatchHost, prepare_live_match_host_for_recovery,
+    prepare_match_host_for_recovery,
+};
+#[cfg(feature = "transport")]
+pub use host_status::{
+    DEFAULT_HOST_STATUS_PORT, HOST_STATUS_CONTRACT_VERSION, HostStatusServerError,
+    MatchHostStatusConfig, serve_live_match_host_with_status_and_control_and_shutdown,
+    serve_match_host_with_status_and_control_and_shutdown,
+    serve_prepared_live_match_host_with_status_and_control_and_shutdown,
+    serve_prepared_match_host_with_status_and_control_and_shutdown,
+};
+#[cfg(feature = "transport")]
+pub use host_transport::{
+    MatchHostTransportError, MatchHostWebTransportConfig,
+    serve_live_match_host_with_control_and_shutdown, serve_match_host,
+    serve_match_host_with_control, serve_match_host_with_control_and_shutdown,
+    serve_match_host_with_shutdown,
+};
+#[cfg(feature = "transport")]
+pub use live_host::{ColdMatchResolver, LiveHostError, LiveMatchHost, LivePlacementFailure};
+#[cfg(feature = "transport")]
+pub use persistence::{
+    PersistenceError, SnapshotCommitBatch, SnapshotCommitFuture, SnapshotCommitter,
+    SnapshotPersistence,
+};
+#[cfg(feature = "transport")]
+pub use recovery::{
+    MAX_RECOVERY_IMAGE_BYTES, RECOVERY_FORMAT_VERSION, RecoveryError, RecoveryImage,
+};
+#[cfg(feature = "transport")]
+pub use replay::{
+    REPLAY_FORMAT_VERSION, ReplayError, ReplayLog, ReplayRecord, ReplayVerification, verify_replay,
+};
+#[cfg(feature = "transport")]
+pub use replay_baseline::{ReplayBaseline, ReplayPlayerWatermarks};
+#[cfg(feature = "transport")]
+pub use runtime::{CommandOutcome, MatchRuntime, RuntimeError, RuntimeRecoveryError};
+#[cfg(feature = "transport")]
+pub use transport::{
+    TransportError, WebTransportConfig, serve, serve_with_control, serve_with_control_and_shutdown,
+    serve_with_shutdown,
+};
+
+#[cfg(all(test, feature = "transport"))]
 mod benchmarks;
 
-pub use live_host::{ColdMatchResolver, LiveHostError, LiveMatchHost, LivePlacementFailure};
-
-#[cfg(test)]
+#[cfg(all(test, feature = "transport"))]
 mod test_support;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "transport"))]
 mod command_lane_acceptance;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "transport"))]
 mod welcome_handshake_acceptance;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "transport"))]
 mod host_input_tests;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "transport"))]
 mod checkpoint_tests;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "transport"))]
 mod persistence_tests;

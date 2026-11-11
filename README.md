@@ -36,6 +36,16 @@ Use `BrowserRoutePrefix` plus a validated `MatchId` to address a match. With a `
 
 The single-match demo mode opts into this addressing when `GAME_SERVER_MATCH_ID` is set. `GAME_SERVER_SESSION_PATH` then means the browser route base path rather than the full session path. If `GAME_SERVER_MATCH_ID` is absent, the old exact-session-path behavior remains available for existing experiments.
 
+### Rust/wasm clients
+
+The default `transport` feature is the native host (tokio, wtransport, ring). A browser client built for `wasm32-unknown-unknown` turns it off and gets the client wire layer only:
+
+```toml
+game-server = { git = "https://github.com/moritzbrantner/game-server", default-features = false }
+```
+
+That keeps `protocol` (command/snapshot/fragment/welcome/ack codecs, `PROTOCOL_VERSION`), `reassembly::SnapshotReassembler`, `browser` (route prefixes, `MatchId`, reconnect paths, `BROWSER_PROTOCOL_CONTRACT`), `control` frames, `session::ReconnectToken`, and the `GameSimulation` trait with the demo world. Hosting, replay, recovery and serving need `transport`. The client brings its own WebTransport (for example the browser's `WebTransport` through JS or web-sys) and feeds its bytes through these codecs. CI checks this layer for wasm32.
+
 For process-hosted matches, `serve_match_host*` owns one WebTransport listener and dispatches each canonical match/reconnect route to the matching `MatchHost` runtime. Unknown or malformed routes fail closed before admission. `GAME_SERVER_MATCH_IDS=alpha,beta` enables that mode in the demo server and serves `/game/matches/alpha` and `/game/matches/beta` from the same listener.
 
 ## Snapshot visibility

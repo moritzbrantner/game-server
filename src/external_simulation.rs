@@ -879,7 +879,8 @@ fn require_maximum_length(bytes: &[u8]) -> Result<(), ExternalSimulationError> {
     }
 }
 
-#[cfg(test)]
+// These tests drive the adapter through a MatchRuntime and replay verification.
+#[cfg(all(test, feature = "transport"))]
 mod tests {
     use super::*;
     use crate::{
