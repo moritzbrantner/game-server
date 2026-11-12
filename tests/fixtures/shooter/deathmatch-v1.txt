@@ -1,0 +1,14 @@
+schema=1
+source_repository=moenarch-games/shooter
+source=shooter-replay promote deathmatch-20s.shrp --target game-server --from 0 --to 1200
+description=scripted deathmatch: six slots, seeded bots, scripted people at 100 ms input latency (lag-compensated shots), one leaves and is removed after the grace
+tick_hz=60
+bot_seed=125780003414393
+replay_format_version=2
+replay_bytes=127016
+expected_records=3123
+expected_final_tick=1200
+expected_admissions=2
+expected_commands=1920
+expected_removals=1
+expected_digest_checkpoints=1200
