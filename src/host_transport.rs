@@ -27,7 +27,8 @@ pub struct MatchHostWebTransportConfig {
     pub certificate_pem: PathBuf,
     pub private_key_pem: PathBuf,
     pub route_prefix: BrowserRoutePrefix,
-    /// None permits native/local clients without Origin. Browser deployments should configure this.
+    /// Applies only to sessions that send an Origin; native clients without one are always
+    /// admitted. None admits every origin. Browser deployments should configure this.
     pub allowed_origins: Option<BrowserOriginAllowlist>,
     pub drain_grace: Duration,
 }
@@ -492,8 +493,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn configured_origins_gate_new_and_reconnect_sessions_before_admission_or_epoch_fencing()
-    {
+    async fn configured_origins_gate_browser_sessions_and_admit_native_sessions_without_origin() {
         use crate::test_support::TestDirectory;
         use crate::{BrowserOriginAllowlist, ReconnectToken, WELCOME_BYTES, decode_welcome};
         use wtransport::{ClientConfig, endpoint::ConnectOptions, error::ConnectingError};
@@ -555,10 +555,6 @@ mod tests {
             .unwrap();
             let url = format!("https://127.0.0.1:{port}{}", prefix.match_path(&id));
             assert!(matches!(
-                client.connect(url.clone()).await,
-                Err(ConnectingError::SessionRejected)
-            ));
-            assert!(matches!(
                 client
                     .connect(
                         ConnectOptions::builder(url.clone())
@@ -571,7 +567,7 @@ mod tests {
             assert_eq!(host.statuses().await[0].occupied_player_slots, 0);
             let admitted = client
                 .connect(
-                    ConnectOptions::builder(url)
+                    ConnectOptions::builder(url.clone())
                         .add_header("origin", "https://board.example")
                         .build(),
                 )
@@ -594,10 +590,6 @@ mod tests {
                             .build()
                     )
                     .await,
-                Err(ConnectingError::SessionRejected)
-            ));
-            assert!(matches!(
-                client.connect(reconnect.clone()).await,
                 Err(ConnectingError::SessionRejected)
             ));
             host.inspect(&id, |runtime| {
@@ -626,6 +618,12 @@ mod tests {
             assert_eq!(current.player_id, original.player_id);
             assert!(current.connection_epoch > original.connection_epoch);
             assert_eq!(host.statuses().await[0].occupied_player_slots, 1);
+            // Native clients send no Origin; the allowlist only gates browser sessions.
+            let native = client.connect(url).await.unwrap();
+            let mut stream = native.accept_uni().await.unwrap();
+            stream.read_exact(&mut bytes).await.unwrap();
+            assert_eq!(decode_welcome(&bytes).unwrap().player_id, 2);
+            assert_eq!(host.statuses().await[0].occupied_player_slots, 2);
             shutdown.send(()).await.unwrap();
             tasks.join_next().await.unwrap().unwrap().unwrap();
         })
