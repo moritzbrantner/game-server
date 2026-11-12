@@ -23,7 +23,7 @@ The welcome, command rejections and control responses count as delivered once th
 
 `browser` exposes the versioned browser-facing boundary without creating a second gameplay protocol. `BROWSER_PROTOCOL_CONTRACT` binds the route version to the existing command/snapshot protocol version, reliable-control format version, reconnect-token size, payload ceilings, snapshot fragment bound, and reliable command lane format (lane format version, header and ack sizes, one lane per connection) so browser clients can pin one explicit compatibility surface.
 
-Hosted browser deployments can set `MatchHostWebTransportConfig::allowed_origins` to `Some(BrowserOriginAllowlist::new(["https://board.example"])?)`. The allowlist requires canonical HTTP(S) origins and rejects missing/nonmatching headers before admission or reconnect fencing. `None` permits native/local clients without an Origin. This is a browser boundary, not authentication; see [the origin decision](docs/adr/0007-browser-origin-allowlists.md).
+Hosted browser deployments can set `MatchHostWebTransportConfig::allowed_origins` to `Some(BrowserOriginAllowlist::new(["https://board.example"])?)`. The allowlist requires canonical HTTP(S) origins and rejects opaque/nonmatching headers before admission or reconnect fencing. Sessions without an Origin (native clients) are admitted either way, so native and browser players can share a match; `None` admits every origin. This is a browser boundary, not authentication; see [the origin decision](docs/adr/0007-browser-origin-allowlists.md).
 
 Use `BrowserRoutePrefix` plus a validated `MatchId` to address a match. With a `/game` base path and match ID `uno_01`, the canonical paths are:
 

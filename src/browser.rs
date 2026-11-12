@@ -15,6 +15,9 @@ pub const MAX_BROWSER_ORIGINS: usize = 16;
 pub const MAX_BROWSER_ORIGIN_BYTES: usize = 2048;
 
 /// Exact serialized HTTP(S) origins. This browser boundary is not client authentication.
+///
+/// The allowlist constrains only sessions that carry an Origin header. Browsers always send
+/// one, so other websites stay out; native clients send none and are admitted.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BrowserOriginAllowlist(BTreeSet<String>);
 
@@ -43,7 +46,7 @@ impl BrowserOriginAllowlist {
     }
 
     pub fn allows(&self, origin: Option<&str>) -> bool {
-        origin.is_some_and(|origin| self.0.contains(origin))
+        origin.is_none_or(|origin| self.0.contains(origin))
     }
 }
 
@@ -216,7 +219,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn origin_allowlists_are_canonical_bounded_exact_and_never_match_missing_origins() {
+    fn origin_allowlists_are_canonical_bounded_exact_and_admit_missing_origins() {
         let allowed = BrowserOriginAllowlist::new([
             "https://board.example",
             "http://127.0.0.1:5173",
@@ -225,8 +228,8 @@ mod tests {
         .unwrap();
         assert!(allowed.allows(Some("https://board.example")));
         assert!(allowed.allows(Some("http://127.0.0.1:5173")));
+        assert!(allowed.allows(None));
         for origin in [
-            None,
             Some("null"),
             Some("https://board.example.attacker.test"),
             Some("https://board.example/"),
