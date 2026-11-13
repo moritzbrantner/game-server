@@ -17,6 +17,8 @@ pub mod protocol;
 pub mod reassembly;
 pub mod session;
 pub mod simulation;
+#[cfg(feature = "webrtc-transport")]
+pub mod webrtc_transport;
 pub mod world;
 
 // Native host: tokio, wtransport and ring.

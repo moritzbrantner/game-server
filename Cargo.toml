@@ -24,6 +24,10 @@ name = "control-client"
 path = "src/bin/control-client.rs"
 required-features = ["transport"]
 
+[[example]]
+name = "webrtc-proof"
+required-features = ["webrtc-transport"]
+
 [features]
 default = ["transport"]
 # The native host: WebTransport serving, match hosting, replay and recovery.
@@ -34,8 +38,19 @@ transport = ["dep:ring", "dep:tokio", "dep:wtransport"]
 # `default-features = false`. Binds WebTransport directly with wasm-bindgen,
 # so consumers need no `--cfg=web_sys_unstable_apis`.
 browser-transport = ["dep:js-sys", "dep:wasm-bindgen", "dep:wasm-bindgen-futures"]
+# Native home-hosted sessions; existing WebTransport users remain unchanged.
+webrtc-transport = ["transport", "dep:async-trait", "dep:bytes", "dep:futures-util", "dep:reqwest", "dep:rustls", "dep:serde", "dep:serde_json", "dep:tokio-tungstenite", "dep:webrtc"]
 
 [dependencies]
+async-trait = { version = "0.1.89", optional = true }
+bytes = { version = "1.11", optional = true }
+futures-util = { version = "0.3.31", optional = true, features = ["sink"] }
+reqwest = { version = "0.13.5", optional = true, default-features = false, features = ["json", "rustls-no-provider"] }
+rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std", "tls12"] }
+serde = { version = "1.0", optional = true, features = ["derive"] }
+serde_json = { version = "1.0", optional = true }
+tokio-tungstenite = { version = "0.30", optional = true, features = ["rustls-tls-webpki-roots"] }
+webrtc = { version = "0.21.1", optional = true }
 js-sys = { version = "0.3.80", optional = true }
 ring = { version = "0.17.14", optional = true }
 tokio = { version = "1.53.1", optional = true, features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
