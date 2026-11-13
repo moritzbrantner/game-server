@@ -1,4 +1,4 @@
-use super::peer::{self, Channels, NEGOTIATE_TIMEOUT, Peer};
+use super::peer::{self, Channels, Peer};
 use super::{Lobby, Result, WebRtcError};
 use crate::{
     CommandRejectionFrame, ControlResponse, MatchId, ReconnectToken, ReliableCommandAck,
@@ -34,6 +34,7 @@ pub struct WebRtcClient {
     relay_only: bool,
     reassembler: SnapshotReassembler,
     rejections: VecDeque<CommandRejectionFrame>,
+    authorization: Vec<u8>,
 }
 
 impl WebRtcClient {
@@ -45,9 +46,31 @@ impl WebRtcClient {
         bind_ip: &str,
         relay_only: bool,
     ) -> Result<Self> {
+        Self::connect_with_authorization(lobby, match_id, bind_ip, relay_only, Vec::new()).await
+    }
+
+    /// Carries an opaque bounded game proof to the host's game-owned authorizer.
+    /// The proof stays in memory and is retained for same-participant reconnect.
+    pub async fn connect_with_authorization(
+        lobby: Lobby,
+        match_id: MatchId,
+        bind_ip: &str,
+        relay_only: bool,
+        authorization: Vec<u8>,
+    ) -> Result<Self> {
+        if authorization.len() > super::MAX_AUTHORIZATION_BYTES {
+            return Err(WebRtcError("game authorization exceeds limit"));
+        }
         timeout(
-            NEGOTIATE_TIMEOUT * 3,
-            Self::negotiate(lobby, match_id, bind_ip.to_owned(), relay_only, None),
+            std::time::Duration::from_secs(100),
+            Self::negotiate(
+                lobby,
+                match_id,
+                bind_ip.to_owned(),
+                relay_only,
+                None,
+                authorization,
+            ),
         )
         .await
         .map_err(|_| WebRtcError("guest connection timed out"))?
@@ -59,6 +82,7 @@ impl WebRtcClient {
         bind_ip: String,
         relay_only: bool,
         reconnect: Option<ReconnectToken>,
+        authorization: Vec<u8>,
     ) -> Result<Self> {
         if lobby.participant_id() == lobby.host_participant_id() {
             return Err(WebRtcError("guest needs its own lobby participant"));
@@ -67,7 +91,7 @@ impl WebRtcClient {
         let channels = peer.create_channels().await?;
         let offer = peer.local_description(true).await?;
         let host = lobby.host_participant_id().to_owned();
-        lobby.signal(&host,json!({"adapter":"game-server-webrtc-v1","kind":"offer","matchId":match_id.as_str(),"description":offer})).await?;
+        lobby.signal(&host,json!({"adapter":"game-server-webrtc-v1","kind":"offer","matchId":match_id.as_str(),"description":offer,"authorization":authorization})).await?;
         let ticket = loop {
             let event = lobby.receive().await?;
             if event["type"] == "error" {
@@ -115,6 +139,7 @@ impl WebRtcClient {
             relay_only,
             reassembler: SnapshotReassembler::new(),
             rejections: VecDeque::new(),
+            authorization,
         })
     }
 
@@ -223,17 +248,24 @@ impl WebRtcClient {
         let token = ReconnectToken(self.welcome.reconnect_token);
         self.peer.pc.close().await?;
         timeout(
-            NEGOTIATE_TIMEOUT * 3,
+            std::time::Duration::from_secs(100),
             Self::negotiate(
                 self.lobby,
                 self.match_id,
                 self.bind_ip,
                 self.relay_only,
                 Some(token),
+                self.authorization,
             ),
         )
         .await
         .map_err(|_| WebRtcError("reconnect timed out"))?
+    }
+
+    /// Interrupt transport while retaining the participant and reconnect token.
+    /// A later consuming `reconnect` resumes this same fenced runtime session.
+    pub async fn disconnect(&self) -> Result<()> {
+        self.peer.pc.close().await.map_err(Into::into)
     }
 
     pub async fn close(self) -> Result<()> {

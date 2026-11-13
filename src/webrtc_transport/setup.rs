@@ -382,3 +382,84 @@ async fn request(
     }
     serde_json::from_slice(&bytes).map_err(Into::into)
 }
+
+#[cfg(test)]
+pub(super) mod test_support {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::task::JoinSet;
+
+    /// Local signaling endpoints stand in for the already authenticated setup
+    /// participants. The real adapter/ICE/DataChannels are used by the probe.
+    pub async fn lobbies() -> (Lobby, Lobby, JoinSet<()>) {
+        let mut tasks = JoinSet::new();
+        let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = http.local_addr().unwrap();
+        let unused_turn = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let turn_address = unused_turn.local_addr().unwrap();
+        drop(unused_turn);
+        tasks.spawn(async move {
+            loop {
+                let (mut stream, _) = http.accept().await.unwrap();
+                let mut bytes = [0; 4096];
+                let _ = stream.read(&mut bytes).await.unwrap();
+                let body = json!({"expiresAt":now_ms().unwrap()+60_000,"iceServers":[{"urls":[format!("turn:{turn_address}?transport=tcp")],"username":"test","credential":"test"}]}).to_string();
+                let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body);
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let config = SetupConfig::new(&format!("http://{address}"), "http://localhost").unwrap();
+        let mut clients = Vec::new();
+        let mut servers = Vec::new();
+        for _ in 0..2 {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let accept = async {
+                let (stream, _) = listener.accept().await.unwrap();
+                tokio_tungstenite::accept_async(stream).await.unwrap()
+            };
+            let (client, server) = tokio::join!(
+                tokio_tungstenite::connect_async(format!("ws://{address}")),
+                accept
+            );
+            clients.push(client.unwrap().0);
+            servers.push(server);
+        }
+        let mut guest_socket = servers.pop().unwrap();
+        let mut host_socket = servers.pop().unwrap();
+        tasks.spawn(async move {
+            loop {
+                tokio::select! {
+                    Some(Ok(Message::Text(text))) = host_socket.next() => {
+                        let event: Value = serde_json::from_str(&text).unwrap();
+                        if event["type"] == "signal" {
+                            guest_socket.send(Message::Text(json!({"type":"signal","from":"00000001","payload":event["payload"]}).to_string().into())).await.unwrap();
+                        }
+                    },
+                    Some(Ok(Message::Text(text))) = guest_socket.next() => {
+                        let event: Value = serde_json::from_str(&text).unwrap();
+                        if event["type"] == "signal" {
+                            host_socket.send(Message::Text(json!({"type":"signal","from":"00000002","payload":event["payload"]}).to_string().into())).await.unwrap();
+                        }
+                    },
+                    else => return,
+                }
+            }
+        });
+        let mut lobby = |id: &str| Lobby {
+            config: config.clone(),
+            http: Lobby::http().unwrap(),
+            lobby_id: "000000000001".to_owned(),
+            participant: Participant {
+                participant_id: id.to_owned(),
+                participant_token: "0".repeat(64),
+                host_participant_id: "00000001".to_owned(),
+                expires_at: u64::MAX,
+                max_expires_at: u64::MAX,
+            },
+            socket: clients.remove(0),
+        };
+        (lobby("00000001"), lobby("00000002"), tasks)
+    }
+}
