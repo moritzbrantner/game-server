@@ -25,7 +25,9 @@ The optional `webrtc-transport` feature adds native home-host and guest adapters
 over the existing setup-service lobby, signaling and short-lived TURN interface.
 `WebRtcHost::attach` adds WebRTC beside an already serving `LiveMatchHost` while
 retaining its single tick, persistence and recovery owner; game control receives
-the authenticated participant plus the fenced player identity.
+the authenticated participant plus the fenced player identity. An optional bounded
+peer content service carries game-owned manifest/chunk bytes on that same admitted
+session, independently of gameplay/control.
 Normal ICE prefers direct connectivity and falls back to TURN; the dedicated
 WebTransport adapter and its wire formats retain their behavior. See
 [WebRTC setup, channel mapping and real-network probes](docs/WEBRTC.md).

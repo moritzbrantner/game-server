@@ -4,11 +4,16 @@
 //! single-use admission tickets and reconnect tokens remain in memory.
 
 mod client;
+mod content;
 mod peer;
 mod server;
 mod setup;
 
 pub use client::{ConnectionMetrics, WebRtcClient};
+pub use content::{
+    MAX_CONTENT_BYTES, WebRtcContentClient, WebRtcContentError, WebRtcContentFuture,
+    WebRtcContentService,
+};
 pub use server::{WebRtcControlService, WebRtcHost, WebRtcHostConfig};
 
 pub use setup::{Lobby, SetupConfig};

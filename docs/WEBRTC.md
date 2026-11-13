@@ -73,8 +73,7 @@ The host heartbeats every 20 seconds and renews near expiry only when its existi
 setup lifetime cap allows it. Signaling expiry/disconnect ends hosting; ordinary
 shutdown drains, releases connections and freezes the runtime for the owning game
 to save through its existing recovery/storage path. Game applications own durable
-saves, registration lifetime policy, launch UI and invitations. This transport
-does not implement MMORPG's later native launcher or missing-asset stages.
+saves, registration lifetime policy, launch UI and invitations. Games retain native launcher and missing-asset cache/import behavior.
 
 `WebRtcClient` uses the same welcome, intent, snapshot and reliable-command codecs
 as WebTransport. Retain the welcome token in memory; `reconnect` preserves player
@@ -86,6 +85,44 @@ issuing another exchange. Private command rejections can be read through
 `command_rejection` or drained with `pop_command_rejection` after control reads.
 `metrics` returns selected-path counters without addresses or credentials.
 
+## Optional peer content
+
+A host opts in with `.with_content_service(Arc<dyn WebRtcContentService>)`.
+The asynchronous `handle(participant_id, match_id, ControlContext, request)` receives
+opaque game-owned bytes only after admission. The participant, match, player and
+connection epoch are the same identities as scoped control. Games own content
+entitlements, manifests, immutable hashes, file lookup and verified cache/import.
+Use asynchronous I/O and cancellation-safe futures; detached work and unbounded
+blocking jobs are outside the service contract.
+
+Native guests opt in with `WebRtcClient::connect_with_content_authorization`,
+using the same arguments as `connect_with_authorization`. Offers and answers must
+both advertise `contentVersion: 1`; missing/unknown capabilities leave channel 3
+absent. Existing native/browser peers and dedicated listeners retain their lanes.
+`client.content_client()` returns `None` without mutual support, otherwise an
+independent cloneable handle whose `request(&bytes).await` exchanges one chunk.
+Keep gameplay receives and sends running while that handle awaits content.
+Reconnect negotiates again; old handles never migrate to the replacement epoch.
+
+Requests and responses each contain at most `MAX_CONTENT_BYTES` (16 KiB).
+There is one outstanding exchange across handle clones, one handler per peer and
+four active handlers per host. Busy callers fail without queuing work. Each chunk
+waits at least 10 ms before lookup; exchanges and handlers have five-second bounds.
+The existing provider limits each channel's send buffer to 64 KiB and bounds its
+receive event queues. Responses use nonblocking enqueue so content cannot wait on
+the authoritative loop; small paced chunks bound shared SCTP contention while
+snapshots, intents and control continue on their original channels. This is not a
+bandwidth reservation under arbitrary network congestion.
+
+Current authorization, runtime drain and session fencing are checked before lookup
+and again under the runtime lock at nonblocking response publication. File/network
+I/O never holds that lock. Revocation, disconnect, retirement and shutdown close
+the peer and cancel its content tasks. The game must also recheck mutable content
+entitlements before delayed protected side effects. A game-owned service refusal returns `WebRtcContentError::Refused` and preserves
+the peer and lane. A timeout or transport/protocol failure closes the peer. Canceling a request future disables its content handle; reconnect
+before more content requests so delayed bytes cannot become a later response.
+Setup signaling and the website never carry content bytes.
+
 ## Channel contract
 
 All channels are negotiated out of band on both endpoints.
@@ -95,6 +132,7 @@ All channels are negotiated out of band on both endpoints.
 | 0 | `game-server.realtime.v1` | unordered, `maxRetransmits: 0` | Existing commands and whole/fragmented snapshots |
 | 1 | `game-server.session.v1` | ordered, reliable | `GSAD` + byte `1`, then 32-byte ticket (+ 16-byte reconnect token), existing welcome/rejections/GSCT |
 | 2 | `game-server.commands.v1` | ordered, reliable | Existing GSCL header, commands and acknowledgements |
+| 3 (optional) | `game-server.content.v1` | ordered, reliable | Opaque request (≤16 KiB); response status byte `1` + opaque bytes (≤16 KiB), or byte `0` for refusal |
 
 No canonical player-scoped snapshot enters broadcast delivery. Snapshot
 authorization, projection and provider enqueue use the same runtime lock.

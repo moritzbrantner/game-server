@@ -46,3 +46,17 @@ cancellation ownership. Provider reactors stop when their final owner drops.
 Invites expose only public match/lobby IDs; capabilities, SDP, tickets, reconnect
 tokens and TURN credentials never enter diagnostics. Games retain guest policy,
 durable storage and invitations. Bulk assets use their independently bounded path.
+
+## Optional content extension (#91)
+
+Peers can mutually advertise `contentVersion: 1` in authenticated setup offers
+and answers to create negotiated reliable ordered channel 3. Missing support
+keeps the original three channels. Content requests and responses are opaque
+game-owned payloads capped at 16 KiB each, with one outstanding exchange per peer,
+four concurrent host handlers, five-second bounds and chunk pacing. A separate
+client handle permits gameplay/control progress during content lookup. Current
+participant authorization, runtime drain and connection fencing gate both handler
+entry and nonblocking response publication; content I/O runs outside the runtime
+lock. Peer closure cancels handlers. Games retain manifest/hash/cache/import and
+content-entitlement semantics; signaling never carries bulk bytes. See
+[the content API and bounds](../WEBRTC.md#optional-peer-content).

@@ -6,6 +6,7 @@ use crate::{
 };
 use serde_json::json;
 use std::collections::VecDeque;
+use std::sync::Arc;
 use tokio::time::timeout;
 
 /// Selected-path observations only; no SDP, addresses or ICE credentials.
@@ -35,6 +36,8 @@ pub struct WebRtcClient {
     reassembler: SnapshotReassembler,
     rejections: VecDeque<CommandRejectionFrame>,
     authorization: Vec<u8>,
+    content_requested: bool,
+    content: Option<super::WebRtcContentClient>,
 }
 
 impl WebRtcClient {
@@ -58,6 +61,30 @@ impl WebRtcClient {
         relay_only: bool,
         authorization: Vec<u8>,
     ) -> Result<Self> {
+        Self::connect_optional_content(lobby, match_id, bind_ip, relay_only, authorization, false)
+            .await
+    }
+
+    /// Opts into channel 3 if the host supplies a content service.
+    pub async fn connect_with_content_authorization(
+        lobby: Lobby,
+        match_id: MatchId,
+        bind_ip: &str,
+        relay_only: bool,
+        authorization: Vec<u8>,
+    ) -> Result<Self> {
+        Self::connect_optional_content(lobby, match_id, bind_ip, relay_only, authorization, true)
+            .await
+    }
+
+    async fn connect_optional_content(
+        lobby: Lobby,
+        match_id: MatchId,
+        bind_ip: &str,
+        relay_only: bool,
+        authorization: Vec<u8>,
+        content_requested: bool,
+    ) -> Result<Self> {
         if authorization.len() > super::MAX_AUTHORIZATION_BYTES {
             return Err(WebRtcError("game authorization exceeds limit"));
         }
@@ -70,6 +97,7 @@ impl WebRtcClient {
                 relay_only,
                 None,
                 authorization,
+                content_requested,
             ),
         )
         .await
@@ -83,15 +111,16 @@ impl WebRtcClient {
         relay_only: bool,
         reconnect: Option<ReconnectToken>,
         authorization: Vec<u8>,
+        content_requested: bool,
     ) -> Result<Self> {
         if lobby.participant_id() == lobby.host_participant_id() {
             return Err(WebRtcError("guest needs its own lobby participant"));
         }
         let mut peer = Peer::new(lobby.turn_servers().await?, relay_only, &bind_ip).await?;
-        let channels = peer.create_channels().await?;
+        let mut channels = peer.create_channels().await?;
         let offer = peer.local_description(true).await?;
         let host = lobby.host_participant_id().to_owned();
-        lobby.signal(&host,json!({"adapter":"game-server-webrtc-v1","kind":"offer","matchId":match_id.as_str(),"description":offer,"authorization":authorization})).await?;
+        lobby.signal(&host,json!({"adapter":"game-server-webrtc-v1","kind":"offer","matchId":match_id.as_str(),"description":offer,"authorization":authorization,"contentVersion":if content_requested {Some(1)} else {None}})).await?;
         let ticket = loop {
             let event = lobby.receive().await?;
             if event["type"] == "error" {
@@ -108,6 +137,9 @@ impl WebRtcClient {
                 continue;
             }
             let ticket: [u8; 32] = serde_json::from_value(payload["ticket"].clone())?;
+            if content_requested && payload["contentVersion"] == 1 {
+                channels.content = Some(peer.create_content_channel().await?);
+            }
             peer.pc
                 .set_remote_description(serde_json::from_value(payload["description"].clone())?)
                 .await?;
@@ -129,6 +161,9 @@ impl WebRtcClient {
             crate::decode_welcome(&peer::receive(&channels.session, crate::WELCOME_BYTES).await?)
                 .map_err(|_| WebRtcError("invalid authoritative welcome"))?;
         peer::send(&channels.commands, &crate::encode_command_lane_header()).await?;
+        let content = channels.content.as_ref().map(|channel| {
+            super::WebRtcContentClient::new(Arc::clone(channel), Arc::clone(&peer.pc))
+        });
         Ok(Self {
             lobby,
             peer,
@@ -140,7 +175,14 @@ impl WebRtcClient {
             reassembler: SnapshotReassembler::new(),
             rejections: VecDeque::new(),
             authorization,
+            content_requested,
+            content,
         })
+    }
+
+    /// Obtain an independent handle so content never monopolizes gameplay receives.
+    pub fn content_client(&self) -> Option<super::WebRtcContentClient> {
+        self.content.clone()
     }
 
     pub fn welcome(&self) -> &Welcome {
@@ -256,6 +298,7 @@ impl WebRtcClient {
                 self.relay_only,
                 Some(token),
                 self.authorization,
+                self.content_requested,
             ),
         )
         .await

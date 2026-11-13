@@ -134,6 +134,19 @@ impl Peer {
             .ok_or(WebRtcError("missing local description"))
     }
 
+    pub(super) async fn create_content_channel(&self) -> Result<Arc<dyn DataChannel>> {
+        Ok(self
+            .pc
+            .create_data_channel(
+                "game-server.content.v1",
+                Some(RTCDataChannelInit {
+                    negotiated: Some(3),
+                    ..Default::default()
+                }),
+            )
+            .await?)
+    }
+
     pub(super) async fn create_channels(&self) -> Result<Channels> {
         let realtime = self
             .pc
@@ -171,6 +184,7 @@ impl Peer {
             realtime,
             session,
             commands,
+            content: None,
         })
     }
 }
@@ -179,6 +193,7 @@ pub(super) struct Channels {
     pub(super) realtime: Arc<dyn DataChannel>,
     pub(super) session: Arc<dyn DataChannel>,
     pub(super) commands: Arc<dyn DataChannel>,
+    pub(super) content: Option<Arc<dyn DataChannel>>,
 }
 
 pub(super) async fn opened(channel: &Arc<dyn DataChannel>) -> Result<()> {
