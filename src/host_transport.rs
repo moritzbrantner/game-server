@@ -14,6 +14,7 @@ use crate::simulation::GameSimulation;
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,6 +25,9 @@ use wtransport::{Endpoint, Identity, ServerConfig};
 #[derive(Clone, Debug)]
 pub struct MatchHostWebTransportConfig {
     pub port: u16,
+    /// None retains the dedicated listener's dual-stack wildcard bind.
+    /// Managed home hosts can restrict their owner-only listener to loopback.
+    pub bind_ip: Option<IpAddr>,
     pub certificate_pem: PathBuf,
     pub private_key_pem: PathBuf,
     pub route_prefix: BrowserRoutePrefix,
@@ -274,11 +278,7 @@ pub(crate) async fn serve_live_host_inner<S: GameSimulation, C: MatchControlServ
     let identity = Identity::load_pemfiles(&config.certificate_pem, &config.private_key_pem)
         .await
         .map_err(|error| MatchHostTransportError::Identity(error.to_string()))?;
-    let server_config = ServerConfig::builder()
-        .with_bind_default(config.port)
-        .with_identity(identity)
-        .keep_alive_interval(Some(Duration::from_secs(3)))
-        .build();
+    let server_config = server_config(&config, identity);
     let endpoint = Endpoint::server(server_config)
         .map_err(|error| MatchHostTransportError::Endpoint(error.to_string()))?;
 
@@ -470,6 +470,18 @@ async fn persist_host_recovery<S: GameSimulation>(
     result
 }
 
+fn server_config(config: &MatchHostWebTransportConfig, identity: Identity) -> ServerConfig {
+    let builder = ServerConfig::builder();
+    let builder = match config.bind_ip {
+        Some(ip) => builder.with_bind_address(SocketAddr::new(ip, config.port)),
+        None => builder.with_bind_default(config.port),
+    };
+    builder
+        .with_identity(identity)
+        .keep_alive_interval(Some(Duration::from_secs(3)))
+        .build()
+}
+
 async fn resume_host_after_failed_recovery<S: GameSimulation>(state: &HostedServerState<S>) {
     for (_, hosted) in state.host.entries() {
         hosted.runtime.lock().await.resume_after_failed_recovery();
@@ -484,12 +496,30 @@ mod tests {
     fn config() -> MatchHostWebTransportConfig {
         MatchHostWebTransportConfig {
             port: 0,
+            bind_ip: None,
             certificate_pem: PathBuf::from("unused-cert.pem"),
             private_key_pem: PathBuf::from("unused-key.pem"),
             route_prefix: BrowserRoutePrefix::new("/matches").unwrap(),
             allowed_origins: None,
             drain_grace: Duration::ZERO,
         }
+    }
+
+    #[tokio::test]
+    async fn managed_owner_listener_binds_only_the_configured_loopback_address() {
+        let mut config = config();
+        config.bind_ip = Some(std::net::Ipv4Addr::LOCALHOST.into());
+        let identity = Identity::self_signed(["localhost", "127.0.0.1"]).unwrap();
+        let endpoint = Endpoint::server(server_config(&config, identity)).unwrap();
+        let address = endpoint.local_addr().unwrap();
+        assert_eq!(address.ip(), std::net::Ipv4Addr::LOCALHOST);
+        assert_ne!(address.port(), 0);
+        drop(endpoint);
+
+        config.bind_ip = None;
+        let identity = Identity::self_signed(["localhost"]).unwrap();
+        let endpoint = Endpoint::server(server_config(&config, identity)).unwrap();
+        assert!(endpoint.local_addr().unwrap().ip().is_unspecified());
     }
 
     #[tokio::test]
@@ -532,6 +562,7 @@ mod tests {
                 RejectMatchControlService,
                 MatchHostWebTransportConfig {
                     port,
+                    bind_ip: None,
                     certificate_pem: certificate,
                     private_key_pem: key,
                     route_prefix: prefix.clone(),
@@ -705,6 +736,7 @@ mod tests {
                 RejectMatchControlService,
                 MatchHostWebTransportConfig {
                     port,
+                    bind_ip: None,
                     certificate_pem: certificate,
                     private_key_pem: key,
                     route_prefix: BrowserRoutePrefix::new("/game").unwrap(),

@@ -99,6 +99,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         RejectMatchControlService,
         MatchHostWebTransportConfig {
             port,
+            bind_ip: None,
             certificate_pem: certificate,
             private_key_pem: key,
             route_prefix: prefix,
