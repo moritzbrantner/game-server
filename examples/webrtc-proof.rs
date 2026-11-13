@@ -76,7 +76,9 @@ impl GameSimulation for ProofSimulation {
     fn snapshot_for(&self, id: PlayerId) -> Result<SimulationSnapshot, SimulationError> {
         let snapshot = self.demo.snapshot()?;
         let player = snapshot.payload[1..]
-            .chunks_exact(12)
+            .as_chunks::<12>()
+            .0
+            .iter()
             .find(|bytes| bytes[..4] == id.to_be_bytes())
             .ok_or_else(|| SimulationError::new("unknown projection recipient"))?;
         let mut payload = vec![1];
@@ -155,9 +157,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .find(|line| line.starts_with("VmRSS:"))
                 .unwrap_or("VmRSS unavailable")
                 .to_owned();
+            let runtime_tick = demo_runtime_tick_nanos()?;
             println!(
                 "{}",
-                serde_json::json!({"shutdown":true,"replayVerified":true,"tick":runtime.current_tick(),"authoritativeTickSamples":ticks,"meanTickNanos":timing.nanos.load(Ordering::Relaxed)/ticks.max(1),"maxTickNanos":timing.max_nanos.load(Ordering::Relaxed),"singleMatchProcessRss":rss})
+                serde_json::json!({"shutdown":true,"replayVerified":true,"tick":runtime.current_tick(),"simulationStepSamples":ticks,"meanSimulationStepNanos":timing.nanos.load(Ordering::Relaxed)/ticks.max(1),"maxSimulationStepNanos":timing.max_nanos.load(Ordering::Relaxed),"singleMatchProcessRss":rss,"runtimeTickWorkload":"two neutral demo players, replay capture, 1000 ticks","meanRuntimeAdvanceNanos":runtime_tick})
             );
         }
         "client" => {
@@ -170,7 +173,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let player = client.welcome().player_id;
             let epoch = client.welcome().connection_epoch;
             let payload = game_server::encode_demo_command(0, 0)?;
-            client.send_intent(1, &payload).await?;
+            // Held input is best-effort: repeat the same current intent, then
+            // observe its state before any reliable command could mask delivery.
+            for _ in 0..3 {
+                client.send_intent(1, &payload).await?;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            timeout_intent(&mut client, player).await?;
             let ack = client.command(1, &payload).await?;
             assert_eq!(ack.outcome, ReliableCommandOutcome::Applied);
             let duplicate = client.command(1, &payload).await?;
@@ -225,4 +234,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => return Err("unknown probe mode".into()),
     }
     Ok(())
+}
+
+fn demo_runtime_tick_nanos() -> Result<u128, Box<dyn std::error::Error>> {
+    use ring::rand::SecureRandom;
+    let mut runtime = MatchRuntime::new_with_replay_capture(DemoSimulation::default(), 400);
+    for _ in 0..2 {
+        let mut token = [0_u8; 16];
+        ring::rand::SystemRandom::new()
+            .fill(&mut token)
+            .map_err(|_| "probe randomness failed")?;
+        runtime.admit(game_server::ReconnectToken(token))?;
+    }
+    let start = Instant::now();
+    for _ in 0..1000 {
+        runtime.advance_tick()?;
+    }
+    Ok(start.elapsed().as_nanos() / 1000)
+}
+
+async fn timeout_intent(
+    client: &mut WebRtcClient,
+    player: PlayerId,
+) -> Result<(), Box<dyn std::error::Error>> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let snapshot = client.snapshot().await?;
+            if game_server::decode_demo_snapshot(&snapshot.payload)
+                .map_err(|_| "invalid demo snapshot")?
+                .iter()
+                .any(|entry| entry.player_id == player && entry.last_applied_sequence == 1)
+            {
+                return Ok::<_, Box<dyn std::error::Error>>(());
+            }
+        }
+    })
+    .await?
 }

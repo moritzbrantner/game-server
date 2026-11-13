@@ -68,7 +68,7 @@ impl<S: GameSimulation> WebRtcHost<S> {
     /// Keep this future alive for the host lifetime; resolve `shutdown` to stop.
     pub async fn run(
         self,
-        authorize: impl Fn(&str) -> bool,
+        authorize: impl Fn(&str) -> bool + Send + Sync + 'static,
         shutdown: impl Future<Output = ()>,
     ) -> Result<()> {
         let tick_hz = self.state.runtime.lock().await.tick_hz();
@@ -77,6 +77,7 @@ impl<S: GameSimulation> WebRtcHost<S> {
         }
         let _ticks = crate::transport::spawn_tick_loop(self.state.clone(), tick_hz);
         let mut lobby = self.lobby;
+        let authorize: Arc<dyn Fn(&str) -> bool + Send + Sync> = Arc::new(authorize);
         let mut peers = JoinSet::new();
         let mut participants: BTreeMap<String, Arc<dyn webrtc::peer_connection::PeerConnection>> =
             BTreeMap::new();
@@ -87,11 +88,7 @@ impl<S: GameSimulation> WebRtcHost<S> {
             tokio::select! {
                 _ = &mut shutdown => break Ok(()),
                 _ = heartbeat.tick() => {
-                    // An authenticated ping keeps the signaling socket observable.
-                    use futures_util::SinkExt;
-                    if lobby.socket.send(tokio_tungstenite::tungstenite::Message::Text("{\"type\":\"ping\"}".into())).await.is_err() {
-                        break Err(WebRtcError("host signaling heartbeat failed"));
-                    }
+                    if let Err(error) = lobby.heartbeat().await {break Err(error);}
                 },
                 event = lobby.receive() => {
                     let event = match event { Ok(event)=>event, Err(error)=>break Err(error) };
@@ -101,17 +98,16 @@ impl<S: GameSimulation> WebRtcHost<S> {
                             let payload = &event["payload"];
                             if payload["adapter"] != "game-server-webrtc-v1" || payload["matchId"] != self.match_id.as_str()
                                 || payload["kind"] != "offer" || !authorize(from) { continue; }
+                            if peers.len() >= 32 {continue;}
                             if let Some(previous) = participants.remove(from) {previous.close().await?;}
                             if participants.len() >= 16 {continue;}
                             let offer = match serde_json::from_value(payload["description"].clone()) {Ok(offer)=>offer,Err(_)=>continue};
                             let servers = match lobby.turn_servers().await {Ok(servers)=>servers,Err(error)=>break Err(error)};
                             let negotiation = async {
                                 let mut peer = Peer::new(servers,self.config.relay_only,&self.config.bind_ip).await?;
-                                eprintln!("WebRTC host peer created");
                                 peer.pc.set_remote_description(offer).await?;
                                 let channels = peer.create_channels().await?;
                                 let answer = peer.local_description(false).await?;
-                                eprintln!("WebRTC host ICE gathered");
                                 let mut ticket = [0_u8;32];
                                 SystemRandom::new().fill(&mut ticket).map_err(|_| WebRtcError("ticket randomness unavailable"))?;
                                 // WSS targets the authenticated participant; this ticket is single-use,
@@ -125,8 +121,9 @@ impl<S: GameSimulation> WebRtcHost<S> {
                             let finished = participant.clone();
                             let connection = Arc::clone(&peer.pc);
                             let finished_connection = Arc::clone(&connection);
+                            let authorize = Arc::clone(&authorize);
                             peers.spawn(async move {
-                                let result = serve_peer(peer,channels,ticket,state).await;
+                                let result = serve_peer(peer,channels,ticket,state,||authorize(&finished)).await;
                                 if let Err(error) = &result {eprintln!("WebRTC peer ended: {error}");}
                                 (finished,finished_connection,result)
                             });
@@ -137,7 +134,9 @@ impl<S: GameSimulation> WebRtcHost<S> {
                                 && let Some(connection) = participants.remove(id) { connection.close().await?; }
                         },
                         Some("connected"|"participant-connected"|"pong") => {},
-                        Some("error") => break Err(WebRtcError("setup service rejected host signaling")),
+                        // A peer can leave while its answer is gathering. Refusing
+                        // that one targeted signal must not stop the whole match.
+                        Some("error") => eprintln!("setup service refused a signaling operation"),
                         _ => {},
                     }
                 },
@@ -168,13 +167,13 @@ async fn serve_peer<S: GameSimulation>(
     channels: Channels,
     ticket: [u8; 32],
     state: ConnectionState<S>,
+    authorize: impl Fn() -> bool + Send + Sync,
 ) -> Result<()> {
     let mut shutdown = state.shutdown.subscribe();
     let setup = async {
         peer::opened(&channels.session).await?;
-        eprintln!("WebRTC host session open");
+        peer::send(&channels.session, &super::ADMISSION_READY).await?;
         let admission = peer::receive(&channels.session, 48).await?;
-        eprintln!("WebRTC host admission received");
         if admission.len() != 32 && admission.len() != 48 || admission[..32] != ticket {
             return Err(WebRtcError("invalid admission ticket"));
         }
@@ -187,27 +186,13 @@ async fn serve_peer<S: GameSimulation>(
         };
         Ok::<_, WebRtcError>((channels, admission))
     };
-    let admitted = timeout(NEGOTIATE_TIMEOUT, setup).await;
-    if admitted.is_err() {
-        let report = peer
-            .pc
-            .get_stats(
-                std::time::Instant::now(),
-                webrtc::peer_connection::StatsSelector::None,
-            )
-            .await;
-        for entry in report.iter() {
-            if let webrtc::peer_connection::RTCStatsReportEntry::DataChannel(channel) = entry {
-                eprintln!(
-                    "[DEBUG-86] admission channel={} received={} sent={}",
-                    channel.data_channel_identifier,
-                    channel.messages_received,
-                    channel.messages_sent
-                );
-            }
-        }
+    let (channels, admission) = timeout(NEGOTIATE_TIMEOUT, setup)
+        .await
+        .map_err(|_| WebRtcError("admission timed out"))??;
+    // Authorization may have changed while ICE and the ticket exchange ran.
+    if !authorize() {
+        return Err(WebRtcError("game admission revoked"));
     }
-    let (channels, admission) = admitted.map_err(|_| WebRtcError("admission timed out"))??;
     let token = connection::generate_reconnect_token()
         .map_err(|_| WebRtcError("reconnect randomness unavailable"))?;
     let (lease, welcome) = {
@@ -304,7 +289,8 @@ async fn established<S: GameSimulation>(
             },
             frame = peer::receive(&channels.session,peer::RELIABLE_LIMIT) => {
                 let request = crate::decode_control_request(&frame?).map_err(|_| WebRtcError("invalid reliable control"))?;
-                if controls.len() >= 4 {return Err(WebRtcError("control concurrency exceeded"));}
+                // GSCT has no request id: this ordered channel carries one exchange at a time.
+                if !controls.is_empty() {return Err(WebRtcError("control concurrency exceeded"));}
                 let runtime = Arc::clone(&state.runtime);
                 let control = Arc::clone(&state.control);
                 let handlers = Arc::clone(&state.control_handlers);
@@ -321,7 +307,10 @@ async fn established<S: GameSimulation>(
             publication = snapshots.recv()=> {
                 let publication = match publication {Ok(publication)=>publication,Err(broadcast::error::RecvError::Lagged(_))=>continue,Err(_)=>return Err(WebRtcError("snapshot source stopped"))};
                 let runtime = state.runtime.lock().await;
-                if let SnapshotPublication::CommittedPlayers(frames) = &publication && !frames.contains_key(&lease.player_id) {continue;}
+                if let SnapshotPublication::CommittedPlayers(frames) = &publication && !frames.contains_key(&lease.player_id) {
+                    runtime.validate_connection(lease.player_id,lease.connection_epoch).map_err(|_| WebRtcError("snapshot fencing refused"))?;
+                    continue;
+                }
                 let frame = connection::snapshot_for_connection(&runtime,lease,&publication).map_err(|_| WebRtcError("snapshot fencing refused"))?;
                 let tick = crate::protocol::snapshot_frame_tick(&frame).map_err(|_| WebRtcError("invalid snapshot"))?;
                 if newest_tick.is_some_and(|newest|tick<=newest) {continue;}
@@ -337,5 +326,79 @@ async fn established<S: GameSimulation>(
             _ = peer.channels.recv()=>return Err(WebRtcError("extra data channel refused")),
             _ = lane_tasks.join_next()=>return Err(WebRtcError("command lane stopped")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ready_channel_never_admits_a_wrong_ticket_or_revoked_participant() {
+        timeout(Duration::from_secs(10), async {
+            for (valid_ticket, authorized) in [(false, true), (true, false)] {
+                let mut client = Peer::new(Vec::new(), false, "127.0.0.1").await.unwrap();
+                let client_channels = client.create_channels().await.unwrap();
+                let offer = client.local_description(true).await.unwrap();
+                let mut server = Peer::new(Vec::new(), false, "127.0.0.1").await.unwrap();
+                server.pc.set_remote_description(offer).await.unwrap();
+                let server_channels = server.create_channels().await.unwrap();
+                let answer = server.local_description(false).await.unwrap();
+                client.pc.set_remote_description(answer).await.unwrap();
+
+                let runtime = Arc::new(Mutex::new(MatchRuntime::new(
+                    crate::DemoSimulation::default(),
+                    400,
+                )));
+                let (snapshots, _) = broadcast::channel(1);
+                let (shutdown, _) = broadcast::channel(1);
+                let state = ConnectionState {
+                    runtime: Arc::clone(&runtime),
+                    control: Arc::new(crate::RejectControlService),
+                    control_handlers: Arc::new(Semaphore::new(
+                        connection::MAX_CONCURRENT_CONTROL_HANDLERS,
+                    )),
+                    snapshots,
+                    shutdown,
+                    admission_gate: None,
+                };
+                let mut tasks = JoinSet::new();
+                tasks.spawn(serve_peer(
+                    server,
+                    server_channels,
+                    [42; 32],
+                    state,
+                    move || authorized,
+                ));
+                peer::opened(&client_channels.session).await.unwrap();
+                assert_eq!(
+                    peer::receive(&client_channels.session, 5).await.unwrap(),
+                    super::super::ADMISSION_READY
+                );
+                assert_eq!(runtime.lock().await.slot_count(), 0);
+                peer::send(
+                    &client_channels.session,
+                    &[if valid_ticket { 42 } else { 43 }; 32],
+                )
+                .await
+                .unwrap();
+                let failure = tasks.join_next().await.unwrap().unwrap().unwrap_err();
+                assert_eq!(
+                    failure,
+                    WebRtcError(if valid_ticket {
+                        "game admission revoked"
+                    } else {
+                        "invalid admission ticket"
+                    })
+                );
+                let runtime = runtime.lock().await;
+                assert_eq!(runtime.active_count(), 0);
+                assert_eq!(runtime.slot_count(), 0);
+                drop(runtime);
+                client.pc.close().await.unwrap();
+            }
+        })
+        .await
+        .expect("bounded native admission probe");
     }
 }

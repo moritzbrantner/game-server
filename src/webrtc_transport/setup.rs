@@ -200,6 +200,23 @@ impl Lobby {
         &self.participant.host_participant_id
     }
 
+    /// Keep the creator's existing lobby alive within its configured lifetime cap.
+    pub(super) async fn heartbeat(&mut self) -> Result<()> {
+        if now_ms()?.saturating_add(60_000) >= self.participant.expires_at
+            && self.participant.expires_at < self.participant.max_expires_at
+        {
+            self.renew().await?;
+        }
+        timeout(
+            SETUP_TIMEOUT,
+            self.socket
+                .send(Message::Text("{\"type\":\"ping\"}".into())),
+        )
+        .await
+        .map_err(|_| WebRtcError("host heartbeat timed out"))?
+        .map_err(|_| WebRtcError("host signaling heartbeat failed"))
+    }
+
     /// Obtain temporary relay credentials only from the authenticated setup interface.
     pub(super) async fn turn_servers(&self) -> Result<Vec<RTCIceServer>> {
         let body = request(
@@ -244,7 +261,6 @@ impl Lobby {
                         .as_str()
                         .ok_or(WebRtcError("missing TURN credential"))?
                         .to_owned(),
-                    ..Default::default()
                 })
             })
             .collect()

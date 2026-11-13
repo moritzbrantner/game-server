@@ -1,10 +1,11 @@
 use super::peer::{self, Channels, NEGOTIATE_TIMEOUT, Peer};
 use super::{Lobby, Result, WebRtcError};
 use crate::{
-    ControlResponse, MatchId, ReconnectToken, ReliableCommandAck, SnapshotFrame,
-    SnapshotReassembler, Welcome,
+    CommandRejectionFrame, ControlResponse, MatchId, ReconnectToken, ReliableCommandAck,
+    SnapshotFrame, SnapshotReassembler, Welcome,
 };
 use serde_json::json;
+use std::collections::VecDeque;
 use tokio::time::timeout;
 
 /// Selected-path observations only; no SDP, addresses or ICE credentials.
@@ -32,6 +33,7 @@ pub struct WebRtcClient {
     bind_ip: String,
     relay_only: bool,
     reassembler: SnapshotReassembler,
+    rejections: VecDeque<CommandRejectionFrame>,
 }
 
 impl WebRtcClient {
@@ -62,10 +64,8 @@ impl WebRtcClient {
             return Err(WebRtcError("guest needs its own lobby participant"));
         }
         let mut peer = Peer::new(lobby.turn_servers().await?, relay_only, &bind_ip).await?;
-        eprintln!("WebRTC guest peer created");
         let channels = peer.create_channels().await?;
         let offer = peer.local_description(true).await?;
-        eprintln!("WebRTC guest ICE gathered");
         let host = lobby.host_participant_id().to_owned();
         lobby.signal(&host,json!({"adapter":"game-server-webrtc-v1","kind":"offer","matchId":match_id.as_str(),"description":offer})).await?;
         let ticket = loop {
@@ -87,13 +87,15 @@ impl WebRtcClient {
             peer.pc
                 .set_remote_description(serde_json::from_value(payload["description"].clone())?)
                 .await?;
-            eprintln!("WebRTC guest answer accepted");
             break ticket;
         };
         peer::opened(&channels.session).await?;
         peer::opened(&channels.commands).await?;
         peer::opened(&channels.realtime).await?;
-        eprintln!("WebRTC guest channels open");
+        let ready = peer::receive(&channels.session, super::ADMISSION_READY.len()).await?;
+        if ready != super::ADMISSION_READY {
+            return Err(WebRtcError("invalid admission readiness marker"));
+        }
         let mut admission = ticket.to_vec();
         if let Some(token) = reconnect {
             admission.extend_from_slice(&token.0);
@@ -112,6 +114,7 @@ impl WebRtcClient {
             bind_ip,
             relay_only,
             reassembler: SnapshotReassembler::new(),
+            rejections: VecDeque::new(),
         })
     }
 
@@ -168,15 +171,50 @@ impl WebRtcClient {
     pub async fn control(&mut self, payload: &[u8]) -> Result<ControlResponse> {
         let frame = crate::encode_control_request(payload)
             .map_err(|_| WebRtcError("invalid control request"))?;
-        peer::send(&self.channels.session, &frame).await?;
-        let response = timeout(
-            std::time::Duration::from_secs(5),
-            peer::receive(&self.channels.session, peer::RELIABLE_LIMIT),
+        let exchange = async {
+            peer::send(&self.channels.session, &frame).await?;
+            loop {
+                let response = peer::receive(&self.channels.session, peer::RELIABLE_LIMIT).await?;
+                if response.get(1) == Some(&5) {
+                    if self.rejections.len() >= 32 {
+                        return Err(WebRtcError("command rejection queue full"));
+                    }
+                    self.rejections.push_back(
+                        crate::decode_command_rejection(&response)
+                            .map_err(|_| WebRtcError("invalid command rejection"))?,
+                    );
+                    continue;
+                }
+                return crate::decode_control_response(&response)
+                    .map_err(|_| WebRtcError("invalid control response"));
+            }
+        };
+        let result = timeout(std::time::Duration::from_secs(5), exchange)
+            .await
+            .unwrap_or(Err(WebRtcError("control response timed out")));
+        if result.is_err() {
+            // This channel has no exchange ids. A delayed response must never be
+            // mistaken for a later economic/control operation after a timeout.
+            self.peer.pc.close().await?;
+        }
+        result
+    }
+
+    pub fn pop_command_rejection(&mut self) -> Option<CommandRejectionFrame> {
+        self.rejections.pop_front()
+    }
+
+    pub async fn command_rejection(&mut self) -> Result<CommandRejectionFrame> {
+        if let Some(rejection) = self.pop_command_rejection() {
+            return Ok(rejection);
+        }
+        let frame = peer::receive(
+            &self.channels.session,
+            crate::MAX_COMMAND_REJECTION_PAYLOAD_BYTES + crate::COMMAND_REJECTION_HEADER_BYTES,
         )
-        .await
-        .map_err(|_| WebRtcError("control response timed out"))??;
-        crate::decode_control_response(&response)
-            .map_err(|_| WebRtcError("invalid control response"))
+        .await?;
+        crate::decode_command_rejection(&frame)
+            .map_err(|_| WebRtcError("invalid command rejection"))
     }
 
     /// Replace the transport while preserving the fenced runtime session and lane

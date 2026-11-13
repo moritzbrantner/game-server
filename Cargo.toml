@@ -28,6 +28,10 @@ required-features = ["transport"]
 name = "webrtc-proof"
 required-features = ["webrtc-transport"]
 
+[[example]]
+name = "webrtc-proof-reference"
+required-features = ["webrtc-transport"]
+
 [features]
 default = ["transport"]
 # The native host: WebTransport serving, match hosting, replay and recovery.

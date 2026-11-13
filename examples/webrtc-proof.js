@@ -44,7 +44,6 @@ async function runWebRtcProof({ lobbyId, relayOnly = false, scoped = false }) {
   }));
   let current;
   const connect = async reconnect => {
-    console.info("WebRTC browser creating peer");
     const turn = await post(`/lobbies/${lobbyId}/turn-credentials`, { participantId: participant.participantId }, participant.participantToken);
     const stun = turn.iceServers.flatMap(server => server.urls).filter(url => url.startsWith("turn:") && !url.endsWith("transport=tcp"))
       .map(url => `stun:${url.slice(5).split("?")[0]}`);
@@ -58,7 +57,6 @@ async function runWebRtcProof({ lobbyId, relayOnly = false, scoped = false }) {
     if (pc.iceGatheringState !== "complete") await deadline(new Promise(resolve => {
       pc.addEventListener("icegatheringstatechange", () => { if (pc.iceGatheringState === "complete") resolve(); });
     }));
-    console.info("WebRTC browser ICE gathered");
     signaling.send(JSON.stringify({ type: "signal", to: participant.hostParticipantId,
       payload: { adapter: "game-server-webrtc-v1", kind: "offer", matchId: "webrtc-proof", description: pc.localDescription } }));
     let ticket;
@@ -68,15 +66,13 @@ async function runWebRtcProof({ lobbyId, relayOnly = false, scoped = false }) {
       ticket = event.payload.ticket;
       assert(Array.isArray(ticket) && ticket.length === 32, "invalid admission ticket");
       await pc.setRemoteDescription(event.payload.description);
-      console.info("WebRTC browser answer accepted");
       break;
     }
     await deadline(Promise.all([session, realtime, commands].map(channel => channel.readyState === "open" ? Promise.resolve() : new Promise(resolve => channel.addEventListener("open", resolve, { once: true })))));
-    console.info("WebRTC browser channels open");
+    const ready = new Uint8Array(await nextSession());
+    assert(ready.length === 5 && ready.every((byte, index) => byte === [71,83,65,68,1][index]), "invalid admission readiness marker");
     session.send(new Uint8Array([...ticket, ...(reconnect || [])]));
-    setTimeout(() => console.info("WebRTC browser sent admission " + JSON.stringify({buffered:session.bufferedAmount,connection:pc.connectionState,ice:pc.iceConnectionState})),1000);
     const welcome = new Uint8Array(await nextSession());
-    console.info("WebRTC browser welcome received");
     assert(welcome.length === 46 && welcome[0] === 3 && welcome[1] === 3, "invalid welcome");
     commands.send(new Uint8Array([71, 83, 67, 76, 1, 3]));
     return { pc, realtime, session, commands, nextSnapshot, nextSession, nextAck, welcome };
@@ -92,7 +88,20 @@ async function runWebRtcProof({ lobbyId, relayOnly = false, scoped = false }) {
       const ack = new Uint8Array(await current.nextAck());
       assert(ack.length === 7 && ack[0] === 3 && ack[1] === 6 && new DataView(ack.buffer).getUint32(2) === sequence && ack[6] === outcome, "wrong reliable acknowledgement");
     };
-    current.realtime.send(command(1));
+    for (let i = 0; i < 3; i++) {
+      current.realtime.send(command(1));
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
+    for (;;) {
+      const frame = new Uint8Array(await current.nextSnapshot());
+      assert(frame[0] === 3 && frame[1] === 2, "invalid intent snapshot");
+      const candidate = frame.slice(20), view = new DataView(candidate.buffer);
+      let delivered = false;
+      for (let offset = 1; offset < candidate.length; offset += 12) {
+        if (view.getUint32(offset) === playerId && view.getUint32(offset + 8) === 1) delivered = true;
+      }
+      if (delivered) break;
+    }
     await sendCommand(1, 1); await sendCommand(1, 2);
     const old = current;
     const reconnectStart = performance.now();

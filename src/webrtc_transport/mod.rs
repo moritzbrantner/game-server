@@ -40,3 +40,6 @@ impl From<serde_json::Error> for WebRtcError {
 }
 
 type Result<T> = std::result::Result<T, WebRtcError>;
+
+/// Server-first admission readiness marker on negotiated session channel 1.
+pub const ADMISSION_READY: [u8; 5] = *b"GSAD\x01";
