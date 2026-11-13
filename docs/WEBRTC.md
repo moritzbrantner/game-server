@@ -106,7 +106,8 @@ Reconnect negotiates again; old handles never migrate to the replacement epoch.
 
 Requests and responses each contain at most `MAX_CONTENT_BYTES` (16 KiB).
 There is one outstanding exchange across handle clones, one handler per peer and
-four active handlers per host. Busy callers fail without queuing work. Each chunk
+four active handlers per host. Busy callers fail without queuing work; host handler
+saturation returns a content refusal while keeping gameplay connected. Each chunk
 waits at least 10 ms before lookup; exchanges and handlers have five-second bounds.
 The existing provider limits each channel's send buffer to 64 KiB and bounds its
 receive event queues. Responses use nonblocking enqueue so content cannot wait on

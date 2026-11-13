@@ -582,7 +582,7 @@ async fn established<S: GameSimulation>(
                     timeout(Duration::from_secs(5), async {
                         // One active operation per peer; four across the host. No queued
                         // external jobs. A paced chunk leaves room for gameplay traffic.
-                        let _permit = binding.permits.try_acquire().map_err(|_|WebRtcError("content service busy"))?;
+                        let Ok(_permit) = binding.permits.try_acquire() else {return Ok(vec![0]);};
                         tokio::time::sleep(Duration::from_millis(10)).await;
                         {
                             let runtime = runtime.lock().await;
@@ -606,6 +606,98 @@ async fn established<S: GameSimulation>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct EchoContent;
+    impl super::super::WebRtcContentService for EchoContent {
+        fn handle<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a MatchId,
+            _: ControlContext,
+            request: &'a [u8],
+        ) -> super::super::WebRtcContentFuture<'a> {
+            Box::pin(async move { Ok(request.to_vec()) })
+        }
+    }
+    impl WebRtcControlService for EchoContent {
+        fn handle(
+            &self,
+            _: &str,
+            _: &MatchId,
+            _: ControlContext,
+            payload: &[u8],
+        ) -> std::result::Result<Vec<u8>, ControlServiceError> {
+            Ok(payload.to_vec())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn saturated_content_refuses_without_disconnect_and_recovers() {
+        timeout(Duration::from_secs(10), async {
+            let id = MatchId::new("saturated").unwrap();
+            let mut matches = crate::MatchHost::new(1).unwrap();
+            matches
+                .insert(
+                    id.clone(),
+                    MatchRuntime::new(crate::DemoSimulation::default(), 400),
+                )
+                .unwrap();
+            let host = LiveMatchHost::new(matches);
+            host.claim().unwrap();
+            host.start().await;
+            let (lobby, guest, _signaling) = super::super::setup::test_support::lobbies().await;
+            let adapter = WebRtcHost::attach(
+                lobby,
+                host.clone(),
+                id.clone(),
+                Arc::new(EchoContent),
+                WebRtcHostConfig {
+                    bind_ip: "127.0.0.1".to_owned(),
+                    relay_only: false,
+                },
+            )
+            .unwrap()
+            .with_content_service(Arc::new(EchoContent));
+            // Exhaust the actual shared handler pool without extra peers or jobs.
+            let pool = Arc::clone(&adapter.content_permits);
+            let saturated = pool.acquire_many(4).await.unwrap();
+            let (stop, shutdown) = tokio::sync::oneshot::channel();
+            let mut tasks = JoinSet::new();
+            tasks.spawn(adapter.run(|_| true, async {
+                let _ = shutdown.await;
+            }));
+            let mut client = super::super::WebRtcClient::connect_with_content_authorization(
+                guest,
+                id,
+                "127.0.0.1",
+                false,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+            let content = client.content_client().unwrap();
+            assert_eq!(
+                content.request(b"full").await,
+                Err(super::super::WebRtcContentError::Refused)
+            );
+            assert_eq!(
+                client.control(b"still connected").await.unwrap().payload,
+                b"still connected"
+            );
+            assert!(client.snapshot().await.unwrap().tick > 0);
+            drop(saturated);
+            assert_eq!(
+                content.request(b"capacity restored").await.unwrap(),
+                b"capacity restored"
+            );
+            client.close().await.unwrap();
+            stop.send(()).unwrap();
+            tasks.join_next().await.unwrap().unwrap().unwrap();
+            host.stop().await;
+        })
+        .await
+        .expect("bounded content saturation probe");
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ready_channel_never_admits_a_wrong_ticket_or_revoked_participant() {
