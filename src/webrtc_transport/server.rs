@@ -80,6 +80,8 @@ pub struct WebRtcHost<S> {
     state: ConnectionState<S>,
     config: WebRtcHostConfig,
     managed: Option<ManagedAttachment<S>>,
+    content: Option<Arc<dyn super::WebRtcContentService>>,
+    content_permits: Arc<Semaphore>,
 }
 
 impl<S: GameSimulation> WebRtcHost<S> {
@@ -109,6 +111,8 @@ impl<S: GameSimulation> WebRtcHost<S> {
             state,
             config,
             managed: None,
+            content: None,
+            content_permits: Arc::new(Semaphore::new(4)),
         })
     }
 
@@ -131,12 +135,20 @@ impl<S: GameSimulation> WebRtcHost<S> {
             match_id,
             state,
             config,
+            content: None,
+            content_permits: Arc::new(Semaphore::new(4)),
             managed: Some(ManagedAttachment {
                 host,
                 stopped,
                 control,
             }),
         })
+    }
+
+    /// Enables opaque bounded requests on an optional channel of the admitted peer.
+    pub fn with_content_service(mut self, service: Arc<dyn super::WebRtcContentService>) -> Self {
+        self.content = Some(service);
+        self
     }
 
     pub fn lobby_id(&self) -> &str {
@@ -251,16 +263,18 @@ impl<S: GameSimulation> WebRtcHost<S> {
                             if participants.len() >= 16 {continue;}
                             let offer = match serde_json::from_value(payload["description"].clone()) {Ok(offer)=>offer,Err(_)=>continue};
                             let servers = match lobby.turn_servers().await {Ok(servers)=>servers,Err(error)=>break Err(error)};
+                            let content_enabled = self.content.is_some() && payload["contentVersion"] == 1;
                             let negotiation = async {
                                 let mut peer = Peer::new(servers,self.config.relay_only,&self.config.bind_ip).await?;
                                 peer.pc.set_remote_description(offer).await?;
-                                let channels = peer.create_channels().await?;
+                                let mut channels = peer.create_channels().await?;
+                                if content_enabled {channels.content = Some(peer.create_content_channel().await?);}
                                 let answer = peer.local_description(false).await?;
                                 let mut ticket = [0_u8;32];
                                 SystemRandom::new().fill(&mut ticket).map_err(|_| WebRtcError("ticket randomness unavailable"))?;
                                 // WSS targets the authenticated participant; this ticket is single-use,
                                 // match/lobby/DTLS-offer scoped and expires with the negotiation deadline.
-                                lobby.signal(from,json!({"adapter":"game-server-webrtc-v1","kind":"answer","matchId":self.match_id.as_str(),"description":answer,"ticket":ticket})).await?;
+                                lobby.signal(from,json!({"adapter":"game-server-webrtc-v1","kind":"answer","matchId":self.match_id.as_str(),"description":answer,"ticket":ticket,"contentVersion":if content_enabled {Some(1)} else {None}})).await?;
                                 Ok::<_,WebRtcError>((peer,channels,ticket))
                             };
                             let (peer,channels,ticket) = match timeout(NEGOTIATE_TIMEOUT,negotiation).await {Ok(Ok(result))=>result,Ok(Err(error))=>{eprintln!("WebRTC negotiation failed: {error}");continue},Err(_)=>{eprintln!("WebRTC host negotiation timed out");continue}};
@@ -274,9 +288,10 @@ impl<S: GameSimulation> WebRtcHost<S> {
                             let finished_connection = Arc::clone(&connection);
                             let authorize = Arc::clone(&revalidate);
                             let managed_host = self.managed.as_ref().map(|managed| managed.host.clone());
+                            let content = self.content.as_ref().filter(|_|content_enabled).map(|service| super::content::ContentBinding {service:Arc::clone(service), participant: participant.clone(), match_id: self.match_id.clone(), permits: Arc::clone(&self.content_permits)});
                             peers.spawn(async move {
                                 let authorized_participant = finished.clone();
-                                let result = serve_peer(peer,channels,ticket,state,move ||authorize(&authorized_participant) && managed_host.as_ref().is_none_or(|host|host.is_serving())).await;
+                                let result = serve_peer(peer,channels,ticket,state,content,move ||authorize(&authorized_participant) && managed_host.as_ref().is_none_or(|host|host.is_serving())).await;
                                 if let Err(error) = &result {eprintln!("WebRTC peer ended: {error}");}
                                 (finished,finished_connection,result)
                             });
@@ -347,6 +362,7 @@ async fn serve_peer<S: GameSimulation>(
     channels: Channels,
     ticket: [u8; 32],
     mut state: ConnectionState<S>,
+    content: Option<super::content::ContentBinding>,
     authorize: impl Fn() -> bool + Send + Sync + 'static,
 ) -> Result<()> {
     let authorize: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(authorize);
@@ -423,6 +439,7 @@ async fn serve_peer<S: GameSimulation>(
                 &state,
                 &mut shutdown,
                 &authorize,
+                content,
             )
             .await
         }
@@ -443,6 +460,7 @@ async fn established<S: GameSimulation>(
     state: &ConnectionState<S>,
     shutdown: &mut broadcast::Receiver<()>,
     authorize: &Arc<dyn Fn() -> bool + Send + Sync>,
+    content: Option<super::content::ContentBinding>,
 ) -> Result<()> {
     let mut snapshots = state.snapshots.subscribe();
     let mut newest_tick = None;
@@ -465,6 +483,8 @@ async fn established<S: GameSimulation>(
     let mut acks = [0_u8; crate::RELIABLE_COMMAND_ACK_BYTES];
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut controls = JoinSet::new();
+    let mut content_tasks: JoinSet<Result<Vec<u8>>> = JoinSet::new();
+    let content = content.map(Arc::new);
     let mut authorization_poll = tokio::time::interval(Duration::from_millis(100));
     loop {
         if !authorize() {
@@ -544,6 +564,41 @@ async fn established<S: GameSimulation>(
             _ = peer.closed.changed()=>return Ok(()),
             _ = peer.channels.recv()=>return Err(WebRtcError("extra data channel refused")),
             _ = lane_tasks.join_next()=>return Err(WebRtcError("command lane stopped")),
+            result = content_tasks.join_next(), if !content_tasks.is_empty() => {
+                let response = result.ok_or(WebRtcError("content task missing"))?.map_err(|_|WebRtcError("content task failed"))??;
+                let runtime = state.runtime.lock().await;
+                if !authorize() || runtime.is_draining() {return Err(WebRtcError("content access revoked"));}
+                runtime.validate_connection(lease.player_id,lease.connection_epoch).map_err(|_|WebRtcError("content fencing refused"))?;
+                // Only nonblocking provider enqueue shares this lock, never content I/O.
+                channels.content.as_ref().ok_or(WebRtcError("content unavailable"))?.try_send(bytes::BytesMut::from(response.as_slice())).await?;
+            },
+            request = async {match &channels.content {Some(channel)=>peer::receive(channel,super::MAX_CONTENT_BYTES).await,None=>std::future::pending().await}} => {
+                let request = request?;
+                if !content_tasks.is_empty() {return Err(WebRtcError("content concurrency exceeded"));}
+                let binding = Arc::clone(content.as_ref().ok_or(WebRtcError("content unavailable"))?);
+                let runtime = Arc::clone(&state.runtime);
+                let authorize = Arc::clone(authorize);
+                content_tasks.spawn(async move {
+                    timeout(Duration::from_secs(5), async {
+                        // One active operation per peer; four across the host. No queued
+                        // external jobs. A paced chunk leaves room for gameplay traffic.
+                        let Ok(_permit) = binding.permits.try_acquire() else {return Ok(vec![0]);};
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        {
+                            let runtime = runtime.lock().await;
+                            if !authorize() || runtime.is_draining() {return Err(WebRtcError("content access revoked"));}
+                            runtime.validate_connection(lease.player_id,lease.connection_epoch).map_err(|_|WebRtcError("content fencing refused"))?;
+                        }
+                        let result = binding.service.handle(&binding.participant,&binding.match_id,ControlContext{player_id:lease.player_id,connection_epoch:lease.connection_epoch},&request).await;
+                        let mut response = vec![u8::from(result.is_ok())];
+                        if let Ok(payload) = result {
+                            if payload.len()>super::MAX_CONTENT_BYTES {return Err(WebRtcError("content response exceeds limit"));}
+                            response.extend_from_slice(&payload);
+                        }
+                        Ok(response)
+                    }).await.map_err(|_|WebRtcError("content service timed out"))?
+                });
+            },
         }
     }
 }
@@ -551,6 +606,98 @@ async fn established<S: GameSimulation>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct EchoContent;
+    impl super::super::WebRtcContentService for EchoContent {
+        fn handle<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a MatchId,
+            _: ControlContext,
+            request: &'a [u8],
+        ) -> super::super::WebRtcContentFuture<'a> {
+            Box::pin(async move { Ok(request.to_vec()) })
+        }
+    }
+    impl WebRtcControlService for EchoContent {
+        fn handle(
+            &self,
+            _: &str,
+            _: &MatchId,
+            _: ControlContext,
+            payload: &[u8],
+        ) -> std::result::Result<Vec<u8>, ControlServiceError> {
+            Ok(payload.to_vec())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn saturated_content_refuses_without_disconnect_and_recovers() {
+        timeout(Duration::from_secs(10), async {
+            let id = MatchId::new("saturated").unwrap();
+            let mut matches = crate::MatchHost::new(1).unwrap();
+            matches
+                .insert(
+                    id.clone(),
+                    MatchRuntime::new(crate::DemoSimulation::default(), 400),
+                )
+                .unwrap();
+            let host = LiveMatchHost::new(matches);
+            host.claim().unwrap();
+            host.start().await;
+            let (lobby, guest, _signaling) = super::super::setup::test_support::lobbies().await;
+            let adapter = WebRtcHost::attach(
+                lobby,
+                host.clone(),
+                id.clone(),
+                Arc::new(EchoContent),
+                WebRtcHostConfig {
+                    bind_ip: "127.0.0.1".to_owned(),
+                    relay_only: false,
+                },
+            )
+            .unwrap()
+            .with_content_service(Arc::new(EchoContent));
+            // Exhaust the actual shared handler pool without extra peers or jobs.
+            let pool = Arc::clone(&adapter.content_permits);
+            let saturated = pool.acquire_many(4).await.unwrap();
+            let (stop, shutdown) = tokio::sync::oneshot::channel();
+            let mut tasks = JoinSet::new();
+            tasks.spawn(adapter.run(|_| true, async {
+                let _ = shutdown.await;
+            }));
+            let mut client = super::super::WebRtcClient::connect_with_content_authorization(
+                guest,
+                id,
+                "127.0.0.1",
+                false,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+            let content = client.content_client().unwrap();
+            assert_eq!(
+                content.request(b"full").await,
+                Err(super::super::WebRtcContentError::Refused)
+            );
+            assert_eq!(
+                client.control(b"still connected").await.unwrap().payload,
+                b"still connected"
+            );
+            assert!(client.snapshot().await.unwrap().tick > 0);
+            drop(saturated);
+            assert_eq!(
+                content.request(b"capacity restored").await.unwrap(),
+                b"capacity restored"
+            );
+            client.close().await.unwrap();
+            stop.send(()).unwrap();
+            tasks.join_next().await.unwrap().unwrap().unwrap();
+            host.stop().await;
+        })
+        .await
+        .expect("bounded content saturation probe");
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ready_channel_never_admits_a_wrong_ticket_or_revoked_participant() {
@@ -587,6 +734,7 @@ mod tests {
                     server_channels,
                     [42; 32],
                     state,
+                    None,
                     move || authorized,
                 ));
                 peer::opened(&client_channels.session).await.unwrap();
