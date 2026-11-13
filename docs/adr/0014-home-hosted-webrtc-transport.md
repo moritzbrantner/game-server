@@ -1,6 +1,11 @@
 # Home-hosted WebRTC transport alongside dedicated WebTransport
 
-Status: accepted architectural direction (owner choice A, 2026-11-10); implementation and real-network acceptance pending.
+Status: accepted architectural direction (owner choice A, 2026-11-10); opt-in implementation and bounded proof delivered in #86.
+
+Implementation update (#86): the opt-in native/browser adapter and bounded direct,
+TURN and restricted-network proof are described in [WebRTC](../WEBRTC.md) and
+[the channel/admission mapping](0015-webrtc-session-channels.md). Dedicated
+WebTransport remains the default; MMORPG consumer stages remain separately owned.
 
 ## Decision
 
