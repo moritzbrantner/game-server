@@ -99,6 +99,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let route_prefix = BrowserRoutePrefix::new(session_path)?;
         let transport_config = MatchHostWebTransportConfig {
             port,
+            bind_ip: None,
             certificate_pem,
             private_key_pem,
             route_prefix,

@@ -726,6 +726,7 @@ mod tests {
             let prefix = BrowserRoutePrefix::new("/game").unwrap();
             let config = MatchHostWebTransportConfig {
                 port,
+                bind_ip: None,
                 certificate_pem: cert,
                 private_key_pem: key,
                 route_prefix: prefix.clone(),

@@ -22,7 +22,14 @@ The probe intentionally permits its ephemeral test lobby's participants.
 ### Managed host attachment
 
 For `PreparedLiveMatchHost` consumers, retain `prepared.host()` and start the
-existing managed serving/recovery future. Once `host.is_serving()` is true, use
+existing managed serving/recovery future. For an owner-only local listener, set
+`MatchHostWebTransportConfig::bind_ip` to
+`Some(std::net::Ipv4Addr::LOCALHOST.into())` before starting that future. This
+keeps native QUIC admission on loopback while WebRTC uses game approval; an
+Origin allowlist alone does not restrict native QUIC peers. Dedicated servers
+retain their dual-stack wildcard bind with `bind_ip: None`.
+
+Once `host.is_serving()` is true, use
 `WebRtcHost::attach(lobby, host.clone(), match_id, control, config)` and keep its
 `run_with_authorization` future alive beside that owner. `attach` rejects an
 unstarted host or unknown match. It retains the existing private runtime and
