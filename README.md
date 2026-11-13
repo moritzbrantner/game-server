@@ -9,7 +9,7 @@ Reusable server-authoritative multiplayer runtime extracted from the proven `ser
 - server-owned match/session identity and lifecycle;
 - deterministic tick scheduling and command ingestion;
 - authoritative snapshots and replay evidence;
-- WebTransport/HTTP/3 transport adapters;
+- WebTransport/HTTP/3 and opt-in WebRTC DataChannel transport adapters;
 - reconnect/resume semantics and graceful recovery;
 - multi-match process hosting and draining.
 
@@ -20,6 +20,12 @@ Single-match and hosted listeners share one internal connection module for admis
 The welcome, command rejections and control responses count as delivered once the server has written and finished them locally. The server does not wait for the client's ACK, and a client that reads exactly one frame and drops the stream is fine. The five-second welcome bound covers opening and writing. Rollback applies only to a welcome that was never completely written, so the token from a received welcome stays valid: after an outage the session is usable on the same connection, or the connection ends and that token (the latest one, after a reconnect) resumes the same player within grace. See [the local stream finish decision](docs/adr/0009-local-stream-finish.md).
 
 ## Browser integration contract
+
+The optional `webrtc-transport` feature adds native home-host and guest adapters
+over the existing setup-service lobby, signaling and short-lived TURN interface.
+Normal ICE prefers direct connectivity and falls back to TURN; the dedicated
+WebTransport adapter and its wire formats retain their behavior. See
+[WebRTC setup, channel mapping and real-network probes](docs/WEBRTC.md).
 
 `browser` exposes the versioned browser-facing boundary without creating a second gameplay protocol. `BROWSER_PROTOCOL_CONTRACT` binds the route version to the existing command/snapshot protocol version, reliable-control format version, reconnect-token size, payload ceilings, snapshot fragment bound, and reliable command lane format (lane format version, header and ack sizes, one lane per connection) so browser clients can pin one explicit compatibility surface.
 

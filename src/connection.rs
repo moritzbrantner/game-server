@@ -266,7 +266,7 @@ fn finish_locally(stream: &mut SendStream) -> Result<(), String> {
         .map_err(|_| "stream was already finished or reset".to_owned())
 }
 
-fn rollback_failed_welcome<S: GameSimulation>(
+pub(crate) fn rollback_failed_welcome<S: GameSimulation>(
     runtime: &mut MatchRuntime<S>,
     admission: AdmissionRequest,
     lease: SessionLease,
@@ -739,7 +739,7 @@ async fn read_lane_bytes<R: AsyncRead + Unpin>(
         .map_err(|error| LaneFailure::protocol(format!("reliable command lane read: {error}")))
 }
 
-fn snapshot_for_connection<'a, S: GameSimulation>(
+pub(crate) fn snapshot_for_connection<'a, S: GameSimulation>(
     runtime: &MatchRuntime<S>,
     lease: SessionLease,
     publication: &'a SnapshotPublication,
@@ -863,7 +863,7 @@ fn send_snapshot(
     Ok(SnapshotDelivery::Fragmented)
 }
 
-async fn dispatch_control<S: GameSimulation>(
+pub(crate) async fn dispatch_control<S: GameSimulation>(
     runtime: Arc<Mutex<MatchRuntime<S>>>,
     context: ControlContext,
     control: Arc<dyn ControlService>,
@@ -894,7 +894,7 @@ async fn dispatch_control<S: GameSimulation>(
         .map_err(|error| format!("reliable-control handler task failed: {error}"))?
 }
 
-fn generate_reconnect_token() -> Result<ReconnectToken, String> {
+pub(crate) fn generate_reconnect_token() -> Result<ReconnectToken, String> {
     let mut bytes = [0_u8; RECONNECT_TOKEN_BYTES];
     SystemRandom::new()
         .fill(&mut bytes)

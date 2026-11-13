@@ -317,7 +317,10 @@ fn consume_recovery_file(path: &Path) -> Result<(), TransportError> {
     Ok(())
 }
 
-fn spawn_tick_loop<S: GameSimulation>(state: ServerState<S>, tick_hz: u16) -> JoinSet<()> {
+pub(crate) fn spawn_tick_loop<S: GameSimulation>(
+    state: ServerState<S>,
+    tick_hz: u16,
+) -> JoinSet<()> {
     let mut tasks = JoinSet::new();
     tasks.spawn(async move {
         let mut ticker =
