@@ -9,7 +9,7 @@ mod server;
 mod setup;
 
 pub use client::{ConnectionMetrics, WebRtcClient};
-pub use server::{WebRtcHost, WebRtcHostConfig};
+pub use server::{WebRtcControlService, WebRtcHost, WebRtcHostConfig};
 
 pub use setup::{Lobby, SetupConfig};
 
@@ -43,3 +43,9 @@ type Result<T> = std::result::Result<T, WebRtcError>;
 
 /// Server-first admission readiness marker on negotiated session channel 1.
 pub const ADMISSION_READY: [u8; 5] = *b"GSAD\x01";
+
+/// Maximum opaque game-owned proof carried with a signaling offer.
+pub const MAX_AUTHORIZATION_BYTES: usize = 1024;
+
+#[cfg(test)]
+mod managed_tests;

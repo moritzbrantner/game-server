@@ -636,8 +636,8 @@ impl LaneFailure {
 /// that does not read them stalls only this lane, never the connection loop. A FIN
 /// at a frame boundary ends the lane cleanly; any other lane fault fails closed.
 pub(crate) async fn run_command_lane<S, R, W>(
-    mut recv: R,
-    mut send: W,
+    recv: R,
+    send: W,
     runtime: Arc<Mutex<MatchRuntime<S>>>,
     lease: SessionLease,
     frame_timeout: Duration,
@@ -646,6 +646,23 @@ where
     S: GameSimulation,
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
+{
+    run_command_lane_with_authorization(recv, send, runtime, lease, frame_timeout, || true).await
+}
+
+pub(crate) async fn run_command_lane_with_authorization<S, R, W, A>(
+    mut recv: R,
+    mut send: W,
+    runtime: Arc<Mutex<MatchRuntime<S>>>,
+    lease: SessionLease,
+    frame_timeout: Duration,
+    authorize: A,
+) -> Result<(), LaneFailure>
+where
+    S: GameSimulation,
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+    A: Fn() -> bool,
 {
     let mut header = [0_u8; COMMAND_LANE_HEADER_BYTES];
     header[..STREAM_CLASS_BYTES].copy_from_slice(COMMAND_LANE_MAGIC);
@@ -688,13 +705,18 @@ where
         let command = decode_command(&frame)
             .map_err(|error| LaneFailure::protocol(format!("reliable command frame: {error}")))?;
 
-        let submitted = runtime.lock().await.submit_lane_command(
+        let mut guard = runtime.lock().await;
+        if !authorize() {
+            return Err(LaneFailure::protocol("game admission revoked"));
+        }
+        let submitted = guard.submit_lane_command(
             lease.player_id,
             lease.connection_epoch,
             CommandLane::Reliable,
             command.sequence,
             &command.payload,
         );
+        drop(guard);
         let outcome = match submitted {
             Ok(CommandOutcome::Applied) => ReliableCommandOutcome::Applied,
             Ok(CommandOutcome::IgnoredStale) => ReliableCommandOutcome::Duplicate,

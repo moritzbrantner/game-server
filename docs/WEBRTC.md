@@ -19,6 +19,49 @@ membership or possession of a public invite must not stand in for that policy.
 The callback is checked before issuing a ticket and before admitting a player.
 The probe intentionally permits its ephemeral test lobby's participants.
 
+### Managed host attachment
+
+For `PreparedLiveMatchHost` consumers, retain `prepared.host()` and start the
+existing managed serving/recovery future. Once `host.is_serving()` is true, use
+`WebRtcHost::attach(lobby, host.clone(), match_id, control, config)` and keep its
+`run_with_authorization` future alive beside that owner. `attach` rejects an
+unstarted host or unknown match. It retains the existing private runtime and
+snapshot source; it never starts another tick loop or claims host ownership.
+Committed publications, player projections, command sequencing and recovery
+therefore pass through the original managed lifecycle.
+
+The attachment's `control` implements `WebRtcControlService::handle(participant_id,
+match_id, context, payload)`. The participant comes from authenticated signaling;
+`context` contains the runtime-assigned player and connection epoch and retains
+the ordinary control dispatch fencing. Games bind that participant to their own
+approved character/entitlement before protected operations and recheck revocation
+when performing delayed external side effects. Do not expose a trusted LAN
+arbitrary-character claim handler as public guest authorization.
+
+Guests can use `WebRtcClient::connect_with_authorization(lobby, match_id, bind_ip,
+relay_only, proof)` with at most `MAX_AUTHORIZATION_BYTES` (1,024) opaque bytes.
+The optional offer field `authorization` carries this game-owned proof; missing
+means empty for existing clients. Proofs stay in memory, including same-participant
+reconnect, and must not enter diagnostics or invitations. Proof interpretation,
+identity and durable entitlement storage belong to the game.
+
+`run_with_authorization(authorize, revalidate, shutdown)` takes an asynchronous
+`authorize(participant_id: String, proof: Vec<u8>) -> bool` and a cheap synchronous
+`revalidate(&str) -> bool`. Up to 32 approvals can wait, one per participant, each
+bounded to 60 seconds while signaling and heartbeat continue. This permits host
+approval before a ticket is issued. Revalidation runs before ticket creation,
+again at runtime admission, and during an established peer's lifetime (idle bound
+100 ms). Revocation closes the peer and disconnects its current lease. Clients
+bound the entire connection/reconnection attempt to 100 seconds.
+
+Stopping the attachment closes only its WebRTC peers and leaves the managed host
+serving. Managed drain, match retirement or owner shutdown ends the attachment;
+the original owner retains freeze/save/recovery responsibilities. Dedicated
+WebTransport connections keep their original control service and lifecycle. The
+standalone `WebRtcHost::new` / synchronous `run` path remains available and owns
+its tick loop, drain and freeze as before. Gameplay/control wire layouts are
+unchanged; the authorization field extends only the setup signaling offer.
+
 The host heartbeats every 20 seconds and renews near expiry only when its existing
 setup lifetime cap allows it. Signaling expiry/disconnect ends hosting; ordinary
 shutdown drains, releases connections and freezes the runtime for the owning game
@@ -28,7 +71,9 @@ does not implement MMORPG's later native launcher or missing-asset stages.
 
 `WebRtcClient` uses the same welcome, intent, snapshot and reliable-command codecs
 as WebTransport. Retain the welcome token in memory; `reconnect` preserves player
-identity and reliable-lane watermarks while rotating the token/epoch. Control is
+identity and reliable-lane watermarks while rotating the token/epoch.
+`disconnect(&self)` closes transport while retaining those reconnect capabilities;
+`close(self)` consumes them. Control is
 serialized on its reliable channel; after a control timeout reconnect before
 issuing another exchange. Private command rejections can be read through
 `command_rejection` or drained with `pop_command_rejection` after control reads.

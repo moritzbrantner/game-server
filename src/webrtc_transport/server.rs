@@ -2,8 +2,8 @@ use super::peer::{self, Channels, NEGOTIATE_TIMEOUT, Peer};
 use super::{Lobby, Result, WebRtcError};
 use crate::connection::{self, AdmissionRequest, ConnectionState, SnapshotPublication};
 use crate::{
-    ControlContext, ControlService, GameSimulation, MatchId, MatchRuntime, ReconnectToken,
-    SessionLease, Welcome,
+    ControlContext, ControlService, ControlServiceError, GameSimulation, LiveMatchHost, MatchId,
+    MatchRuntime, ReconnectToken, SessionLease, Welcome,
 };
 use ring::rand::{SecureRandom, SystemRandom};
 use serde_json::json;
@@ -22,12 +22,64 @@ pub struct WebRtcHostConfig {
     pub relay_only: bool,
 }
 
+/// Game-owned control receives the authenticated signaling participant, never a capability.
+/// The ordinary dispatch path still validates the connection epoch before invocation.
+pub trait WebRtcControlService: Send + Sync + 'static {
+    fn handle(
+        &self,
+        participant_id: &str,
+        match_id: &MatchId,
+        context: ControlContext,
+        payload: &[u8],
+    ) -> std::result::Result<Vec<u8>, ControlServiceError>;
+}
+
+struct ParticipantControl {
+    service: Arc<dyn WebRtcControlService>,
+    participant_id: String,
+    match_id: MatchId,
+}
+impl ControlService for ParticipantControl {
+    fn handle(
+        &self,
+        context: ControlContext,
+        payload: &[u8],
+    ) -> std::result::Result<Vec<u8>, ControlServiceError> {
+        self.service
+            .handle(&self.participant_id, &self.match_id, context, payload)
+    }
+}
+
+struct AuthorizedControl {
+    inner: Arc<dyn ControlService>,
+    authorize: Arc<dyn Fn() -> bool + Send + Sync>,
+}
+impl ControlService for AuthorizedControl {
+    fn handle(
+        &self,
+        context: ControlContext,
+        payload: &[u8],
+    ) -> std::result::Result<Vec<u8>, ControlServiceError> {
+        if !(self.authorize)() {
+            return Err(ControlServiceError::new("game admission revoked"));
+        }
+        self.inner.handle(context, payload)
+    }
+}
+
+struct ManagedAttachment<S> {
+    host: LiveMatchHost<S>,
+    stopped: broadcast::Receiver<()>,
+    control: Arc<dyn WebRtcControlService>,
+}
+
 /// One authoritative match and one setup lobby. Games retain their runtime/storage.
 pub struct WebRtcHost<S> {
     lobby: Lobby,
     match_id: MatchId,
     state: ConnectionState<S>,
     config: WebRtcHostConfig,
+    managed: Option<ManagedAttachment<S>>,
 }
 
 impl<S: GameSimulation> WebRtcHost<S> {
@@ -56,6 +108,34 @@ impl<S: GameSimulation> WebRtcHost<S> {
             match_id,
             state,
             config,
+            managed: None,
+        })
+    }
+
+    /// Attaches to an already serving managed match. Its existing owner retains
+    /// ticking, persistence, recovery and shutdown. Stopping this sidecar closes
+    /// only its peers; it never drains or freezes the shared runtime.
+    pub fn attach(
+        lobby: Lobby,
+        host: LiveMatchHost<S>,
+        match_id: MatchId,
+        control: Arc<dyn WebRtcControlService>,
+        config: WebRtcHostConfig,
+    ) -> Result<Self> {
+        let (state, stopped) = managed_state(&host, &match_id)?;
+        if lobby.participant_id() != lobby.host_participant_id() {
+            return Err(WebRtcError("native host must create its lobby"));
+        }
+        Ok(Self {
+            lobby,
+            match_id,
+            state,
+            config,
+            managed: Some(ManagedAttachment {
+                host,
+                stopped,
+                control,
+            }),
         })
     }
 
@@ -71,13 +151,46 @@ impl<S: GameSimulation> WebRtcHost<S> {
         authorize: impl Fn(&str) -> bool + Send + Sync + 'static,
         shutdown: impl Future<Output = ()>,
     ) -> Result<()> {
+        let authorize = Arc::new(authorize);
+        let approval = Arc::clone(&authorize);
+        self.run_with_authorization(
+            move |participant, _authorization| {
+                let approved = approval(&participant);
+                async move { approved }
+            },
+            move |participant| authorize(participant),
+            shutdown,
+        )
+        .await
+    }
+
+    /// Approval has a 60-second bound and runs without blocking signaling or
+    /// heartbeat. Revalidation must be cheap and current; it runs before ticket
+    /// creation and again under the runtime lock immediately before admission.
+    pub async fn run_with_authorization<F, A>(
+        mut self,
+        authorize: impl Fn(String, Vec<u8>) -> F + Send + Sync + 'static,
+        revalidate: A,
+        shutdown: impl Future<Output = ()>,
+    ) -> Result<()>
+    where
+        F: Future<Output = bool> + Send + 'static,
+        A: Fn(&str) -> bool + Send + Sync + 'static,
+    {
         let tick_hz = self.state.runtime.lock().await.tick_hz();
         if tick_hz == 0 {
             return Err(WebRtcError("invalid tick frequency"));
         }
-        let _ticks = crate::transport::spawn_tick_loop(self.state.clone(), tick_hz);
+        let _ticks = self
+            .managed
+            .is_none()
+            .then(|| crate::transport::spawn_tick_loop(self.state.clone(), tick_hz));
         let mut lobby = self.lobby;
-        let authorize: Arc<dyn Fn(&str) -> bool + Send + Sync> = Arc::new(authorize);
+        let authorize = Arc::new(authorize);
+        let revalidate = Arc::new(revalidate);
+        let mut approvals = JoinSet::new();
+        let mut pending = std::collections::BTreeSet::new();
+        let mut managed_poll = tokio::time::interval(Duration::from_millis(100));
         let mut peers = JoinSet::new();
         let mut participants: BTreeMap<String, Arc<dyn webrtc::peer_connection::PeerConnection>> =
             BTreeMap::new();
@@ -87,17 +200,52 @@ impl<S: GameSimulation> WebRtcHost<S> {
         let result = loop {
             tokio::select! {
                 _ = &mut shutdown => break Ok(()),
+                _ = async { match &mut self.managed { Some(managed) => {let _ = managed.stopped.recv().await;}, None => std::future::pending().await } } => break Ok(()),
+                _ = managed_poll.tick(), if self.managed.is_some() => {
+                    if let Some(managed) = &self.managed && (!managed.host.is_serving() || managed.host.is_draining().await) { break Ok(()); }
+                },
                 _ = heartbeat.tick() => {
                     if let Err(error) = lobby.heartbeat().await {break Err(error);}
                 },
-                event = lobby.receive() => {
-                    let event = match event { Ok(event)=>event, Err(error)=>break Err(error) };
+                event = async {
+                    tokio::select! {
+                        event = lobby.receive() => event.map(|event| (event, false)),
+                        approved = approvals.join_next(), if !approvals.is_empty() => {
+                            match approved {
+                                Some(Ok((participant, event, approved))) => {
+                                    pending.remove(&participant);
+                                    Ok((if approved {event} else {serde_json::Value::Null}, true))
+                                },
+                                _ => Ok((serde_json::Value::Null, true)),
+                            }
+                        }
+                    }
+                } => {
+                    let (event, approved) = match event { Ok(event)=>event, Err(error)=>break Err(error) };
                     match event["type"].as_str() {
                         Some("signal") => {
                             let Some(from) = event["from"].as_str() else {continue};
                             let payload = &event["payload"];
                             if payload["adapter"] != "game-server-webrtc-v1" || payload["matchId"] != self.match_id.as_str()
-                                || payload["kind"] != "offer" || !authorize(from) { continue; }
+                                || payload["kind"] != "offer" { continue; }
+                            if !approved {
+                                let authorization = match payload.get("authorization") {
+                                    None => Vec::new(),
+                                    Some(value) => match serde_json::from_value::<Vec<u8>>(value.clone()) {
+                                        Ok(bytes) if bytes.len() <= super::MAX_AUTHORIZATION_BYTES => bytes,
+                                        _ => continue,
+                                    },
+                                };
+                                if approvals.len() >= 32 || !pending.insert(from.to_owned()) {continue;}
+                                let participant = from.to_owned();
+                                let authorize = Arc::clone(&authorize);
+                                approvals.spawn(async move {
+                                    let approved = timeout(Duration::from_secs(60), async {authorize(participant.clone(), authorization).await}).await.unwrap_or(false);
+                                    (participant, event, approved)
+                                });
+                                continue;
+                            }
+                            if !revalidate(from) {continue;}
                             if peers.len() >= 32 {continue;}
                             if let Some(previous) = participants.remove(from) {previous.close().await?;}
                             if participants.len() >= 16 {continue;}
@@ -116,14 +264,19 @@ impl<S: GameSimulation> WebRtcHost<S> {
                                 Ok::<_,WebRtcError>((peer,channels,ticket))
                             };
                             let (peer,channels,ticket) = match timeout(NEGOTIATE_TIMEOUT,negotiation).await {Ok(Ok(result))=>result,Ok(Err(error))=>{eprintln!("WebRTC negotiation failed: {error}");continue},Err(_)=>{eprintln!("WebRTC host negotiation timed out");continue}};
-                            let state = self.state.clone();
+                            let mut state = self.state.clone();
+                            if let Some(managed) = &self.managed {
+                                state.control = Arc::new(ParticipantControl { service: Arc::clone(&managed.control), participant_id: from.to_owned(), match_id: self.match_id.clone() });
+                            }
                             let participant = from.to_owned();
                             let finished = participant.clone();
                             let connection = Arc::clone(&peer.pc);
                             let finished_connection = Arc::clone(&connection);
-                            let authorize = Arc::clone(&authorize);
+                            let authorize = Arc::clone(&revalidate);
+                            let managed_host = self.managed.as_ref().map(|managed| managed.host.clone());
                             peers.spawn(async move {
-                                let result = serve_peer(peer,channels,ticket,state,||authorize(&finished)).await;
+                                let authorized_participant = finished.clone();
+                                let result = serve_peer(peer,channels,ticket,state,move ||authorize(&authorized_participant) && managed_host.as_ref().is_none_or(|host|host.is_serving())).await;
                                 if let Err(error) = &result {eprintln!("WebRTC peer ended: {error}");}
                                 (finished,finished_connection,result)
                             });
@@ -146,7 +299,9 @@ impl<S: GameSimulation> WebRtcHost<S> {
                 },
             }
         };
-        self.state.runtime.lock().await.begin_drain();
+        if self.managed.is_none() {
+            self.state.runtime.lock().await.begin_drain();
+        }
         let _ = self.state.shutdown.send(());
         // Gracefully release leases and peer connections before dropping their owners.
         while !peers.is_empty() {
@@ -157,18 +312,48 @@ impl<S: GameSimulation> WebRtcHost<S> {
                 break;
             }
         }
-        self.state.runtime.lock().await.freeze_for_recovery();
+        if self.managed.is_none() {
+            self.state.runtime.lock().await.freeze_for_recovery();
+        }
         result
     }
+}
+
+fn managed_state<S: GameSimulation>(
+    host: &LiveMatchHost<S>,
+    id: &MatchId,
+) -> Result<(ConnectionState<S>, broadcast::Receiver<()>)> {
+    if !host.is_serving() {
+        return Err(WebRtcError("managed host is not serving"));
+    }
+    let hosted = host.get(id).ok_or(WebRtcError("unknown managed match"))?;
+    let stopped = hosted.shutdown.subscribe();
+    let (shutdown, _) = broadcast::channel(1);
+    Ok((
+        ConnectionState {
+            runtime: Arc::clone(&hosted.runtime),
+            snapshots: hosted.snapshots.clone(),
+            shutdown,
+            control: Arc::new(crate::RejectControlService),
+            control_handlers: Arc::new(Semaphore::new(connection::MAX_CONCURRENT_CONTROL_HANDLERS)),
+            admission_gate: Some(host.admission_gate()),
+        },
+        stopped,
+    ))
 }
 
 async fn serve_peer<S: GameSimulation>(
     mut peer: Peer,
     channels: Channels,
     ticket: [u8; 32],
-    state: ConnectionState<S>,
-    authorize: impl Fn() -> bool + Send + Sync,
+    mut state: ConnectionState<S>,
+    authorize: impl Fn() -> bool + Send + Sync + 'static,
 ) -> Result<()> {
+    let authorize: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(authorize);
+    state.control = Arc::new(AuthorizedControl {
+        inner: Arc::clone(&state.control),
+        authorize: Arc::clone(&authorize),
+    });
     let mut shutdown = state.shutdown.subscribe();
     let setup = async {
         peer::opened(&channels.session).await?;
@@ -196,7 +381,17 @@ async fn serve_peer<S: GameSimulation>(
     let token = connection::generate_reconnect_token()
         .map_err(|_| WebRtcError("reconnect randomness unavailable"))?;
     let (lease, welcome) = {
+        let gate = match &state.admission_gate {
+            Some(gate) => Some(gate.read().await),
+            None => None,
+        };
+        if gate.as_ref().is_some_and(|gate| **gate) || !authorize() {
+            return Err(WebRtcError("game admission revoked"));
+        }
         let mut runtime = state.runtime.lock().await;
+        if !authorize() {
+            return Err(WebRtcError("game admission revoked"));
+        }
         let lease = match admission {
             AdmissionRequest::New => runtime.admit(token),
             AdmissionRequest::Reconnect(old) => runtime.reconnect(old, token),
@@ -220,7 +415,17 @@ async fn serve_peer<S: GameSimulation>(
                 .map_err(|_| WebRtcError("welcome rollback failed"))?;
             Err(error)
         }
-        Ok(()) => established(&channels, &mut peer, lease, &state, &mut shutdown).await,
+        Ok(()) => {
+            established(
+                &channels,
+                &mut peer,
+                lease,
+                &state,
+                &mut shutdown,
+                &authorize,
+            )
+            .await
+        }
     };
     state
         .runtime
@@ -237,6 +442,7 @@ async fn established<S: GameSimulation>(
     lease: SessionLease,
     state: &ConnectionState<S>,
     shutdown: &mut broadcast::Receiver<()>,
+    authorize: &Arc<dyn Fn() -> bool + Send + Sync>,
 ) -> Result<()> {
     let mut snapshots = state.snapshots.subscribe();
     let mut newest_tick = None;
@@ -245,23 +451,32 @@ async fn established<S: GameSimulation>(
     let (lane_local, lane_remote) = tokio::io::duplex(8 * 1024);
     let (lane_read, lane_write) = tokio::io::split(lane_remote);
     let mut lane_tasks = JoinSet::new();
-    lane_tasks.spawn(connection::run_command_lane(
+    let lane_authorize = Arc::clone(authorize);
+    lane_tasks.spawn(connection::run_command_lane_with_authorization(
         lane_read,
         lane_write,
         Arc::clone(&state.runtime),
         lease,
         Duration::from_secs(10),
+        move || lane_authorize(),
     ));
     let (mut lane_recv, mut lane_send) = tokio::io::split(lane_local);
     let mut lane_header = false;
     let mut acks = [0_u8; crate::RELIABLE_COMMAND_ACK_BYTES];
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut controls = JoinSet::new();
+    let mut authorization_poll = tokio::time::interval(Duration::from_millis(100));
     loop {
+        if !authorize() {
+            return Err(WebRtcError("game admission revoked"));
+        }
         tokio::select! {
             frame = peer::receive(&channels.realtime,peer::DATAGRAM_BUDGET) => {
                 let command = crate::decode_command(&frame?).map_err(|_| WebRtcError("invalid command"))?;
-                let outcome = state.runtime.lock().await.submit_command(lease.player_id,lease.connection_epoch,command.sequence,&command.payload);
+                let mut runtime = state.runtime.lock().await;
+                if !authorize() {return Err(WebRtcError("game admission revoked"));}
+                let outcome = runtime.submit_command(lease.player_id,lease.connection_epoch,command.sequence,&command.payload);
+                drop(runtime);
                 match outcome {
                     Ok(_) | Err(crate::RuntimeError::Frozen) => {},
                     Err(crate::RuntimeError::Simulation(error)) if error.command_rejection().is_some()=> {
@@ -273,6 +488,7 @@ async fn established<S: GameSimulation>(
             },
             frame = peer::receive(&channels.commands,crate::MAX_COMMAND_PAYLOAD_BYTES+crate::COMMAND_HEADER_BYTES) => {
                 let frame = frame?;
+                if !authorize() {return Err(WebRtcError("game admission revoked"));}
                 if !lane_header {
                     crate::decode_command_lane_header(&frame).map_err(|_| WebRtcError("invalid command lane header"))?;
                     // The shared interpreter consumes the remainder after GSCL.
@@ -288,6 +504,7 @@ async fn established<S: GameSimulation>(
                 peer::send(&channels.commands,&acks).await?;
             },
             frame = peer::receive(&channels.session,peer::RELIABLE_LIMIT) => {
+                if !authorize() {return Err(WebRtcError("game admission revoked"));}
                 let request = crate::decode_control_request(&frame?).map_err(|_| WebRtcError("invalid reliable control"))?;
                 // GSCT has no request id: this ordered channel carries one exchange at a time.
                 if !controls.is_empty() {return Err(WebRtcError("control concurrency exceeded"));}
@@ -307,6 +524,7 @@ async fn established<S: GameSimulation>(
             publication = snapshots.recv()=> {
                 let publication = match publication {Ok(publication)=>publication,Err(broadcast::error::RecvError::Lagged(_))=>continue,Err(_)=>return Err(WebRtcError("snapshot source stopped"))};
                 let runtime = state.runtime.lock().await;
+                if !authorize() {return Err(WebRtcError("game admission revoked"));}
                 if let SnapshotPublication::CommittedPlayers(frames) = &publication && !frames.contains_key(&lease.player_id) {
                     runtime.validate_connection(lease.player_id,lease.connection_epoch).map_err(|_| WebRtcError("snapshot fencing refused"))?;
                     continue;
@@ -321,6 +539,7 @@ async fn established<S: GameSimulation>(
                 for frame in fragments {if channels.realtime.try_send(bytes::BytesMut::from(frame.as_slice())).await.is_err() {break;}}
                 newest_tick = Some(tick);
             },
+            _ = authorization_poll.tick()=>{},
             _ = shutdown.recv()=>return Ok(()),
             _ = peer.closed.changed()=>return Ok(()),
             _ = peer.channels.recv()=>return Err(WebRtcError("extra data channel refused")),
