@@ -148,6 +148,14 @@ impl<S: GameSimulation> MatchRuntime<S> {
         }
     }
 
+    /// Read-only view of the hosted simulation for trusted, game-specific
+    /// queries under the runtime lock (for example capturing durable records
+    /// between ticks without a canonical snapshot round trip). Mutation still
+    /// goes only through admission, commands, host input and ticks.
+    pub fn simulation(&self) -> &S {
+        &self.simulation
+    }
+
     pub fn tick_hz(&self) -> u16 {
         self.simulation.tick_hz()
     }
