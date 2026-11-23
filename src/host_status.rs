@@ -9,6 +9,7 @@ use crate::simulation::GameSimulation;
 use std::error::Error;
 use std::fmt;
 use std::io;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -326,7 +327,7 @@ where
     S: GameSimulation,
     C: MatchControlService,
 {
-    let listener = TcpListener::bind(("0.0.0.0", status_config.port))
+    let listener = TcpListener::bind(status_bind_address(&transport_config, status_config))
         .await
         .map_err(|error| HostStatusServerError::Bind(error.to_string()))?;
     let state = Arc::new(StatusState::starting(host.max_matches(), allow_empty));
@@ -399,6 +400,19 @@ where
             }
         }
     }
+}
+
+/// The status listener follows the transport's bind address, so a host that serves
+/// players only on loopback does not publish its status to the network. Without one it
+/// keeps listening on every IPv4 interface.
+fn status_bind_address(
+    transport: &MatchHostWebTransportConfig,
+    status: MatchHostStatusConfig,
+) -> SocketAddr {
+    let ip = transport
+        .bind_ip
+        .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    SocketAddr::new(ip, status.port)
 }
 
 async fn join_status_task(
@@ -696,6 +710,30 @@ mod tests {
     }
     fn factory(_: &MatchId) -> Result<DemoSimulation, std::convert::Infallible> {
         Ok(DemoSimulation::new())
+    }
+
+    #[tokio::test]
+    async fn status_listener_follows_the_transport_bind_address() {
+        let mut transport = MatchHostWebTransportConfig {
+            port: 0,
+            bind_ip: Some(Ipv4Addr::LOCALHOST.into()),
+            certificate_pem: "cert.pem".into(),
+            private_key_pem: "key.pem".into(),
+            route_prefix: BrowserRoutePrefix::new("/game").unwrap(),
+            allowed_origins: None,
+            drain_grace: Duration::ZERO,
+        };
+        let status = MatchHostStatusConfig { port: 0 };
+        let listener = TcpListener::bind(status_bind_address(&transport, status))
+            .await
+            .unwrap();
+        assert!(listener.local_addr().unwrap().ip().is_loopback());
+        // Without a configured address the listener keeps its every-interface default.
+        transport.bind_ip = None;
+        assert_eq!(
+            status_bind_address(&transport, MatchHostStatusConfig { port: 8080 }),
+            SocketAddr::from((Ipv4Addr::UNSPECIFIED, 8080))
+        );
     }
 
     #[tokio::test]
