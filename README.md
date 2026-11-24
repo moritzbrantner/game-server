@@ -100,6 +100,8 @@ Both shared and player-scoped delivery validate the current connection epoch und
 
 `GameSimulation::connection_changed(player_id)` lets Rust consumers invalidate ephemeral presentation state, such as tentative placements, after an accepted disconnect or reconnect. Stale epochs and invalid reconnect tokens produce no notification. The default is a no-op; implementations must keep canonical snapshots and gameplay unchanged. These notifications are intentionally absent from replay. Recovery restores sessions offline, and the first accepted reconnect notifies the simulation before it can serve that connection.
 
+`GameSimulation::expired_admissions()` lets a game bound sessions that never finished its own admission step, such as a character claim. Before each tick the runtime removes every reported player that still has a session exactly like an expired reconnect slot: the slot is freed, the removal is recorded for replay and the connection closes at its next snapshot. The default expires nobody.
+
 This boundary is intended for hidden-information games such as card games. It keeps visibility policy in the supplied game simulation rather than duplicating game rules in WebTransport handlers.
 
 ## Snapshot fragmentation

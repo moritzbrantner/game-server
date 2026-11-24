@@ -522,7 +522,12 @@ impl<S: GameSimulation> MatchRuntime<S> {
             return Err(RuntimeError::Frozen);
         }
         let current_tick = self.current_tick();
-        let expired = self.sessions.expired_player_ids(current_tick);
+        let mut expired = self.sessions.expired_player_ids(current_tick);
+        for player_id in self.simulation.expired_admissions() {
+            if self.last_sequences.contains_key(&player_id) && !expired.contains(&player_id) {
+                expired.push(player_id);
+            }
+        }
         for player_id in expired {
             if !self.simulation.try_remove_player(player_id)? {
                 return Err(SimulationError::new(format!(
@@ -586,11 +591,15 @@ mod tests {
         players: Vec<PlayerId>,
         commands: Vec<(PlayerId, u32, Vec<u8>)>,
         connection_changes: Vec<PlayerId>,
+        expired_admissions: Vec<PlayerId>,
     }
 
     impl GameSimulation for FakeSimulation {
         fn connection_changed(&mut self, player_id: PlayerId) {
             self.connection_changes.push(player_id);
+        }
+        fn expired_admissions(&self) -> Vec<PlayerId> {
+            self.expired_admissions.clone()
         }
         fn tick_hz(&self) -> u16 {
             20
@@ -987,6 +996,39 @@ mod tests {
                     )
                 })
         );
+        verify_replay(FakeSimulation::default(), runtime.replay_log().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn expired_admissions_free_their_slot_and_replay() {
+        let mut runtime = MatchRuntime::new_with_replay_capture(FakeSimulation::default(), 10);
+        let waiting = runtime.admit(token(1)).unwrap();
+        let admitted = runtime.admit(token(2)).unwrap();
+        assert!(matches!(
+            runtime.admit(token(3)),
+            Err(RuntimeError::Session(_))
+        ));
+        runtime.advance_tick().unwrap();
+        // Unknown players are ignored; a known one loses its slot before the tick.
+        runtime.simulation.expired_admissions = vec![waiting.player_id, 99];
+        runtime.advance_tick().unwrap();
+        runtime.simulation.expired_admissions.clear();
+        assert_eq!(runtime.slot_count(), 1);
+        assert_eq!(runtime.simulation().players, vec![admitted.player_id]);
+        assert!(
+            runtime
+                .validate_connection(waiting.player_id, waiting.connection_epoch)
+                .is_err()
+        );
+        assert!(runtime.submit_host_input(waiting.player_id, &[1]).is_err());
+        runtime.admit(token(3)).unwrap();
+        runtime.advance_tick().unwrap();
+        assert!(runtime.replay_log().unwrap().records().iter().any(|record| {
+            matches!(
+                record,
+                ReplayRecord::PlayerRemoved { tick: 1, player_id } if *player_id == waiting.player_id
+            )
+        }));
         verify_replay(FakeSimulation::default(), runtime.replay_log().unwrap()).unwrap();
     }
 
