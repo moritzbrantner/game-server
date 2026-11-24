@@ -146,6 +146,16 @@ pub trait GameSimulation: Send + 'static {
 
     fn advance_tick(&mut self) -> Result<(), SimulationError>;
 
+    /// Players whose game-level admission (for example a character claim) did not
+    /// complete within the game's own bound. Before each tick the runtime removes
+    /// them like an expired reconnect slot: the simulation's `try_remove_player`
+    /// runs, the session slot is freed, the removal is recorded for replay and the
+    /// connection closes. Players without a session are ignored. The default
+    /// expires nobody.
+    fn expired_admissions(&self) -> Vec<PlayerId> {
+        Vec::new()
+    }
+
     fn snapshot_scope(&self) -> SnapshotScope {
         SnapshotScope::Shared
     }
